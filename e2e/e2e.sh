@@ -43,6 +43,34 @@ for i in $(seq 1 60); do
   sleep 5
 done
 
+echo "=== wait for SO signing keyshares ==="
+for attempt in $(seq 1 120); do
+  keyshares_ready=1
+  for index in 0 1 2; do
+    count=""
+    if ! count=$("${COMPOSE[@]}" exec -T postgres psql \
+      -U postgres -d "sparkoperator_${index}" -tAc \
+      "SELECT count(*) FROM signing_keyshares WHERE status = 'AVAILABLE';" \
+      2>/dev/null); then
+      keyshares_ready=0
+      break
+    fi
+    count=$(echo "$count" | tr -d '[:space:]')
+    case "$count" in
+      ''|*[!0-9]*|0) keyshares_ready=0; break ;;
+    esac
+  done
+  if [ "$keyshares_ready" = "1" ]; then
+    echo "SO signing keyshares ready"
+    break
+  fi
+  if [ "$attempt" = 120 ]; then
+    echo "SO signing keyshares did not become ready"
+    exit 1
+  fi
+  sleep 5
+done
+
 echo "=== wait for SSP ==="
 for i in $(seq 1 90); do
   if curl -sf http://127.0.0.1:5000/health > /dev/null; then break; fi
