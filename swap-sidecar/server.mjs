@@ -15,6 +15,7 @@
 // SIDECAR_TOKEN (bearer for /swap-fill), PORT.
 import http from "node:http";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import { sparkAddressFromIdentityPubkey } from "./address.mjs";
 
 const SDK_DIST = process.env.SPARK_SDK_DIST;
@@ -22,6 +23,21 @@ if (!SDK_DIST) throw new Error("set SPARK_SDK_DIST");
 const { SparkWallet } = await import(SDK_DIST);
 
 const TOKEN = process.env.SIDECAR_TOKEN ?? "";
+// Fail closed: an unset token opens /swap-fill (liquidity drain), /sign
+// (signing oracle) and /store-shares to anyone who reaches the port.
+// Explicit opt-out only: SIDECAR_ALLOW_NO_AUTH=1 (local dev).
+if (!TOKEN && process.env.SIDECAR_ALLOW_NO_AUTH !== "1") {
+  console.error("refusing to start: set SIDECAR_TOKEN");
+  process.exit(1);
+}
+
+function authorized(req) {
+  if (!TOKEN) return true;
+  const got = (req.headers.authorization ?? "").replace(/^Bearer /, "");
+  const a = crypto.createHash("sha256").update(got).digest();
+  const b = crypto.createHash("sha256").update(TOKEN).digest();
+  return crypto.timingSafeEqual(a, b);
+}
 const NETWORK = process.env.SPARK_NETWORK ?? "LOCAL";
 const SSP_URL = process.env.SSP_URL ?? "http://127.0.0.1:5000";
 // SSP identity is self-published on /health; retry while the SSP boots.
@@ -124,14 +140,17 @@ const server = http.createServer(async (req, res) => {
     } });
   }
   if (req.url === "/sign" && req.method === "POST") {
-    if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { error: "unauthorized" });
+    if (!authorized(req)) return send(401, { error: "unauthorized" });
     let body = "";
     for await (const chunk of req) body += chunk;
     try {
       // Sign with the sidecar (SSP identity) key via the wallet's public API
       // (sha256(message) + DER signature, hex). Matches what verifiers check.
+      // Constrained shape: base64 manifests or hex-colon quote payloads only.
       const { message } = JSON.parse(body);
-      if (typeof message !== "string" || !message) return send(400, { error: "message string required" });
+      if (typeof message !== "string" || !/^[A-Za-z0-9+/=:.]{1,8192}$/.test(message)) {
+        return send(400, { error: "message shape rejected" });
+      }
       const signature = await wallet.signMessageWithIdentityKey(message);
       return send(200, { signature });
     } catch (e) {
@@ -139,7 +158,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
   if (req.url === "/store-shares" && req.method === "POST") {
-    if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { error: "unauthorized" });
+    if (!authorized(req)) return send(401, { error: "unauthorized" });
     let body = "";
     for await (const chunk of req) body += chunk;
     try {
@@ -167,7 +186,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
   if (req.url === "/swap-fill" && req.method === "POST") {
-    if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { error: "unauthorized" });
+    if (!authorized(req)) return send(401, { error: "unauthorized" });
     let body = "";
     for await (const chunk of req) body += chunk;
     try {

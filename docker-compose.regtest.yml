@@ -33,6 +33,16 @@ x-operator-common: &operator-common
     - ./e2e/upstream/operator_2.key:/opt/spark/keys/operator_2.key:ro
     - tls-certs:/opt/spark/tls:ro
 
+x-sidecar-common: &sidecar-common
+  image: ${SIDECAR_IMAGE:-ghcr.io/benthecarman/mutinynet-ssp-sidecar:latest}
+  build:
+    context: .
+    dockerfile: swap-sidecar.Dockerfile
+  volumes:
+    - sidecar-data:/app/data
+    - ./e2e:/app/e2e:ro
+    - tls-certs:/tls:ro
+
 services:
   cert-init:
     image: alpine:3.20
@@ -211,27 +221,6 @@ services:
 
   # ---- Swap-fill sidecar: funded Spark wallet completing leaf swaps ----
   # Mnemonic persists in sidecar-data; fund once via the sidecar-fund service.
-  x-sidecar-common: &sidecar-common
-    image: ${SIDECAR_IMAGE:-ghcr.io/benthecarman/mutinynet-ssp-sidecar:latest}
-    build:
-      context: .
-      dockerfile: swap-sidecar.Dockerfile
-    volumes:
-      - sidecar-data:/app/data
-      - ./e2e:/app/e2e:ro
-      - tls-certs:/tls:ro
-    environment:
-      # Trust root for SO self-signed certs (SDK loads /tmp/minikube-ca.pem
-      # when SPARK_LOCAL_INGRESS_HOST is set; entrypoint bundles /tls certs).
-      SPARK_LOCAL_INGRESS_HOST: sidecar
-      SPARK_SDK_DIST: /sdk/index.node.js
-      SPARK_NETWORK: LOCAL
-      SO_HOSTS: spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535
-      SSP_URL: http://ssp:5000
-      SIDECAR_MNEMONIC_FILE: /app/data/sidecar.mnemonic
-      SIDECAR_TOKEN: ${SIDECAR_TOKEN:-regtest-sidecar-token}
-      SPARK_DANGEROUSLY_DISABLE_TLS_VERIFICATION: 1
-
   swap-sidecar:
     <<: *sidecar-common
     depends_on:
@@ -249,7 +238,7 @@ services:
       SO_HOSTS: spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535
       SSP_URL: http://ssp:5000
       SIDECAR_MNEMONIC_FILE: /app/data/sidecar.mnemonic
-      SIDECAR_TOKEN: ${SIDECAR_TOKEN:-regtest-sidecar-token}
+      SIDECAR_TOKEN: ${SIDECAR_TOKEN:?set SIDECAR_TOKEN}
     restart: unless-stopped
 
   # One-shot: fund the sidecar liquidity wallet from the regtest bitcoind.
@@ -302,7 +291,7 @@ services:
       SSP_LN_FEE_PPM: 0
       SSP_SWAP_FEE_SATS: 0
       SIDECAR_URL: http://swap-sidecar:5001
-      SIDECAR_TOKEN: ${SIDECAR_TOKEN:-regtest-sidecar-token}
+      SIDECAR_TOKEN: ${SIDECAR_TOKEN:?set SIDECAR_TOKEN}
       SSP_FROST_THRESHOLD: 2
       SSP_FROST_OPERATORS: '[{"id":0,"identifier":"0000000000000000000000000000000000000000000000000000000000000001","identityPublicKey":"0322ca18fc489ae25418a0e768273c2c61cabb823edfb14feb891e9bec62016510"},{"id":1,"identifier":"0000000000000000000000000000000000000000000000000000000000000002","identityPublicKey":"0341727a6c41b168f07eb50865ab8c397a53c7eef628ac1020956b705e43b6cb27"},{"id":2,"identifier":"0000000000000000000000000000000000000000000000000000000000000003","identityPublicKey":"0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6"}]'
       RUST_LOG: info

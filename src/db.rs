@@ -17,14 +17,26 @@ impl Db {
         let path: PathBuf = [data_dir, "ssp.sqlite"].iter().collect();
         let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS challenges(identity TEXT PRIMARY KEY, protected TEXT NOT NULL);
+            "CREATE TABLE IF NOT EXISTS challenges(identity TEXT PRIMARY KEY, protected TEXT NOT NULL, issued_at TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, identity TEXT NOT NULL, valid_until TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, kind TEXT NOT NULL, owner TEXT NOT NULL, created_at TEXT NOT NULL, payload TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS transfers(spark_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS preimages(hash TEXT PRIMARY KEY, preimage TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, status TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, status TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS static_quotes(txid TEXT NOT NULL, vout INTEGER NOT NULL, credit INTEGER NOT NULL, signature TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(txid, vout));",
         )
         .map_err(|e| e.to_string())?;
+        // Lightweight migration for DBs created before issued_at existed.
+        let has_issued: bool = conn
+            .prepare("SELECT issued_at FROM challenges LIMIT 0")
+            .is_ok();
+        if !has_issued {
+            conn.execute(
+                "ALTER TABLE challenges ADD COLUMN issued_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         Ok(Self {
             inner: Arc::new(Mutex::new(conn)),
         })
@@ -39,13 +51,65 @@ impl Db {
         f(&conn).map_err(|e| e.to_string())
     }
 
-    // ---- challenges ----
-    pub async fn save_challenge(&self, identity: &str, protected: &str) -> Result<(), String> {
+    // ---- challenges (single-use, 5-minute expiry) ----
+    pub async fn save_challenge(
+        &self,
+        identity: &str,
+        protected: &str,
+        now: &str,
+    ) -> Result<(), String> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO challenges(identity,protected) VALUES(?1,?2)
-                 ON CONFLICT(identity) DO UPDATE SET protected=excluded.protected",
-                (identity, protected),
+                "INSERT INTO challenges(identity,protected,issued_at) VALUES(?1,?2,?3)
+                 ON CONFLICT(identity) DO UPDATE SET protected=excluded.protected, issued_at=excluded.issued_at",
+                (identity, protected, now),
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Atomically consume a challenge: returns true only if the stored
+    /// challenge matches and is younger than `max_age_secs`. Always deletes.
+    pub async fn consume_challenge(
+        &self,
+        identity: &str,
+        protected: &str,
+        now_epoch_secs: i64,
+        max_age_secs: i64,
+    ) -> Result<bool, String> {
+        let conn = self.inner.lock().await;
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT protected, issued_at FROM challenges WHERE identity=?1",
+                (identity,),
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
+            .map_err(|e: rusqlite::Error| e.to_string())?;
+        conn.execute("DELETE FROM challenges WHERE identity=?1", (identity,))
+            .map_err(|e: rusqlite::Error| e.to_string())?;
+        let Some((stored, issued_at)) = row else {
+            return Ok(false);
+        };
+        if stored != protected {
+            return Ok(false);
+        }
+        let issued = chrono::DateTime::parse_from_rfc3339(&issued_at)
+            .map(|d| d.timestamp())
+            .unwrap_or(0);
+        Ok(now_epoch_secs - issued <= max_age_secs)
+    }
+
+    pub async fn prune_challenges(&self, older_than_rfc3339: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM challenges WHERE issued_at<?1",
+                (older_than_rfc3339,),
             )
             .map(|_| ())
         })
@@ -186,6 +250,25 @@ impl Db {
         Ok(out)
     }
 
+    // ---- static deposit quotes (one row per UTXO) ----
+    pub async fn record_static_quote(
+        &self,
+        txid: &str,
+        vout: u32,
+        credit: u64,
+        signature: &str,
+        created_at: &str,
+    ) -> Result<(), String> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO static_quotes(txid,vout,credit,signature,created_at) VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(txid,vout) DO UPDATE SET credit=excluded.credit, signature=excluded.signature, created_at=excluded.created_at",
+                (txid, vout, credit as i64, signature, created_at),
+            )
+            .map(|_| ())
+        })
+        .await
+    }
     // ---- preimages ----
     pub async fn save_preimage(&self, hash: &str, preimage: &str) -> Result<(), String> {
         self.with(|c| {

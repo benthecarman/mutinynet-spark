@@ -7,6 +7,7 @@ cd "$(dirname "$0")/.."
 export SPARK_REF="${SPARK_REF:-/tmp/opencode/spark-ref}"
 export SPARK_DANGEROUSLY_DISABLE_TLS_VERIFICATION=1
 export MINING=1
+export SIDECAR_TOKEN="${SIDECAR_TOKEN:-regtest-sidecar-token}"
 export BITCOIN_RPC_URL="${BITCOIN_RPC_URL:-http://127.0.0.1:8332}"
 export BITCOIN_RPC_USER="${BITCOIN_RPC_USER:-testutil}"
 export BITCOIN_RPC_PASSWORD="${BITCOIN_RPC_PASSWORD:-testutilpassword}"

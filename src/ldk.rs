@@ -95,6 +95,7 @@ pub enum LnEvent {
 }
 
 /// Runtime backend: live ldk-server when configured and reachable, else fake.
+#[derive(Clone)]
 pub enum Backend {
     Live(LdkGrpcBackend),
     Fake(FakeLdkBackend),
@@ -119,31 +120,30 @@ impl Backend {
         }
     }
 
-    /// SubscribeEvents pump for live mode. Reconnects forever.
-    pub async fn run_event_loop(&self) {
-        if let Backend::Live(live) = self {
-            loop {
-                match live.client.subscribe_events().await {
-                    Ok(mut stream) => {
-                        tracing::info!("ldk event stream connected");
-                        while let Some(msg) = stream.next_message().await {
-                            match msg {
-                                Ok(env) => {
-                                    for ev in map_envelope(env) {
-                                        live.apply_ln_event(ev).await;
-                                    }
+    /// SubscribeEvents pump for a live backend. Takes an owned clone so no
+    /// locks are held across the stream; reconnects forever.
+    pub async fn run_event_pump(live: LdkGrpcBackend) {
+        loop {
+            match live.client.subscribe_events().await {
+                Ok(mut stream) => {
+                    tracing::info!("ldk event stream connected");
+                    while let Some(msg) = stream.next_message().await {
+                        match msg {
+                            Ok(env) => {
+                                for ev in map_envelope(env) {
+                                    live.apply_ln_event(ev).await;
                                 }
-                                Err(e) => {
-                                    tracing::warn!("ldk event stream error: {e}");
-                                    break;
-                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("ldk event stream error: {e}");
+                                break;
                             }
                         }
                     }
-                    Err(e) => tracing::warn!("ldk subscribe_events failed: {e}; retry in 5s"),
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Err(e) => tracing::warn!("ldk subscribe_events failed: {e}; retry in 5s"),
             }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     }
 }
@@ -277,6 +277,7 @@ fn bolt11_hash(p: Option<ldk_server_client::ldk_server_grpc::types::Payment>) ->
     }
 }
 
+#[derive(Clone)]
 pub struct LdkGrpcBackend {
     pub client: LdkServerClient,
     pub node_id: Option<String>,
@@ -535,6 +536,7 @@ impl LdkBackend for LdkGrpcBackend {
     }
 }
 
+#[derive(Clone)]
 pub struct FakeLdkBackend {
     pub config: Config,
     db: Arc<Db>,

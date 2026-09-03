@@ -64,7 +64,10 @@ pub async fn dispatch(
         "LightningSendFeeEstimate" | "lightning_send_fee_estimate" => {
             let inv = str_of(&input, "encoded_invoice");
             let amt = opt_num(&input, "amount_sats");
-            let msat = state.ldk.fee_estimate_msat(&inv, amt).await;
+            let msat = crate::backend(&state)
+                .await
+                .fee_estimate_msat(&inv, amt)
+                .await;
             Ok(json!({ "lightning_send_fee_estimate": {
                 "fee_estimate": {
                     "original_value": msat / 1000,
@@ -134,7 +137,7 @@ pub async fn dispatch(
                 "transfer_id": transfer_id,
                 "amount_sats": amount,
                 "network": network,
-                "ssp_identity_pubkey": state.ssp_pubkey_hex,
+                "ssp_identity_pubkey": crate::ssp_identity(&state).await?,
             });
             let serialized = B64.encode(serde_json::to_vec(&manifest).unwrap());
             let sig = sign_with_ssp(&state, &serialized).await?;
@@ -149,11 +152,14 @@ pub async fn dispatch(
         "RequestLightningReceive" | "request_lightning_receive" => {
             let owner = auth::require_session(&state, headers).await?;
             let amount = num_of(&input, "amount_sats");
-            let hash = str_of(&input, "payment_hash");
+            let hash = str_of(&input, "payment_hash").to_lowercase();
+            if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("payment_hash must be 32 bytes hex".to_string());
+            }
             let memo = str_of(&input, "memo");
             let expiry = opt_num(&input, "expiry_secs").unwrap_or(86400) as u32;
-            let inv = state
-                .ldk
+            let inv = crate::backend(&state)
+                .await
                 .create_invoice(amount, &hash, &memo, expiry)
                 .await
                 .map_err(|e| format!("ldk create_invoice: {e}"))?;
@@ -161,7 +167,12 @@ pub async fn dispatch(
             // shares, encrypt per operator, store via the coordinator with
             // owner = SSP identity (attestor == holder, SO's own rule).
             // Wallet-owned hashes skip this (preimage unknown here).
-            if state.ldk.preimage_for(&hash).await.is_some() {
+            if crate::backend(&state)
+                .await
+                .preimage_for(&hash)
+                .await
+                .is_some()
+            {
                 store_preimage_shares(&state, &hash, &inv.invoice).await?;
             }
             let rec = store_request(
@@ -202,7 +213,7 @@ pub async fn dispatch(
             let amt = opt_num(&input, "amount_sats");
             let idem = str_of(&input, "idempotency_key");
             let ext_id = str_of(&input, "user_outbound_transfer_external_id");
-            let pay = state.ldk.pay_invoice(&inv, amt).await;
+            let pay = crate::backend(&state).await.pay_invoice(&inv, amt).await;
             let rec = store_request(
                 &state,
                 "LIGHTNING_SEND",
@@ -247,10 +258,14 @@ pub async fn dispatch(
             // The sidecar serves fills from exact leaves only. If IT needs a
             // swap, its ladder is depleted: fail fast so no leaves lock
             // SO-side in a recursive swap. Top up the ladder instead.
-            if !state.config.sidecar_identity_pubkey.is_empty()
-                && owner == state.config.sidecar_identity_pubkey
-            {
-                return Err("NEEDS_TOPUP: sidecar ladder depleted, top up liquidity".to_string());
+            // Identity pending counts as unknown: allow (guard re-arms
+            // once the sidecar identity resolves).
+            if let Ok(resolved) = crate::ssp_identity(&state).await {
+                if !resolved.is_empty() && owner == resolved {
+                    return Err(
+                        "NEEDS_TOPUP: sidecar ladder depleted, top up liquidity".to_string()
+                    );
+                }
             }
             if state.config.max_swap_total_sats > 0 && total > state.config.max_swap_total_sats {
                 return Err(format!(
@@ -329,20 +344,35 @@ pub async fn dispatch(
         // ---- static deposits (SDK uses static_deposit_quote only) ----
         "StaticDepositQuote" | "static_deposit_quote" => {
             let _ = auth::require_session(&state, headers).await?;
-            let txid = str_of(&input, "transaction_id");
-            let vout = num_of(&input, "output_index");
+            // Quote signing without a UTXO lookup is only acceptable where
+            // coins are worthless. Refuse elsewhere rather than signing blind.
             let network = str_of(&input, "network");
             let network = if network.is_empty() {
                 state.config.network.clone()
             } else {
                 network
             };
+            if network != "REGTEST" && network != "LOCAL" {
+                return Err("static deposit quotes are regtest-only".to_string());
+            }
+            let txid = str_of(&input, "transaction_id").to_lowercase();
+            if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("transaction_id must be 64 hex chars".to_string());
+            }
+            let vout = num_of(&input, "output_index");
+            if vout > u32::MAX as u64 {
+                return Err("output_index out of range".to_string());
+            }
             // FAKE credit: fixed amount, must stay <= the real UTXO value or
             // the SO rejects the claim (totalAmount > utxo.Amount check).
             // TODO(live): look up the UTXO via bitcoind/esplora and apply fees.
             let credit: u64 = 100_000;
             let payload = format!("{txid}:{vout}:{credit}");
             let sig = sign_with_ssp(&state, &payload).await?;
+            state
+                .db
+                .record_static_quote(&txid, vout as u32, credit, &sig, &now)
+                .await?;
             let quote = json!({
                 "__typename": "StaticDepositQuoteOutput",
                 "transaction_id": txid, "output_index": vout,
@@ -425,8 +455,8 @@ pub async fn dispatch(
         // SSP auto-claims; cooperative wallets can also reveal explicitly.
         "MintInvoicePreimage" | "mint_invoice_preimage" => {
             let _ = auth::require_session(&state, headers).await?;
-            let minted = state
-                .ldk
+            let minted = crate::backend(&state)
+                .await
                 .create_invoice_with_new_preimage(0, "", 86400)
                 .await
                 .map_err(|e| format!("ldk mint: {e}"))?;
@@ -439,7 +469,10 @@ pub async fn dispatch(
             let _ = auth::require_session(&state, headers).await?;
             let hash = str_of(&input, "payment_hash").to_lowercase();
             let preimage = str_of(&input, "preimage").to_lowercase();
-            let claimed = state.ldk.reveal_and_claim(&hash, &preimage).await;
+            let claimed = crate::backend(&state)
+                .await
+                .reveal_and_claim(&hash, &preimage)
+                .await;
             Ok(json!({ "reveal_preimage": {
                 "__typename": "RevealPreimageOutput",
                 "ok": claimed,
@@ -601,7 +634,12 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
     match kind {
         "LIGHTNING_SEND" => {
             let pid = p.get("payment_id").and_then(|v| v.as_str()).unwrap_or("");
-            let status = match state.ldk.payment_status(pid).await.as_str() {
+            let status = match crate::backend(&state)
+                .await
+                .payment_status(pid)
+                .await
+                .as_str()
+            {
                 "SUCCEEDED" => "LIGHTNING_PAYMENT_SUCCEEDED",
                 "FAILED" => "LIGHTNING_PAYMENT_FAILED",
                 _ => "LIGHTNING_PAYMENT_INITIATED",
@@ -793,8 +831,8 @@ async fn store_preimage_shares(
         return Err("SSP_FROST_OPERATORS empty; cannot store shares".to_string());
     }
     operators.sort_by_key(|o| o.id);
-    let preimage_hex = state
-        .ldk
+    let preimage_hex = crate::backend(&state)
+        .await
         .preimage_for(payment_hash_hex)
         .await
         .ok_or_else(|| "preimage not held for hash".to_string())?;
@@ -819,7 +857,7 @@ async fn store_preimage_shares(
             "shares": wire,
             "threshold": state.config.frost_threshold,
             "invoiceString": invoice,
-            "ownerIdentityPubkeyHex": state.ssp_pubkey_hex,
+            "ownerIdentityPubkeyHex": crate::ssp_identity(&state).await?,
         }));
     if !state.config.sidecar_token.is_empty() {
         req = req.bearer_auth(&state.config.sidecar_token);

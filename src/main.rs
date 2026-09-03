@@ -19,16 +19,31 @@ mod ldk;
 
 use config::Config;
 use db::Db;
-use ldk::{Backend, LdkBackend};
+use ldk::{Backend, LdkBackend, LdkGrpcBackend};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
     pub db: Arc<Db>,
-    pub ldk: Arc<Backend>,
-    /// Hex secret (resolved) + pubkey for SSP signatures.
+    pub ldk: Arc<tokio::sync::RwLock<Backend>>,
+    /// Hex secret (resolved) for local signing fallback.
     pub ssp_secret_hex: String,
-    pub ssp_pubkey_hex: String,
+    /// Published SSP identity. None while the sidecar identity is pending;
+    /// identity-dependent ops reject until it resolves.
+    pub identity: Arc<tokio::sync::RwLock<Option<String>>>,
+}
+
+pub async fn backend(state: &AppState) -> tokio::sync::RwLockReadGuard<'_, Backend> {
+    state.ldk.read().await
+}
+
+pub async fn ssp_identity(state: &AppState) -> Result<String, String> {
+    state
+        .identity
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| "ssp identity pending (sidecar unreachable)".to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -52,14 +67,23 @@ struct GraphqlResponse {
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let backend = state.ldk.read().await;
     Json(serde_json::json!({
         "status": "ok",
         "network": state.config.network,
-        "ssp_identity_pubkey": state.ssp_pubkey_hex,
-        "identity_source": if state.config.sidecar_url.is_empty() { "local" } else { "sidecar" },
-        "ldk_mode": if state.ldk.live_node_id().is_some() { "live" } else { "fake" },
-        "ldk_node_id": state.ldk.live_node_id(),
+        "ssp_identity_pubkey": state.identity.read().await.clone(),
+        "identity_source": identity_source(&state.config),
+        "ldk_mode": if backend.live_node_id().is_some() { "live" } else { "fake" },
+        "ldk_node_id": backend.live_node_id(),
     }))
+}
+
+fn identity_source(config: &Config) -> &'static str {
+    if config.sidecar_url.is_empty() {
+        "local"
+    } else {
+        "sidecar"
+    }
 }
 
 async fn graphql_handler(
@@ -97,10 +121,8 @@ async fn graphql_handler(
     let req: GraphqlRequest = match serde_json::from_str(&body) {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(
-                "unparseable graphql body: {e}; head={:?}",
-                &body[..body.len().min(300)]
-            );
+            let head: String = body.chars().take(300).collect();
+            tracing::warn!("unparseable graphql body: {e}; head={head:?}");
             let err =
                 serde_json::json!({ "errors": [{ "message": format!("bad graphql body: {e}") }] });
             return (StatusCode::OK, Json(err)).into_response();
@@ -125,19 +147,26 @@ async fn graphql_handler(
 }
 
 /// Inflate what CompressionStream("deflate") emits (zlib-wrapped deflate).
-/// Falls back to raw deflate for other producers.
-fn inflate_raw_deflate(input: &[u8]) -> Result<Vec<u8>, String> {
+/// Falls back to raw deflate for other producers. Capped: a 2 MB compressed
+/// body must never expand past MAX_INFLATED_BYTES (M3).
+const MAX_INFLATED_BYTES: u64 = 8 * 1024 * 1024;
+
+fn read_capped<R: std::io::Read>(r: R) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let mut d = flate2::read::ZlibDecoder::new(input);
-    let mut out = Vec::with_capacity(input.len() * 2);
-    match d.read_to_end(&mut out) {
-        Ok(_) => Ok(out),
-        Err(e) => {
-            let mut r = flate2::read::DeflateDecoder::new(input);
-            let mut raw = Vec::with_capacity(input.len() * 2);
-            r.read_to_end(&mut raw).map_err(|_| e.to_string())?;
-            Ok(raw)
-        }
+    let mut out = Vec::new();
+    r.take(MAX_INFLATED_BYTES + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| e.to_string())?;
+    if out.len() as u64 > MAX_INFLATED_BYTES {
+        return Err("deflate body exceeds limit".to_string());
+    }
+    Ok(out)
+}
+
+fn inflate_raw_deflate(input: &[u8]) -> Result<Vec<u8>, String> {
+    match read_capped(flate2::read::ZlibDecoder::new(input)) {
+        Ok(out) => Ok(out),
+        Err(_) => read_capped(flate2::read::DeflateDecoder::new(input)),
     }
 }
 
@@ -228,66 +257,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let mut config = Config::from_env();
-    let (secret_hex, mut pubkey_hex) = config
+    let config = Config::from_env();
+    let (secret_hex, local_pubkey_hex) = config
         .resolve_signing_key()
         .map_err(|e| format!("signing key: {e}"))?;
-    // When a swap sidecar is configured, IT owns the SSP identity (receives
-    // swap outbounds and signs quotes via /sign): publish its pubkey so all
-    // three agree. Block until it resolves: publishing a fallback key while
-    // healthy would silently break every pinned wallet. With SIDECAR_URL
-    // empty the local key is used.
-    // The sidecar identity also guards the swap arm against recursion.
-    if !config.sidecar_url.is_empty() {
-        info!("waiting for sidecar identity...");
-        loop {
-            match fetch_sidecar_identity(&config.sidecar_url, &config.sidecar_token).await {
-                Ok(pk) => {
-                    info!("SSP identity from sidecar: {pk}");
-                    pubkey_hex = pk.clone();
-                    config.sidecar_identity_pubkey = pk;
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!("sidecar identity unavailable ({e}); retrying in 10s");
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                }
-            }
-        }
-    }
     // Env identity wins when set; otherwise the resolved key's pubkey is used
     // (first boot publishes it via /health for sspClientOptions).
-    let pubkey_hex = if config.ssp_identity_pubkey.is_empty() {
-        pubkey_hex
+    if !config.ssp_identity_pubkey.is_empty() && local_pubkey_hex != config.ssp_identity_pubkey {
+        return Err(format!(
+            "resolved key pubkey {local_pubkey_hex} != SSP_IDENTITY_PUBKEY {}",
+            config.ssp_identity_pubkey
+        )
+        .into());
+    }
+    // Identity starts as the local key (or pinned env key). With a sidecar
+    // configured it is replaced by the sidecar identity once reachable; until
+    // then identity-dependent ops reject with a clear error and /health shows
+    // a null pubkey. The listener binds immediately (M16).
+    let initial_identity = if config.sidecar_url.is_empty() {
+        Some(if config.ssp_identity_pubkey.is_empty() {
+            local_pubkey_hex.clone()
+        } else {
+            config.ssp_identity_pubkey.clone()
+        })
     } else {
-        if pubkey_hex != config.ssp_identity_pubkey {
-            return Err(format!(
-                "resolved key pubkey {pubkey_hex} != SSP_IDENTITY_PUBKEY {}",
-                config.ssp_identity_pubkey
-            )
-            .into());
-        }
-        pubkey_hex
+        None
     };
     let db = Arc::new(Db::open(&config.data_dir).map_err(|e| format!("db: {e}"))?);
-    let backend = Arc::new(Backend::select(&config, db.clone()).await);
-    // Live event pump (fake backend ignores it).
+    // Fake Lightning is never silent: refuse unless explicitly allowed.
+    let allow_fake = std::env::var("SSP_ALLOW_FAKE_LN").unwrap_or_default() == "1";
+    let backend = Arc::new(tokio::sync::RwLock::new(
+        Backend::select(&config, db.clone()).await,
+    ));
+    if backend.read().await.live_node_id().is_none() && !allow_fake {
+        return Err("ldk-server unreachable and SSP_ALLOW_FAKE_LN!=1; refusing fake mode".into());
+    }
+    // Live event pump + recovery: if we started fake, keep retrying connect
+    // and swap the backend live when ldk-server answers.
     {
         let backend = backend.clone();
-        tokio::spawn(async move { backend.run_event_loop().await });
+        if let Backend::Live(live) = backend.read().await.clone() {
+            tokio::spawn(async move { Backend::run_event_pump(live).await });
+        }
+        let backend = backend.clone();
+        let config = config.clone();
+        let db = db.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if backend.read().await.live_node_id().is_some() {
+                    continue;
+                }
+                match LdkGrpcBackend::connect(&config, db.clone()).await {
+                    Ok(live) => {
+                        tracing::info!("ldk-server reachable; switching to live mode");
+                        tokio::spawn(Backend::run_event_pump(live.clone()));
+                        *backend.write().await = Backend::Live(live);
+                    }
+                    Err(e) => tracing::warn!("ldk-server still unreachable: {e}"),
+                }
+            }
+        });
     }
     let addr: SocketAddr = config.listen_addr.parse()?;
+    let identity = Arc::new(tokio::sync::RwLock::new(initial_identity));
+    // Sidecar identity resolution runs in the background; ops needing it fail
+    // closed until it resolves.
+    if !config.sidecar_url.is_empty() {
+        let identity = identity.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            loop {
+                match fetch_sidecar_identity(&config.sidecar_url, &config.sidecar_token).await {
+                    Ok(pk) => {
+                        info!("SSP identity from sidecar: {pk}");
+                        *identity.write().await = Some(pk);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("sidecar identity unavailable ({e}); retrying in 10s");
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    }
+                }
+            }
+        });
+    }
     let state = AppState {
         config: config.clone(),
         db,
         ldk: backend,
         ssp_secret_hex: secret_hex,
-        ssp_pubkey_hex: pubkey_hex.clone(),
+        identity: identity.clone(),
     };
-    info!(
-        "SSP listening on {} (network={}, identity={})",
-        addr, config.network, pubkey_hex
-    );
+    info!("SSP listening on {} (network={})", addr, config.network);
     let app = Router::new()
         .route("/health", get(health))
         .route("/", get(health))
