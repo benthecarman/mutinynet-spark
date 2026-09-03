@@ -5,7 +5,7 @@ use ldk_server_client::{
     ldk_server_grpc::{
         api::{
             Bolt11ClaimForHashRequest, Bolt11FailForHashRequest, Bolt11ReceiveForHashRequest,
-            Bolt11SendRequest, Bolt12SendRequest, GetPaymentDetailsRequest,
+            Bolt11ReceiveRequest, Bolt11SendRequest, Bolt12SendRequest, GetPaymentDetailsRequest,
         },
         events::event_envelope::Event as LdkRawEvent,
         types::{Bolt11InvoiceDescription, PaymentStatus},
@@ -420,13 +420,16 @@ impl LdkBackend for LdkGrpcBackend {
         memo: &str,
         expiry_secs: u32,
     ) -> Result<CreateInvoiceResult, String> {
+        // Non-hodl receive (production default): the wallet stores preimage
+        // shares with the SOs at creation, so the SO flow completes without
+        // any SSP-held preimage. A regular invoice auto-settles on payment;
+        // the wallet hash only binds the SO flow (verified SO-side).
         let resp = self
             .client
-            .bolt11_receive_for_hash(Bolt11ReceiveForHashRequest {
+            .bolt11_receive(Bolt11ReceiveRequest {
                 amount_msat: Some(amount_sats * 1000),
                 description: description_of(memo),
                 expiry_secs,
-                payment_hash: payment_hash_hex.to_string(),
             })
             .await
             .map_err(|e| e.to_string())?;
