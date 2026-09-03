@@ -5,7 +5,7 @@ use ldk_server_client::{
     ldk_server_grpc::{
         api::{
             Bolt11ClaimForHashRequest, Bolt11FailForHashRequest, Bolt11ReceiveForHashRequest,
-            Bolt11SendRequest, GetPaymentDetailsRequest,
+            Bolt11SendRequest, Bolt12SendRequest, GetPaymentDetailsRequest,
         },
         events::event_envelope::Event as LdkRawEvent,
         types::{Bolt11InvoiceDescription, PaymentStatus},
@@ -339,7 +339,32 @@ impl LdkBackend for LdkGrpcBackend {
     }
 
     // Send only inits; finality via SubscribeEvents.
+    // BOLT12 offers (lno1…) route to bolt12_send; everything else to bolt11_send.
     async fn pay_invoice(&self, invoice: &str, amount_sats: Option<u64>) -> PayResult {
+        if invoice.to_lowercase().starts_with("lno1") {
+            let req = Bolt12SendRequest {
+                offer: invoice.to_string(),
+                amount_msat: amount_sats.map(|s| s * 1000),
+                quantity: None,
+                payer_note: None,
+                route_parameters: None,
+            };
+            match self.client.bolt12_send(req).await {
+                Ok(resp) => {
+                    let _ = self.db.set_payment(&resp.payment_id, "PENDING").await;
+                    return PayResult {
+                        payment_id: resp.payment_id,
+                        status: "PENDING".to_string(),
+                    };
+                }
+                Err(e) => {
+                    return PayResult {
+                        payment_id: format!("init-failed: {e}"),
+                        status: "FAILED".to_string(),
+                    }
+                }
+            }
+        }
         let req = Bolt11SendRequest {
             invoice: invoice.to_string(),
             amount_msat: amount_sats.map(|s| s * 1000),
