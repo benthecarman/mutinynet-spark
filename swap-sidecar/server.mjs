@@ -196,8 +196,11 @@ const server = http.createServer(async (req, res) => {
       await claimPendingInbound().catch((e) => console.error("claim drain:", e.message));
       return send(200, { inboundTransferSparkId: tx.id, swapLeaves: leaves });
     } catch (e) {
-      console.error("swap-fill failed:", e.message);
-      return send(500, { error: e.message });
+      // Depleted ladder fails HERE, pre-lock (leaf selection balance check),
+      // so no leaves strand. Signal top-up distinctly for monitoring.
+      const needsTopup = /available balance|NEEDS_TOPUP/.test(e.message);
+      console.error(`swap-fill failed${needsTopup ? " (NEEDS_TOPUP)" : ""}:`, e.message);
+      return send(needsTopup ? 507 : 500, { error: e.message, needsTopup });
     }
   }
   return send(404, { error: "not found" });

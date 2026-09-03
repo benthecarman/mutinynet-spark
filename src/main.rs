@@ -224,18 +224,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let config = Config::from_env();
+    let mut config = Config::from_env();
     let (secret_hex, mut pubkey_hex) = config
         .resolve_signing_key()
         .map_err(|e| format!("signing key: {e}"))?;
     // When a swap sidecar is configured, IT owns the SSP identity (receives
     // swap outbounds and signs quotes via /sign): publish its pubkey so all
     // three agree. Falls back to the local key if the sidecar is down.
+    // The sidecar identity also guards the swap arm against recursion.
     if !config.sidecar_url.is_empty() {
         match fetch_sidecar_identity(&config.sidecar_url, &config.sidecar_token).await {
             Ok(pk) => {
                 info!("SSP identity from sidecar: {pk}");
-                pubkey_hex = pk;
+                pubkey_hex = pk.clone();
+                config.sidecar_identity_pubkey = pk;
             }
             Err(e) => tracing::warn!(
                 "sidecar identity unavailable ({e}); publishing local key {pubkey_hex}"

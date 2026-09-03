@@ -237,6 +237,14 @@ pub async fn dispatch(
         "RequestSwap" | "request_swap" => {
             let owner = auth::require_session(&state, headers).await?;
             let total = num_of(&input, "total_amount_sats");
+            // The sidecar serves fills from exact leaves only. If IT needs a
+            // swap, its ladder is depleted: fail fast so no leaves lock
+            // SO-side in a recursive swap. Top up the ladder instead.
+            if !state.config.sidecar_identity_pubkey.is_empty()
+                && owner == state.config.sidecar_identity_pubkey
+            {
+                return Err("NEEDS_TOPUP: sidecar ladder depleted, top up liquidity".to_string());
+            }
             if state.config.max_swap_total_sats > 0 && total > state.config.max_swap_total_sats {
                 return Err(format!(
                     "swap total {total} exceeds operator cap {}",

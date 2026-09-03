@@ -61,10 +61,11 @@ if (mnemonic) {
 }
 console.log("sidecar:", await wallet.getSparkAddress());
 // Binary leaf ladder (1000 * 2^n sats, MULTIPLICITY copies each): any
-// multiple-of-1000 target sum composes exactly, so sidecar transfers never
-// need a swap themselves (no recursion into the SSP). Floor 1000 avoids
-// bitcoind dust rejection. Denoms deplete as fills consume them: re-run fund
-// to top up (see docs/DEPLOY.md liquidity ops).
+// multiple-of-1000 target sum composes exactly, so sidecar transfers serve
+// fills directly. Fills CONSUME denoms; when exact composition fails the
+// transfer errors pre-lock (no stranded leaves) and /swap-fill answers 507
+// NEEDS_TOPUP: re-run fund to top up. Floor 1000 avoids bitcoind dust
+// rejection on regtest/signet faucets.
 const MULTIPLICITY = Number(process.env.FUND_MULTIPLICITY ?? "3");
 const DENOMS = (process.env.FUND_LADDER ?? "1000,2000,4000,8000,16000,32000,64000,128000,256000,512000,1024000,2048000,4096000,8192000")
   .split(",").map(BigInt);

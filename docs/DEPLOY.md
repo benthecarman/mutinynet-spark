@@ -19,11 +19,13 @@
 
 ## Liquidity ops (recurring)
 
-- Sidecar ladder denoms deplete as fills consume exact matches. Monitor
-  `/swap-sidecar:5001/health` (`available` vs `owned`); re-run `sidecar-fund`
-  to top up. Without exact denoms, fills fail and user swaps reject.
-- LDK: rebalance/close via `deploy/channels.sh` (`list-channels`,
-  `close-channel`). No autopilot by decision.
+- Sidecar fills consume ladder denoms; exact-match failures error pre-lock
+  (no stranded leaves) and `/swap-fill` answers 507 `NEEDS_TOPUP`.
+- The SSP rejects swaps FROM the sidecar identity fast for the same reason:
+  the sidecar must never recurse into its own swap flow.
+- Monitor `/swap-sidecar:5001/health` (`available` vs `owned`) and alert on
+  NEEDS_TOPUP; re-run `sidecar-fund` to top up. Rotate the liquidity wallet
+  (fresh mnemonic + fund) if leaves wedge.
 
 ## Secrets
 

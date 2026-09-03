@@ -26,6 +26,10 @@ pub struct Config {
     /// swapLeaves, which the SDK rejects by design.
     pub sidecar_url: String,
     pub sidecar_token: String,
+    /// Sidecar wallet identity. Swaps FROM this identity are rejected fast:
+    /// the sidecar must serve fills from exact leaves only, never recurse
+    /// into its own swap flow (that strands leaves SO-side).
+    pub sidecar_identity_pubkey: String,
     /// Max total per swap (sats). Bounds operator exposure: user swap
     /// primaries settle only via SO expiry-return, so a restored user wallet
     /// could resurrect spent leaves inside the return window. 0 = no cap.
@@ -52,6 +56,7 @@ impl Config {
             fee_flat_sats_swap: get("SSP_SWAP_FEE_SATS", "0").parse().unwrap_or(0),
             sidecar_url: get("SIDECAR_URL", ""),
             sidecar_token: get("SIDECAR_TOKEN", ""),
+            sidecar_identity_pubkey: get("SIDECAR_IDENTITY_PUBKEY", ""),
             max_swap_total_sats: get("MAX_SWAP_TOTAL_SATS", "1000000")
                 .parse()
                 .unwrap_or(1000000),
