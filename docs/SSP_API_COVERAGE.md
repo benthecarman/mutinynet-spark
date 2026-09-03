@@ -11,7 +11,9 @@ SDK's generated fragments read aliased keys.
 |---|---|---|
 | get_challenge / verify_challenge | live (secp256k1 verify, DER or compact, base64 or hex) | in-memory sessions, 24h |
 | lightning_receive_quote | shape-exact, real ECDSA issuer_signature | manifest is JSON (SDK proto-decodes it: LN-receive needs real TransferManifest proto, see LDK_GAPS) |
-| request_lightning_receive | shape-exact | FakeLdkBackend; live: Bolt11ReceiveForHash |
+| request_lightning_receive | live (hodl, SSP-owned preimage) | FROST split + ECIES per operator, stored via sidecar (owner = SSP); needs SSP_FROST_OPERATORS |
+| mint_invoice_preimage | live (SSP extension) | wallets mint the hash first, then createLightningHodlInvoice with it |
+| reveal_preimage | live (SSP extension) | cooperative wallets reveal; stock wallets never call it |
 | request_lightning_send | shape-exact | FakeLdkBackend; live: Bolt11Send |
 | lightning_send_fee_estimate | live heuristic | ppm config |
 | request_swap | live via funded sidecar (real SO inbound + change, exact SDK shape) | sidecar wallet; needs ladder liquidity (see DEPLOY.md) |

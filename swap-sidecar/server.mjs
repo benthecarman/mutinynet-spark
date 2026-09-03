@@ -138,6 +138,34 @@ const server = http.createServer(async (req, res) => {
       return send(500, { error: e.message });
     }
   }
+  if (req.url === "/store-shares" && req.method === "POST") {
+    if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { error: "unauthorized" });
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    try {
+      // Store SSP-split preimage shares via the coordinator (same call the
+      // SDK wallet makes; owner = SSP identity so attestor == holder).
+      // { paymentHashHex, shares: {identifier: hex}, threshold, invoiceString, ownerIdentityPubkeyHex }
+      const { paymentHashHex, shares, threshold, invoiceString, ownerIdentityPubkeyHex } = JSON.parse(body);
+      const encryptedPreimageShares = {};
+      for (const [identifier, hex] of Object.entries(shares ?? {})) {
+        encryptedPreimageShares[identifier] = Uint8Array.from(Buffer.from(hex, "hex"));
+      }
+      const client = await wallet.connectionManager.createSparkClient(
+        wallet.config.getCoordinatorAddress(),
+      );
+      await client.store_preimage_share_v2({
+        paymentHash: Uint8Array.from(Buffer.from(paymentHashHex, "hex")),
+        encryptedPreimageShares,
+        threshold,
+        invoiceString,
+        userIdentityPublicKey: Uint8Array.from(Buffer.from(ownerIdentityPubkeyHex, "hex")),
+      });
+      return send(200, { ok: true });
+    } catch (e) {
+      return send(500, { error: e.message });
+    }
+  }
   if (req.url === "/swap-fill" && req.method === "POST") {
     if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { error: "unauthorized" });
     let body = "";

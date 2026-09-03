@@ -30,6 +30,11 @@ pub struct Config {
     /// the sidecar must serve fills from exact leaves only, never recurse
     /// into its own swap flow (that strands leaves SO-side).
     pub sidecar_identity_pubkey: String,
+    /// SO set for FROST share encryption: JSON array of
+    /// {id, identifier, identityPublicKey}. Empty = skip share storage.
+    pub frost_operators_json: String,
+    /// FROST threshold (must match the SO signing threshold).
+    pub frost_threshold: usize,
     /// Max total per swap (sats). Bounds operator exposure: user swap
     /// primaries settle only via SO expiry-return, so a restored user wallet
     /// could resurrect spent leaves inside the return window. 0 = no cap.
@@ -57,6 +62,8 @@ impl Config {
             sidecar_url: get("SIDECAR_URL", ""),
             sidecar_token: get("SIDECAR_TOKEN", ""),
             sidecar_identity_pubkey: get("SIDECAR_IDENTITY_PUBKEY", ""),
+            frost_operators_json: get("SSP_FROST_OPERATORS", ""),
+            frost_threshold: get("SSP_FROST_THRESHOLD", "2").parse().unwrap_or(2),
             max_swap_total_sats: get("MAX_SWAP_TOTAL_SATS", "1000000")
                 .parse()
                 .unwrap_or(1000000),

@@ -13,6 +13,7 @@ use tracing::info;
 mod auth;
 mod config;
 mod db;
+mod frost;
 mod graphql;
 mod ldk;
 

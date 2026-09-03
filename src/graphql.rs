@@ -157,6 +157,13 @@ pub async fn dispatch(
                 .create_invoice(amount, &hash, &memo, expiry)
                 .await
                 .map_err(|e| format!("ldk create_invoice: {e}"))?;
+            // SSP-owned preimage (minted via mint_preimage): split into FROST
+            // shares, encrypt per operator, store via the coordinator with
+            // owner = SSP identity (attestor == holder, SO's own rule).
+            // Wallet-owned hashes skip this (preimage unknown here).
+            if state.ldk.preimage_for(&hash).await.is_some() {
+                store_preimage_shares(&state, &hash, &inv.invoice).await?;
+            }
             let rec = store_request(
                 &state,
                 "LIGHTNING_RECEIVE",
@@ -762,6 +769,72 @@ async fn fill_swap_via_sidecar(
         })
         .collect();
     Ok((inbound, leaves))
+}
+
+/// Split the SSP-held preimage for `payment_hash` into FROST shares, ECIES
+/// each to its operator, and store via the sidecar's coordinator session
+/// (same `store_preimage_share_v2` call a wallet makes; owner = SSP).
+async fn store_preimage_shares(
+    state: &AppState,
+    payment_hash_hex: &str,
+    invoice: &str,
+) -> Result<(), String> {
+    use crate::frost;
+    #[derive(serde::Deserialize)]
+    struct Operator {
+        id: u32,
+        identifier: String,
+        #[serde(rename = "identityPublicKey")]
+        identity_public_key: String,
+    }
+    let mut operators: Vec<Operator> = serde_json::from_str(&state.config.frost_operators_json)
+        .map_err(|_| "SSP_FROST_OPERATORS unset or invalid; cannot store shares".to_string())?;
+    if operators.is_empty() {
+        return Err("SSP_FROST_OPERATORS empty; cannot store shares".to_string());
+    }
+    operators.sort_by_key(|o| o.id);
+    let preimage_hex = state
+        .ldk
+        .preimage_for(payment_hash_hex)
+        .await
+        .ok_or_else(|| "preimage not held for hash".to_string())?;
+    let preimage = hex::decode(preimage_hex).map_err(|e| e.to_string())?;
+    let shares =
+        frost::split_secret_with_proofs(&preimage, state.config.frost_threshold, operators.len())?;
+    let mut wire = serde_json::Map::with_capacity(operators.len());
+    for (op, share) in operators.iter().zip(shares.iter()) {
+        // Self-check before sending: a bad share would fail SO-side.
+        frost::validate_share(&share.share, share.index, &share.proofs)?;
+        let proto = frost::encode_secret_share_proto(&share.share, &share.proofs);
+        let enc = frost::encrypt_share_to_operator(&proto, &op.identity_public_key)?;
+        wire.insert(op.identifier.clone(), Value::String(hex::encode(enc)));
+    }
+    if state.config.sidecar_url.is_empty() {
+        return Err("SIDECAR_URL unset; cannot reach store_preimage_share_v2".to_string());
+    }
+    let mut req = reqwest::Client::new()
+        .post(format!("{}/store-shares", state.config.sidecar_url))
+        .json(&serde_json::json!({
+            "paymentHashHex": payment_hash_hex,
+            "shares": wire,
+            "threshold": state.config.frost_threshold,
+            "invoiceString": invoice,
+            "ownerIdentityPubkeyHex": state.ssp_pubkey_hex,
+        }));
+    if !state.config.sidecar_token.is_empty() {
+        req = req.bearer_auth(&state.config.sidecar_token);
+    }
+    let resp: Value = req
+        .send()
+        .await
+        .map_err(|e| format!("sidecar store-shares: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("sidecar store-shares decode: {e}"))?;
+    if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
+        return Err(format!("sidecar store-shares: {err}"));
+    }
+    Ok(())
 }
 
 fn str_of(v: &Value, k: &str) -> String {
