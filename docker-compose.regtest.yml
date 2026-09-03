@@ -243,6 +243,7 @@ services:
         condition: service_healthy
     entrypoint: ["/entrypoint.sh", "node", "fund.mjs"]
     environment:
+      MINING: 1
       SPARK_LOCAL_INGRESS_HOST: sidecar
       SPARK_SDK_DIST: /sdk/index.node.js
       SPARK_NETWORK: LOCAL

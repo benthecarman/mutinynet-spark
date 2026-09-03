@@ -37,7 +37,7 @@ if (!SSP_IDENTITY) {
 }
 
 function baseOpts() {
-  return {
+  const opts = {
     network: NETWORK,
     signingOperators,
     threshold: 2,
@@ -48,6 +48,11 @@ function baseOpts() {
     },
     optimizationOptions: { auto: false, multiplicity: 0 },
   };
+  // Electrs (Esplora REST) for deposit claims. The SDK default only covers
+  // LOCAL/REGTEST/MAINNET hosts; custom chains must set ELECTRS_URL
+  // (e.g. https://mutinynet.com/api).
+  if (process.env.ELECTRS_URL) opts.electrsUrl = process.env.ELECTRS_URL;
+  return opts;
 }
 
 let wallet;
@@ -77,7 +82,7 @@ for (const amount of LADDER) {
   txids.push(sent.id);
 }
 console.log(`sent ${txids.length} ladder deposits`);
-await mineAndWait(3);
+await mineAndWait(3, txids);
 for (const txid of txids) {
   await wallet.claimDeposit(txid);
 }

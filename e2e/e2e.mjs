@@ -1,6 +1,7 @@
 // E2E: self-hosted SSP + local regtest SOs, driven through the real JS SDK.
 // Run: SPARK_SDK_DIST=/tmp/.../dist/index.node.js node e2e.mjs
-// Requires: compose stack up, TLS verification disabled via env.
+// (or ./e2e.sh which sets everything). Regtest-only: mines its own blocks.
+process.env.MINING ??= "1";
 
 const SDK_DIST = process.env.SPARK_SDK_DIST;
 if (!SDK_DIST) throw new Error("set SPARK_SDK_DIST to the built spark-sdk node entry");

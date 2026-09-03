@@ -1,8 +1,15 @@
-// Minimal regtest faucet over bitcoind RPC (no SDK test-utils needed).
+// Minimal faucet over bitcoind RPC (no SDK test-utils needed).
+// Regtest: MINING=1 mines via generatetoaddress (default, preserves old behavior).
+// Signet/custom chains: unset MINING and pass txids; mineAndWait polls the
+// node until the tx reaches the confirmation threshold instead.
 const URL = process.env.BITCOIN_RPC_URL ?? "http://127.0.0.1:8332";
 const USER = process.env.BITCOIN_RPC_USER ?? "testutil";
 const PASS = process.env.BITCOIN_RPC_PASSWORD ?? "testutilpassword";
 const WALLET = process.env.BITCOIN_RPC_WALLET ?? "default";
+// MINING=1 mines via generatetoaddress (regtest only). Anything else polls
+// for confirmations (signet/custom chains with an external miner).
+const MINING = process.env.MINING ?? "";
+const CONFS = Number(process.env.FUND_CONFS ?? "3");
 
 let id = 0;
 async function rpc(method, params = [], wallet) {
@@ -26,12 +33,37 @@ export async function sendToAddress(address, sats) {
 }
 
 export async function mine(n) {
+  if (MINING !== "1") throw new Error("generatetoaddress needs MINING=1 (regtest only)");
   const addr = await rpc("getnewaddress", [], WALLET);
   await rpc("generatetoaddress", [n, addr]);
 }
 
-export async function mineAndWait(n) {
-  await mine(n);
+async function waitForConfirmations(txids, confs, timeoutMs = 30 * 60 * 1000) {
+  const start = Date.now();
+  const pending = new Set(txids);
+  while (pending.size) {
+    for (const txid of [...pending]) {
+      try {
+        const tx = await rpc("getrawtransaction", [txid, true]);
+        if (tx && (tx.confirmations ?? 0) >= confs) pending.delete(txid);
+      } catch {
+        // Not yet visible; keep polling.
+      }
+    }
+    if (!pending.size) break;
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`timeout waiting for ${confs} confs: ${[...pending].join(",")}`);
+    }
+    await new Promise((r) => setTimeout(r, 15000));
+  }
+}
+
+export async function mineAndWait(n, txids = []) {
+  if (MINING === "1") {
+    await mine(n);
+  } else if (txids.length) {
+    await waitForConfirmations(txids, CONFS);
+  }
   // Chain watcher + SO need a moment to ingest.
   await new Promise((r) => setTimeout(r, 4000));
 }

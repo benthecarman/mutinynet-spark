@@ -73,6 +73,8 @@ const initOpts = {
   },
   optimizationOptions: { auto: false, multiplicity: 0 },
 };
+// See fund.mjs: custom chains must set ELECTRS_URL for any L1 reads.
+if (process.env.ELECTRS_URL) initOpts.electrsUrl = process.env.ELECTRS_URL;
 
 let wallet;
 if (mnemonic) {
