@@ -21,11 +21,23 @@
 
 - Sidecar fills consume ladder denoms; exact-match failures error pre-lock
   (no stranded leaves) and `/swap-fill` answers 507 `NEEDS_TOPUP`.
+- Small denoms deplete first: a handful of fills can exhaust them while the
+  total looks healthy. Top up with a small-denom skew, e.g.
+  `FUND_DENOMS=1000,2000,4000,8000,16000,32000,64000,128000
+  FUND_MULTIPLICITY=12 docker compose run --rm sidecar-fund`.
 - The SSP rejects swaps FROM the sidecar identity fast for the same reason:
   the sidecar must never recurse into its own swap flow.
-- Monitor `/swap-sidecar:5001/health` (`available` vs `owned`) and alert on
-  NEEDS_TOPUP; re-run `sidecar-fund` to top up. Rotate the liquidity wallet
+- Monitor `/swap-sidecar:5001/health` (`available` vs `owned`, `needsTopup`
+  flag); re-run `sidecar-fund` to top up. Rotate the liquidity wallet
   (fresh mnemonic + fund) if leaves wedge.
+- Boot order is deadlock-free by construction: the SSP blocks until the
+  sidecar publishes its identity (never serves a fallback key while
+  healthy); the sidecar never blocks on the SSP. `/health` reports
+  `identity_source` so pinning can be asserted.
+- Boot order is deadlock-free by construction: the SSP blocks until the
+  sidecar publishes its identity (never serves a fallback key while
+  healthy); the sidecar never blocks on the SSP. `/health` reports
+  `identity_source` so pinning can be asserted.
 - LDK: rebalance/close via `deploy/channels.sh` (`list-channels`,
   `close-channel`). No autopilot by decision.
 

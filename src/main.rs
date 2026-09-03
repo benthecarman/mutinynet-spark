@@ -55,6 +55,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "status": "ok",
         "network": state.config.network,
         "ssp_identity_pubkey": state.ssp_pubkey_hex,
+        "identity_source": if state.config.sidecar_url.is_empty() { "local" } else { "sidecar" },
         "ldk_mode": if state.ldk.live_node_id().is_some() { "live" } else { "fake" },
         "ldk_node_id": state.ldk.live_node_id(),
     }))
@@ -230,18 +231,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map_err(|e| format!("signing key: {e}"))?;
     // When a swap sidecar is configured, IT owns the SSP identity (receives
     // swap outbounds and signs quotes via /sign): publish its pubkey so all
-    // three agree. Falls back to the local key if the sidecar is down.
+    // three agree. Block until it resolves: publishing a fallback key while
+    // healthy would silently break every pinned wallet. With SIDECAR_URL
+    // empty the local key is used.
     // The sidecar identity also guards the swap arm against recursion.
     if !config.sidecar_url.is_empty() {
-        match fetch_sidecar_identity(&config.sidecar_url, &config.sidecar_token).await {
-            Ok(pk) => {
-                info!("SSP identity from sidecar: {pk}");
-                pubkey_hex = pk.clone();
-                config.sidecar_identity_pubkey = pk;
+        info!("waiting for sidecar identity...");
+        loop {
+            match fetch_sidecar_identity(&config.sidecar_url, &config.sidecar_token).await {
+                Ok(pk) => {
+                    info!("SSP identity from sidecar: {pk}");
+                    pubkey_hex = pk.clone();
+                    config.sidecar_identity_pubkey = pk;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("sidecar identity unavailable ({e}); retrying in 10s");
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
             }
-            Err(e) => tracing::warn!(
-                "sidecar identity unavailable ({e}); publishing local key {pubkey_hex}"
-            ),
         }
     }
     // Env identity wins when set; otherwise the resolved key's pubkey is used
