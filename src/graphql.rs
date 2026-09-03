@@ -411,6 +411,22 @@ pub async fn dispatch(
                             "status": "COMPLETED"}
             }}))
         }
+        // ---- preimage reveal (SSP extension, not in the stock SDK) ----
+        // Cooperative wallets reveal the preimage once they observe LN
+        // payment; the SSP verifies, stores, and claims the hodl invoice.
+        // Stock SDK wallets never call this (nothing to reveal to); their
+        // hodl invoices wait for expiry fail-back.
+        "RevealPreimage" | "reveal_preimage" => {
+            let _ = auth::require_session(&state, headers).await?;
+            let hash = str_of(&input, "payment_hash").to_lowercase();
+            let preimage = str_of(&input, "preimage").to_lowercase();
+            let claimed = state.ldk.reveal_and_claim(&hash, &preimage).await;
+            Ok(json!({ "reveal_preimage": {
+                "__typename": "RevealPreimageOutput",
+                "ok": claimed,
+                "claimed": claimed,
+            }}))
+        }
         // ---- reads ----
         // SDK Transfers query only. user_request is null for transfers the SSP
         // did not participate in (client reads userRequest?.__typename, null-safe).

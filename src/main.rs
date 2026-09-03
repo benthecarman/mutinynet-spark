@@ -209,6 +209,7 @@ fn detect_operation(req: &GraphqlRequest) -> String {
         "Transfers",
         "UserRequest",
         "FetchCurrentUserToUserRequestsConnection",
+        "RevealPreimage",
         "RegisterWalletWebhook",
         "DeleteWalletWebhook",
         "ListSparkWalletWebhooks",

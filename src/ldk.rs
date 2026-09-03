@@ -506,7 +506,27 @@ impl LdkBackend for LdkGrpcBackend {
             LnEvent::OutboundFailed { payment_id } => {
                 let _ = self.db.set_payment(&payment_id, "FAILED").await;
             }
-            LnEvent::InboundClaimable { .. } | LnEvent::InboundReceived { .. } => {}
+            // Self-settling: SSP-minted invoices carry an SSP-held preimage,
+            // so claim immediately (claim_for_hash). Wallet-hash invoices
+            // have no preimage here until revealed via the reveal_preimage
+            // mutation; they wait (expiry fails them back).
+            LnEvent::InboundClaimable { payment_hash } => {
+                if let Some(preimage) = self.preimage_for(&payment_hash).await {
+                    if self
+                        .client
+                        .bolt11_claim_for_hash(Bolt11ClaimForHashRequest {
+                            payment_hash: Some(payment_hash.clone()),
+                            claimable_amount_msat: None,
+                            preimage,
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        tracing::info!("claimed hodl invoice {payment_hash}");
+                    }
+                }
+            }
+            LnEvent::InboundReceived { .. } => {}
         }
     }
 
