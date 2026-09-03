@@ -191,6 +191,24 @@ services:
       - /config.toml
     restart: unless-stopped
 
+  # Second node: LN counterparty for e2e send/receive (channel peer for ldk-server).
+  ldk-server-2:
+    build:
+      context: ${LDK_SERVER_REF:-/tmp/opencode/ldk-server-ref}
+      dockerfile: Dockerfile
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3537:3536"
+      - "127.0.0.1:19736:9735"
+    volumes:
+      - ldk-data-2:/data
+      - ./e2e/ldk-server-2-config.toml:/config.toml:ro
+    command:
+      - /config.toml
+    restart: unless-stopped
+
   # ---- Swap-fill sidecar: funded Spark wallet completing leaf swaps ----
   # Mnemonic persists in sidecar-data; fund once via the sidecar-fund service.
   x-sidecar-common: &sidecar-common
@@ -294,5 +312,6 @@ volumes:
   bitcoind-data:
   tls-certs:
   ldk-data:
+  ldk-data-2:
   ssp-data:
   sidecar-data:
