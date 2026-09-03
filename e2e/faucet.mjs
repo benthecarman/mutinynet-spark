@@ -1,7 +1,7 @@
 // Minimal faucet over bitcoind RPC (no SDK test-utils needed).
-// Regtest: MINING=1 mines via generatetoaddress (default, preserves old behavior).
-// Signet/custom chains: unset MINING and pass txids; mineAndWait polls the
-// node until the tx reaches the confirmation threshold instead.
+// Regtest: set MINING=1 to mine via generatetoaddress (e2e.sh does this).
+// Signet/custom chains: leave MINING unset and pass txids; mineAndWait polls
+// the node until the tx reaches the confirmation threshold instead.
 const URL = process.env.BITCOIN_RPC_URL ?? "http://127.0.0.1:8332";
 const USER = process.env.BITCOIN_RPC_USER ?? "testutil";
 const PASS = process.env.BITCOIN_RPC_PASSWORD ?? "testutilpassword";
