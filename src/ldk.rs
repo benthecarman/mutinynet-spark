@@ -18,12 +18,11 @@ use crate::{config::Config, db::Db};
 /// What the SSP needs from Lightning. BOLT11 only (no BOLT12 hold support in
 /// ldk-server, and receives stay BOLT11 by decision).
 ///
-/// Receive model (non-hodl, production default): the wallet stores preimage
-/// shares with the SOs at invoice creation, so the SO flow completes without
-/// any SSP-held preimage. `create_invoice` issues a regular auto-settling
-/// invoice; the wallet hash only binds the SO flow (verified SO-side).
-/// Explicit hodl (`create_invoice_with_new_preimage` + claim/fail) remains
-/// for flows that opt into it.
+/// Receive model (hodl, SSP-owned preimage): wallets mint a hash via
+/// mint_preimage first and use it in createLightningHodlInvoice. The SSP
+/// holds the preimage before payment (compliant: attestor == holder per
+/// the SO's own rule) and auto-claims on LN arrival. The SO binds invoice
+/// hash deliberately, so the SSP never substitutes hashes.
 ///
 /// Send model: `pay_invoice` only INITS (`Bolt11Send`). Final status comes
 /// from `SubscribeEvents` (PaymentSuccessful/PaymentFailed) via
