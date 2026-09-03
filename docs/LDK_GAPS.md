@@ -5,7 +5,8 @@
    hash->preimage); wallet-supplied hashes stay wallet-owned (hodl, claim on
    reveal via `reveal_and_claim`). Implemented in `FakeLdkBackend`, maps 1:1
    to `Bolt11ReceiveForHash` / `Bolt11ClaimForHash` / `Bolt11FailForHash`.
-3. Receives stay BOLT11 only (no BOLT12 hodl in ldk-server).
+3. Receives stay BOLT11 only (no BOLT12 hodl in ldk-server). Sends accept
+   BOLT11 and BOLT12 offers (`lno1…` routes to `bolt12_send`).
 4. Send only inits (`Bolt11Send`); final status comes from `SubscribeEvents`
    (PaymentSuccessful/Failed) via `apply_ln_event`; wallets poll
    Transfers/UserRequest. Fake mode simulates the event with a 2s flip.
