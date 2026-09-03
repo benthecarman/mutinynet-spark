@@ -5,7 +5,7 @@ use ldk_server_client::{
     ldk_server_grpc::{
         api::{
             Bolt11ClaimForHashRequest, Bolt11FailForHashRequest, Bolt11ReceiveForHashRequest,
-            Bolt11ReceiveRequest, Bolt11SendRequest, Bolt12SendRequest, GetPaymentDetailsRequest,
+            Bolt11SendRequest, Bolt12SendRequest, GetPaymentDetailsRequest,
         },
         events::event_envelope::Event as LdkRawEvent,
         types::{Bolt11InvoiceDescription, PaymentStatus},
