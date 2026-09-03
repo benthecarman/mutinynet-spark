@@ -31,6 +31,17 @@ pub struct AppState {
     /// Published SSP identity. None while the sidecar identity is pending;
     /// identity-dependent ops reject until it resolves.
     pub identity: Arc<tokio::sync::RwLock<Option<String>>>,
+    /// Shared HTTP client (timeouts + pooling) for sidecar calls.
+    pub http: reqwest::Client,
+}
+
+/// One shared client: 15s total, 5s connect. Never build per-request clients.
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("http client builds")
 }
 
 pub async fn backend(state: &AppState) -> tokio::sync::RwLockReadGuard<'_, Backend> {
@@ -172,7 +183,7 @@ fn inflate_raw_deflate(input: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Fetch the sidecar wallet identity (with retries; sidecar may boot later).
 async fn fetch_sidecar_identity(sidecar_url: &str, token: &str) -> Result<String, String> {
-    let mut req = reqwest::Client::new().get(format!("{sidecar_url}/health"));
+    let mut req = http_client().get(format!("{sidecar_url}/health"));
     if !token.is_empty() {
         req = req.bearer_auth(token);
     }
@@ -319,6 +330,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
     }
+    // Periodic prune: expired sessions + challenges older than 1h.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                let now = chrono::Utc::now();
+                let _ = db.prune_expired_sessions(&now.to_rfc3339()).await;
+                let _ = db
+                    .prune_challenges(&(now - chrono::Duration::hours(1)).to_rfc3339())
+                    .await;
+            }
+        });
+    }
     let addr: SocketAddr = config.listen_addr.parse()?;
     let identity = Arc::new(tokio::sync::RwLock::new(initial_identity));
     // Sidecar identity resolution runs in the background; ops needing it fail
@@ -348,6 +373,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ldk: backend,
         ssp_secret_hex: secret_hex,
         identity: identity.clone(),
+        http: http_client(),
     };
     info!("SSP listening on {} (network={})", addr, config.network);
     let app = Router::new()

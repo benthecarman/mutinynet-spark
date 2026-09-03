@@ -194,6 +194,11 @@ services:
     ports:
       - "127.0.0.1:3536:3536"
       - "127.0.0.1:19735:9735"
+    healthcheck:
+      test: ["CMD-SHELL", "(echo > /dev/tcp/127.0.0.1/3536) 2>/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     volumes:
       - ldk-data:/data
       - ./e2e/ldk-server-config.toml:/config.toml:ro
@@ -230,6 +235,11 @@ services:
       - ssp
     ports:
       - "127.0.0.1:5001:5001"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:5001/health').then(r=>{if(!r.ok)process.exit(1)})\""]
+      interval: 15s
+      timeout: 10s
+      retries: 20
     environment:
       PORT: 5001
       SPARK_LOCAL_INGRESS_HOST: sidecar
@@ -275,6 +285,11 @@ services:
       - ldk-server
     ports:
       - "127.0.0.1:5000:5000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5000/health | grep -q '\"status\":\"ok\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     volumes:
       - ssp-data:/data
       - ldk-data:/ldk-data:ro

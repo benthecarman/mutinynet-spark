@@ -182,6 +182,7 @@ pub async fn dispatch(
                 &now,
                 json!({"amount_sats": amount, "payment_hash": hash,
                        "invoice": inv.invoice, "network": state.config.network}),
+                None,
             )
             .await?;
             let req_id = rec["id"].as_str().unwrap_or("").to_string();
@@ -213,6 +214,13 @@ pub async fn dispatch(
             let amt = opt_num(&input, "amount_sats");
             let idem = str_of(&input, "idempotency_key");
             let ext_id = str_of(&input, "user_outbound_transfer_external_id");
+            // Idempotency: a retry with the same key returns the stored
+            // request (with live status) instead of paying twice.
+            if !idem.is_empty() {
+                if let Some(rec) = state.db.find_by_idempotency(&owner, &idem).await? {
+                    return send_response_from_record(&state, &rec, &now).await;
+                }
+            }
             let pay = crate::backend(&state).await.pay_invoice(&inv, amt).await;
             let rec = store_request(
                 &state,
@@ -224,6 +232,11 @@ pub async fn dispatch(
                        "payment_id": pay.payment_id, "status": pay.status,
                        "network": state.config.network,
                        "user_outbound_transfer_external_id": ext_id}),
+                if idem.is_empty() {
+                    None
+                } else {
+                    Some(idem.as_str())
+                },
             )
             .await?;
             state
@@ -233,23 +246,10 @@ pub async fn dispatch(
                     rec["id"].as_str().unwrap_or(""),
                     "PREIMAGE_SWAP",
                     &pay.status,
+                    &owner,
                 )
                 .await?;
-            // Send only inits: status stays INITIATED until SubscribeEvents
-            // reports finality (see LdkBackend::apply_ln_event).
-            Ok(json!({ "request_lightning_send": {
-                "request": {
-                    "__typename": "LightningSendRequest",
-                    "id": rec["id"],
-                    "created_at": now,
-                    "updated_at": now,
-                    "network": state.config.network,
-                    "encoded_invoice": inv,
-                    "fee": {"original_value": 0, "original_unit": "SATOSHI"},
-                    "idempotency_key": idem,
-                    "status": "LIGHTNING_PAYMENT_INITIATED",
-                }
-            }}))
+            return send_response_from_record(&state, &rec, &now).await;
         }
         // ---- swaps (SDK mutation name is RequestSwap / field request_swap) ----
         "RequestSwap" | "request_swap" => {
@@ -273,7 +273,9 @@ pub async fn dispatch(
                     state.config.max_swap_total_sats
                 ));
             }
-            let fee = num_of(&input, "fee_sats");
+            // Fee is server-side (what leaves_swap_fee_estimate quotes);
+            // client input is ignored so a forged fee changes nothing.
+            let fee = state.config.fee_flat_sats_swap;
             let ext_id = str_of(&input, "user_outbound_transfer_external_id");
             let network = state.config.network.clone();
             // Target list (rc schema) or scalar (dated schema).
@@ -300,17 +302,18 @@ pub async fn dispatch(
                 &now,
                 json!({"total_amount_sats": total, "target_amount_sats": target,
                        "inbound_transfer_spark_id": inbound_id}),
+                None,
             )
             .await?;
             let rid = rec["id"].as_str().unwrap_or("").to_string();
             state
                 .db
-                .insert_transfer(&inbound_id, &rid, "COUNTER_SWAP", "CREATED")
+                .insert_transfer(&inbound_id, &rid, "COUNTER_SWAP", "CREATED", &owner)
                 .await?;
             if !ext_id.is_empty() {
                 state
                     .db
-                    .insert_transfer(&ext_id, &rid, "TRANSFER", "CREATED")
+                    .insert_transfer(&ext_id, &rid, "TRANSFER", "CREATED", &owner)
                     .await?;
             }
             let field = "request_swap";
@@ -384,7 +387,15 @@ pub async fn dispatch(
         // SDK ClaimStaticDeposit mutation only (no fixed-amount variant in SspClient).
         "ClaimStaticDeposit" | "claim_static_deposit" => {
             let owner = auth::require_session(&state, headers).await?;
-            store_request(&state, "CLAIM_STATIC_DEPOSIT", &owner, &now, input.clone()).await?;
+            store_request(
+                &state,
+                "CLAIM_STATIC_DEPOSIT",
+                &owner,
+                &now,
+                input.clone(),
+                None,
+            )
+            .await?;
             // ClaimStaticDepositOutputFragment selects only transfer_id.
             Ok(json!({ "claim_static_deposit": {
                 "__typename": "ClaimStaticDepositOutput",
@@ -405,6 +416,7 @@ pub async fn dispatch(
                 &owner,
                 &now,
                 input.clone(),
+                None,
             )
             .await?;
             Ok(json!({ "create_claim_instant_static_deposit": {
@@ -420,7 +432,7 @@ pub async fn dispatch(
             } else {
                 exit_speed
             };
-            let rec = store_request(&state, "COOP_EXIT", &owner, &now, input.clone()).await?;
+            let rec = store_request(&state, "COOP_EXIT", &owner, &now, input.clone(), None).await?;
             let req_id = rec["id"].as_str().unwrap_or("").to_string();
             Ok(json!({ "request_coop_exit": {
                 "request": {
@@ -483,9 +495,9 @@ pub async fn dispatch(
         // SDK Transfers query only. user_request is null for transfers the SSP
         // did not participate in (client reads userRequest?.__typename, null-safe).
         "Transfers" | "transfers" => {
-            let _ = auth::require_session(&state, headers).await?;
+            let owner = auth::require_session(&state, headers).await?;
             let ids = ids_of(&input, v);
-            let rows = state.db.transfers_for(&ids).await?;
+            let rows = state.db.transfers_for(&ids, &owner).await?;
             let map_row = |t: &Value| {
                 json!({
                     "__typename": "Transfer",
@@ -498,9 +510,9 @@ pub async fn dispatch(
             Ok(json!({ "transfers": list }))
         }
         "UserRequest" | "user_request" => {
-            let _ = auth::require_session(&state, headers).await?;
+            let owner = auth::require_session(&state, headers).await?;
             let rid = str_of(&input, "request_id");
-            let found = state.db.get_request(&rid).await?;
+            let found = state.db.get_request(&rid, &owner).await?;
             match found {
                 Some(rec) => Ok(json!({ "user_request": user_request_union(&state, &rec).await })),
                 None => Ok(json!({ "user_request": null })),
@@ -527,26 +539,50 @@ pub async fn dispatch(
 /// (argument lists stripped first so `name: $var` pairs don't pollute the map)
 /// and copies `field` -> `alias` on every object that has `field`.
 /// Extra keys are harmless: each `*FromJson` reads only its own aliases.
-pub fn apply_query_aliases(data: &mut Value, query: &str) -> Vec<(String, String)> {
+pub fn apply_query_aliases(data: &mut Value, query: &str) {
     let aliases = collect_aliases(query);
     apply_aliases_to_value(data, &aliases);
-    aliases
 }
 
 fn collect_aliases(query: &str) -> Vec<(String, String)> {
+    const MAX_ALIASES: usize = 2000;
     // Strip balanced (...) argument lists (they contain `name: value` pairs
-    // that are NOT selection aliases).
+    // that are NOT selection aliases). Track string literals and `#`
+    // comments so their contents never contribute pairs.
     let mut stripped = String::with_capacity(query.len());
     let mut depth = 0usize;
+    let mut in_string = false;
+    let mut in_comment = false;
+    let mut prev_backslash = false;
     for ch in query.chars() {
+        if in_comment {
+            if ch == '\n' {
+                in_comment = false;
+                stripped.push(ch);
+            }
+            continue;
+        }
+        if in_string {
+            if ch == '"' && !prev_backslash {
+                in_string = false;
+            }
+            prev_backslash = ch == '\\' && !prev_backslash;
+            continue;
+        }
         match ch {
+            '#' if depth == 0 => in_comment = true,
+            '"' if depth == 0 => in_string = true,
             '(' => depth += 1,
             ')' if depth > 0 => depth -= 1,
             _ if depth == 0 => stripped.push(ch),
             _ => {}
         }
+        if ch != '\\' {
+            prev_backslash = false;
+        }
     }
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let bytes = stripped.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -574,8 +610,13 @@ fn collect_aliases(query: &str) -> Vec<(String, String)> {
                     }
                     let field = &stripped[fstart..j];
                     // skip `__typename` (bare, no alias) and fragment spreads
-                    if name != "__typename" && name != field {
-                        out.push((name.to_string(), field.to_string()));
+                    if name != "__typename" && name != field && !name.starts_with("...") {
+                        if seen.insert((name.to_string(), field.to_string())) {
+                            out.push((name.to_string(), field.to_string()));
+                            if out.len() >= MAX_ALIASES {
+                                break;
+                            }
+                        }
                     }
                     i = j;
                     continue;
@@ -723,6 +764,39 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
     }
 }
 
+/// Build the request_lightning_send response from a stored LIGHTNING_SEND
+/// record, refreshing status from the payment tracker (M4 idempotent replay
+/// shares this with the fresh-send path).
+async fn send_response_from_record(
+    state: &AppState,
+    rec: &Value,
+    now: &str,
+) -> Result<Value, String> {
+    // Send only inits: status stays INITIATED until SubscribeEvents
+    // reports finality (see LdkBackend::apply_ln_event).
+    let p = rec.get("payload").cloned().unwrap_or(Value::Null);
+    let pid = p.get("payment_id").and_then(|v| v.as_str()).unwrap_or("");
+    let live = crate::backend(state).await.payment_status(pid).await;
+    let status = match live.as_str() {
+        "SUCCEEDED" => "LIGHTNING_PAYMENT_SUCCEEDED",
+        "FAILED" => "LIGHTNING_PAYMENT_FAILED",
+        _ => "LIGHTNING_PAYMENT_INITIATED",
+    };
+    Ok(json!({ "request_lightning_send": {
+        "request": {
+            "__typename": "LightningSendRequest",
+            "id": rec["id"],
+            "created_at": rec.get("created_at").cloned().unwrap_or(Value::Null),
+            "updated_at": now,
+            "network": state.config.network,
+            "encoded_invoice": p.get("encoded_invoice").cloned().unwrap_or(Value::Null),
+            "fee": {"original_value": 0, "original_unit": "SATOSHI"},
+            "idempotency_key": p.get("idempotency_key").cloned().unwrap_or(Value::Null),
+            "status": status,
+        }
+    }}))
+}
+
 /// Insert a user-request row into sqlite and return the record shape that
 /// `user_request_union` reads: {id, type, created_at, payload}.
 async fn store_request(
@@ -731,11 +805,12 @@ async fn store_request(
     owner: &str,
     now: &str,
     payload: Value,
+    idempotency_key: Option<&str>,
 ) -> Result<Value, String> {
     let id = Uuid::new_v4().to_string();
     state
         .db
-        .insert_request(&id, kind, owner, now, &payload)
+        .insert_request(&id, kind, owner, now, &payload, idempotency_key)
         .await?;
     Ok(json!({
         "id": id, "type": kind,
@@ -759,9 +834,7 @@ async fn fill_swap_via_sidecar(
     if targets.is_empty() {
         return Err("no targets".to_string());
     }
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = state.http.clone();
     let mut req = client
         .post(format!("{}/swap-fill", state.config.sidecar_url))
         .json(&serde_json::json!({
@@ -850,7 +923,9 @@ async fn store_preimage_shares(
     if state.config.sidecar_url.is_empty() {
         return Err("SIDECAR_URL unset; cannot reach store_preimage_share_v2".to_string());
     }
-    let mut req = reqwest::Client::new()
+    let mut req = state
+        .http
+        .clone()
         .post(format!("{}/store-shares", state.config.sidecar_url))
         .json(&serde_json::json!({
             "paymentHashHex": payment_hash_hex,
@@ -944,7 +1019,9 @@ async fn sign_with_ssp(state: &AppState, message: &str) -> Result<String, String
 }
 
 async fn sign_via_sidecar(state: &AppState, message: &str) -> Result<String, String> {
-    let mut req = reqwest::Client::new()
+    let mut req = state
+        .http
+        .clone()
         .post(format!("{}/sign", state.config.sidecar_url))
         .json(&serde_json::json!({ "message": message }));
     if !state.config.sidecar_token.is_empty() {

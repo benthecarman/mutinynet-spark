@@ -17,6 +17,10 @@ impl Db {
         let path: PathBuf = [data_dir, "ssp.sqlite"].iter().collect();
         let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
         conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS challenges(identity TEXT PRIMARY KEY, protected TEXT NOT NULL, issued_at TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, identity TEXT NOT NULL, valid_until TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, kind TEXT NOT NULL, owner TEXT NOT NULL, created_at TEXT NOT NULL, payload TEXT NOT NULL);
@@ -26,13 +30,33 @@ impl Db {
              CREATE TABLE IF NOT EXISTS static_quotes(txid TEXT NOT NULL, vout INTEGER NOT NULL, credit INTEGER NOT NULL, signature TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(txid, vout));",
         )
         .map_err(|e| e.to_string())?;
-        // Lightweight migration for DBs created before issued_at existed.
-        let has_issued: bool = conn
+        // Lightweight migrations for DBs created by older builds: probe for
+        // the column, ALTER when missing.
+        if conn
             .prepare("SELECT issued_at FROM challenges LIMIT 0")
-            .is_ok();
-        if !has_issued {
+            .is_err()
+        {
             conn.execute(
                 "ALTER TABLE challenges ADD COLUMN issued_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if conn.prepare("SELECT owner FROM transfers LIMIT 0").is_err() {
+            conn.execute(
+                "ALTER TABLE transfers ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if conn
+            .prepare("SELECT idempotency_key FROM requests LIMIT 0")
+            .is_err()
+        {
+            conn.execute("ALTER TABLE requests ADD COLUMN idempotency_key TEXT", [])
+                .map_err(|e| e.to_string())?;
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_owner_idem ON requests(owner, idempotency_key) WHERE idempotency_key IS NOT NULL AND idempotency_key <> ''",
                 [],
             )
             .map_err(|e| e.to_string())?;
@@ -45,10 +69,13 @@ impl Db {
     async fn with<T, F>(&self, f: F) -> Result<T, String>
     where
         F: FnOnce(&rusqlite::Connection) -> rusqlite::Result<T> + Send,
-        T: Send,
+        T: Send + 'static,
     {
-        let conn = self.inner.lock().await;
-        f(&conn).map_err(|e| e.to_string())
+        // rusqlite is blocking I/O: keep it off async workers.
+        tokio::task::block_in_place(|| {
+            let conn = self.inner.blocking_lock();
+            f(&conn).map_err(|e| e.to_string())
+        })
     }
 
     // ---- challenges (single-use, 5-minute expiry) ----
@@ -153,7 +180,7 @@ impl Db {
         .await
     }
 
-    // ---- requests ----
+    // ---- requests (owner-scoped) ----
     pub async fn insert_request(
         &self,
         id: &str,
@@ -161,23 +188,24 @@ impl Db {
         owner: &str,
         created_at: &str,
         payload: &Value,
+        idempotency_key: Option<&str>,
     ) -> Result<(), String> {
         let payload = serde_json::to_string(payload).map_err(|e| e.to_string())?;
         self.with(|c| {
             c.execute(
-                "INSERT INTO requests(id,kind,owner,created_at,payload) VALUES(?1,?2,?3,?4,?5)",
-                (id, kind, owner, created_at, payload),
+                "INSERT INTO requests(id,kind,owner,created_at,payload,idempotency_key) VALUES(?1,?2,?3,?4,?5,?6)",
+                (id, kind, owner, created_at, payload, idempotency_key),
             )
             .map(|_| ())
         })
         .await
     }
 
-    pub async fn get_request(&self, id: &str) -> Result<Option<Value>, String> {
+    pub async fn get_request(&self, id: &str, owner: &str) -> Result<Option<Value>, String> {
         self.with(|c| {
             c.query_row(
-                "SELECT id,kind,owner,created_at,payload FROM requests WHERE id=?1",
-                (id,),
+                "SELECT id,kind,owner,created_at,payload FROM requests WHERE id=?1 AND owner=?2",
+                (id, owner),
                 |r| {
                     let payload: String = r.get(4)?;
                     Ok(serde_json::json!({
@@ -198,56 +226,96 @@ impl Db {
         .await
     }
 
-    // ---- transfers ----
+    /// Idempotency: an in-flight/completed request with the same owner+key.
+    pub async fn find_by_idempotency(
+        &self,
+        owner: &str,
+        key: &str,
+    ) -> Result<Option<Value>, String> {
+        if key.is_empty() {
+            return Ok(None);
+        }
+        self.with(|c| {
+            c.query_row(
+                "SELECT id,kind,owner,created_at,payload FROM requests WHERE owner=?1 AND idempotency_key=?2 ORDER BY created_at DESC LIMIT 1",
+                (owner, key),
+                |r| {
+                    let payload: String = r.get(4)?;
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "type": r.get::<_, String>(1)?,
+                        "owner_identity_pubkey": r.get::<_, String>(2)?,
+                        "created_at": r.get::<_, String>(3)?,
+                        "payload": serde_json::from_str::<Value>(&payload).unwrap_or(Value::Null),
+                    }))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
+        })
+        .await
+    }
+
+    pub async fn prune_expired_sessions(&self, now_rfc3339: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute("DELETE FROM sessions WHERE valid_until<=?1", (now_rfc3339,))
+                .map(|_| ())
+        })
+        .await
+    }
+
+    // ---- transfers (owner-scoped) ----
     pub async fn insert_transfer(
         &self,
         spark_id: &str,
         request_id: &str,
         kind: &str,
         status: &str,
+        owner: &str,
     ) -> Result<(), String> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO transfers(spark_id,request_id,kind,status) VALUES(?1,?2,?3,?4)
-                 ON CONFLICT(spark_id) DO UPDATE SET status=excluded.status",
-                (spark_id, request_id, kind, status),
+                "INSERT INTO transfers(spark_id,request_id,kind,status,owner) VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(spark_id) DO UPDATE SET status=excluded.status WHERE transfers.owner=excluded.owner",
+                (spark_id, request_id, kind, status, owner),
             )
             .map(|_| ())
         })
         .await
     }
 
-    pub async fn transfers_for(&self, ids: &[String]) -> Result<Vec<Value>, String> {
+    /// Single query, capped row count.
+    pub async fn transfers_for(&self, ids: &[String], owner: &str) -> Result<Vec<Value>, String> {
+        const MAX_IDS: usize = 500;
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let conn = self.inner.lock().await;
-        let mut out = Vec::new();
-        for id in ids {
-            let row: Option<Value> = conn
-                .query_row(
-                    "SELECT spark_id,request_id,kind,status FROM transfers WHERE spark_id=?1",
-                    (id,),
-                    |r| {
-                        Ok(serde_json::json!({
-                            "spark_id": r.get::<_, String>(0)?,
-                            "user_request_id": r.get::<_, String>(1)?,
-                            "type": r.get::<_, String>(2)?,
-                            "status": r.get::<_, String>(3)?,
-                        }))
-                    },
-                )
-                .map(Some)
-                .or_else(|e| match e {
-                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                    e => Err(e),
-                })
-                .map_err(|e: rusqlite::Error| e.to_string())?;
-            if let Some(row) = row {
-                out.push(row);
+        let ids: Vec<&String> = ids.iter().take(MAX_IDS).collect();
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        // rusqlite params must be homogeneous: build owned Vec<Value-ish> via params_from_iter.
+        let sql = format!(
+            "SELECT spark_id,request_id,kind,status FROM transfers WHERE owner=? AND spark_id IN ({placeholders})"
+        );
+        self.with(move |c| {
+            let mut stmt = c.prepare(&sql)?;
+            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&owner];
+            for id in &ids {
+                params.push(id);
             }
-        }
-        Ok(out)
+            let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+                Ok(serde_json::json!({
+                    "spark_id": r.get::<_, String>(0)?,
+                    "user_request_id": r.get::<_, String>(1)?,
+                    "type": r.get::<_, String>(2)?,
+                    "status": r.get::<_, String>(3)?,
+                }))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<Value>>>()
+        })
+        .await
     }
 
     // ---- static deposit quotes (one row per UTXO) ----
