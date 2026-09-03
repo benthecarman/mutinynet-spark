@@ -15,7 +15,7 @@ RUN yarn install && yarn build:sdk \
 
 FROM node:22-bookworm-slim AS final
 WORKDIR /app
-COPY swap-sidecar/package.json ./
+COPY swap-sidecar/package.json swap-sidecar/package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 COPY swap-sidecar/server.mjs swap-sidecar/address.mjs swap-sidecar/fund.mjs ./
 COPY e2e/faucet.mjs ./faucet.mjs
