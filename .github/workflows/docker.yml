@@ -50,7 +50,7 @@ jobs:
         working-directory: /tmp/opencode/spark-ref/sdks/js
         run: |
           corepack enable
-          yarn install
+          yarn install --no-immutable
           yarn build:sdk
       - name: Run full regtest suite
         run: ./e2e/e2e.sh
