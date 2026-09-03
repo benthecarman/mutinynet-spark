@@ -26,6 +26,8 @@
 - Monitor `/swap-sidecar:5001/health` (`available` vs `owned`) and alert on
   NEEDS_TOPUP; re-run `sidecar-fund` to top up. Rotate the liquidity wallet
   (fresh mnemonic + fund) if leaves wedge.
+- LDK: rebalance/close via `deploy/channels.sh` (`list-channels`,
+  `close-channel`). No autopilot by decision.
 
 ## Secrets
 
