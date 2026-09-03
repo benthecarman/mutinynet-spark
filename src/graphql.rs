@@ -411,11 +411,23 @@ pub async fn dispatch(
                             "status": "COMPLETED"}
             }}))
         }
-        // ---- preimage reveal (SSP extension, not in the stock SDK) ----
-        // Cooperative wallets reveal the preimage once they observe LN
-        // payment; the SSP verifies, stores, and claims the hodl invoice.
-        // Stock SDK wallets never call this (nothing to reveal to); their
-        // hodl invoices wait for expiry fail-back.
+        // ---- preimage mint + reveal (SSP extensions, not in stock SDK) ----
+        // SSP-owned preimage model: the wallet mints a hash here FIRST, uses
+        // it in createLightningHodlInvoice, and the SSP holds the preimage
+        // before payment (compliant: attestor == holder). On LN arrival the
+        // SSP auto-claims; cooperative wallets can also reveal explicitly.
+        "MintInvoicePreimage" | "mint_invoice_preimage" => {
+            let _ = auth::require_session(&state, headers).await?;
+            let minted = state
+                .ldk
+                .create_invoice_with_new_preimage(0, "", 86400)
+                .await
+                .map_err(|e| format!("ldk mint: {e}"))?;
+            Ok(json!({ "mint_invoice_preimage": {
+                "__typename": "MintInvoicePreimageOutput",
+                "payment_hash": minted.payment_hash,
+            }}))
+        }
         "RevealPreimage" | "reveal_preimage" => {
             let _ = auth::require_session(&state, headers).await?;
             let hash = str_of(&input, "payment_hash").to_lowercase();
