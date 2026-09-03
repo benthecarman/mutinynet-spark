@@ -106,6 +106,8 @@ async function claimPendingInbound() {
   return claimed;
 }
 
+let needsTopup = false;
+
 const server = http.createServer(async (req, res) => {
   const send = (code, obj) => {
     res.writeHead(code, { "Content-Type": "application/json" });
@@ -113,7 +115,7 @@ const server = http.createServer(async (req, res) => {
   };
   if (req.url === "/health" && req.method === "GET") {
     const bal = await wallet.getBalance().catch(() => ({ balance: "0", satsBalance: {} }));
-    return send(200, { status: "ok", address: await wallet.getSparkAddress(), identityPubkey: await wallet.getIdentityPublicKey(), balance: String(bal.balance), breakdown: {
+    return send(200, { status: "ok", address: await wallet.getSparkAddress(), identityPubkey: await wallet.getIdentityPublicKey(), needsTopup, balance: String(bal.balance), breakdown: {
       available: String(bal.satsBalance?.available ?? "?"),
       owned: String(bal.satsBalance?.owned ?? "?"),
       incoming: String(bal.satsBalance?.incoming ?? "?"),
@@ -191,6 +193,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
       console.log(`swap-fill ${idempotencyKey}: ${total} sats -> ${receiver.slice(0, 20)}... tx=${tx.id}`);
+      needsTopup = false;
       // Claim the user's swap outbounds to us (same machinery as the SDK
       // background stream; keeps books balanced: user leaves come back).
       await claimPendingInbound().catch((e) => console.error("claim drain:", e.message));
@@ -198,9 +201,10 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       // Depleted ladder fails HERE, pre-lock (leaf selection balance check),
       // so no leaves strand. Signal top-up distinctly for monitoring.
-      const needsTopup = /available balance|NEEDS_TOPUP/.test(e.message);
-      console.error(`swap-fill failed${needsTopup ? " (NEEDS_TOPUP)" : ""}:`, e.message);
-      return send(needsTopup ? 507 : 500, { error: e.message, needsTopup });
+      const needsTopupErr = /available balance|NEEDS_TOPUP/.test(e.message);
+      if (needsTopupErr) needsTopup = true;
+      console.error(`swap-fill failed${needsTopupErr ? " (NEEDS_TOPUP)" : ""}:`, e.message);
+      return send(needsTopupErr ? 507 : 500, { error: e.message, needsTopup: needsTopupErr });
     }
   }
   return send(404, { error: "not found" });

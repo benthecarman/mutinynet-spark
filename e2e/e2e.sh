@@ -33,11 +33,13 @@ curl -s http://127.0.0.1:5000/health; echo
 echo "=== swap sidecar up + funded ==="
 docker compose -f docker-compose.regtest.yml up -d swap-sidecar
 sleep 5
-SIDECAR_BAL=$(curl -s http://127.0.0.1:5001/health | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);console.log(j.breakdown?.available ?? j.balance ?? 0)}catch{console.log(0)}})") || SIDECAR_BAL=0
-echo "sidecar available: $SIDECAR_BAL"
+SIDECAR_JSON=$(curl -s http://127.0.0.1:5001/health)
+SIDECAR_BAL=$(echo "$SIDECAR_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);console.log(j.breakdown?.available ?? j.balance ?? 0)}catch{console.log(0)}})") || SIDECAR_BAL=0
+SIDECAR_TOPUP=$(echo "$SIDECAR_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).needsTopup===true?'yes':'no')}catch{console.log('no')}})") || SIDECAR_TOPUP=no
+echo "sidecar available: $SIDECAR_BAL topup_flag: $SIDECAR_TOPUP"
 # Ladder denoms deplete as fills consume exact matches; top up well before
 # empty (failed fills lock leaves SO-side and strand liquidity).
-if [ "${SIDECAR_BAL:-0}" = "0" ] || [ "${SIDECAR_BAL:-0}" = "null" ] || [ "${SIDECAR_BAL:-0}" -lt 10000000 ]; then
+if [ "${SIDECAR_BAL:-0}" = "0" ] || [ "${SIDECAR_BAL:-0}" = "null" ] || [ "${SIDECAR_BAL:-0}" -lt 10000000 ] || [ "$SIDECAR_TOPUP" = "yes" ]; then
   echo "funding/topping up sidecar liquidity wallet..."
   docker compose -f docker-compose.regtest.yml run --rm sidecar-fund
 fi
