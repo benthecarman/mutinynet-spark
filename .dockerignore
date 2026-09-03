@@ -1,0 +1,10 @@
+.git
+target/
+data/
+node_modules/
+swap-sidecar/node_modules/
+*.sqlite
+*.mnemonic
+*.key
+.env
+deploy/.env

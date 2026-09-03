@@ -1,0 +1,10 @@
+# Caddy edge for the SSP: TLS termination + reverse proxy.
+# Copy this file next to your deployment compose and set {$SSP_DOMAIN}.
+# Caddy obtains certs automatically (ACME) and forwards to the SSP.
+{
+	email {$ACME_EMAIL}
+}
+
+{$SSP_DOMAIN} {
+	reverse_proxy ssp:5000
+}

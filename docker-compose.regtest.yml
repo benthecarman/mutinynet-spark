@@ -1,0 +1,295 @@
+# Local regtest e2e stack: bitcoind + postgres + 3 Spark Operators + our SSP.
+#
+# Usage:
+#   SPARK_REF=/tmp/opencode/spark-ref docker compose -f docker-compose.regtest.yml up --build -d
+#   ./e2e/e2e.sh   # runs the SDK end-to-end test, tears nothing down
+#   docker compose -f docker-compose.regtest.yml down
+#
+# SPARK_REF must point at a checkout of https://github.com/buildonspark/spark
+# (used to build the SO image and for the SDK test). Defaults below.
+#
+# Host ports (system postgres already owns 5432 here, so we use 5434):
+#   bitcoind RPC 8332, ZMQ 28332/28333, SOs 8535-8537, SSP 5000, postgres 5434.
+
+x-operator-common: &operator-common
+  build:
+    context: ${SPARK_REF:-/tmp/opencode/spark-ref}
+    dockerfile: Dockerfile
+  depends_on:
+    postgres:
+      condition: service_healthy
+    bitcoin-init:
+      condition: service_completed_successfully
+    cert-init:
+      condition: service_completed_successfully
+  restart: unless-stopped
+  entrypoint: ["/bin/sh", "-c"]
+  volumes:
+    - ./e2e/upstream/entrypoint.sh:/opt/spark/entrypoint.sh:ro
+    - ./e2e/upstream/config.json:/opt/spark/config.json:ro
+    - ./e2e/upstream/operator.config.yaml:/opt/spark/operator.config.yaml:ro
+    - ./e2e/upstream/operator_0.key:/opt/spark/keys/operator_0.key:ro
+    - ./e2e/upstream/operator_1.key:/opt/spark/keys/operator_1.key:ro
+    - ./e2e/upstream/operator_2.key:/opt/spark/keys/operator_2.key:ro
+    - tls-certs:/opt/spark/tls:ro
+
+services:
+  cert-init:
+    image: alpine:3.20
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        apk add --no-cache openssl > /dev/null
+        for i in 0 1 2; do
+          KEY="/tls/server_$${i}.key"
+          CERT="/tls/server_$${i}.crt"
+          if [ -f "$$KEY" ] && [ -f "$$CERT" ]; then
+            echo "TLS key/cert for operator $$i already exist, skipping"
+            continue
+          fi
+          echo "Generating TLS key/cert for operator $$i..."
+          openssl genrsa -out "$$KEY" 2048 2>/dev/null
+          openssl req -new -x509 \
+            -key "$$KEY" -out "$$CERT" \
+            -days 3650 \
+            -subj "/CN=spark-operator-$${i}" \
+            -addext "subjectAltName = DNS:spark-operator-$${i},DNS:localhost,DNS:spark-operator-$${i}.minikube.local"
+        done
+        echo "TLS certificates ready"
+    volumes:
+      - tls-certs:/tls
+
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./e2e/upstream/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  bitcoind:
+    image: lncm/bitcoind:v28.0
+    command:
+      - -conf=/bitcoin.conf
+    ports:
+      - "127.0.0.1:8332:8332"
+      - "127.0.0.1:28332:28332"
+      - "127.0.0.1:28333:28333"
+    volumes:
+      - bitcoind-data:/data/.bitcoin
+      - ./e2e/upstream/bitcoin.conf:/bitcoin.conf:ro
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=testutil", "-rpcpassword=testutilpassword", "-rpcport=8332", "getblockchaininfo"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  bitcoin-init:
+    image: lncm/bitcoind:v28.0
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        CLI="bitcoin-cli -regtest -rpcuser=testutil -rpcpassword=testutilpassword -rpcconnect=bitcoind -rpcport=8332"
+        if ! $$CLI listwallets | grep -q default; then
+          $$CLI createwallet default false false '' false true
+        fi
+        BALANCE=$$($$CLI -rpcwallet=default getbalance)
+        case "$$BALANCE" in
+          0|0.00000000) NEEDS_FUND=1 ;;
+          *) NEEDS_FUND=0 ;;
+        esac
+        if [ "$$NEEDS_FUND" = "1" ]; then
+          ADDRESS=$$($$CLI -rpcwallet=default getnewaddress)
+          $$CLI generatetoaddress 101 "$$ADDRESS" > /dev/null
+          echo "Funded wallet with 101 blocks"
+        fi
+        echo "Bitcoin wallet ready"
+
+  bitcoin-miner:
+    image: lncm/bitcoind:v28.0
+    depends_on:
+      bitcoin-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        CLI="bitcoin-cli -regtest -rpcuser=testutil -rpcpassword=testutilpassword -rpcconnect=bitcoind -rpcport=8332"
+        while true; do
+          ADDRESS=$$($$CLI -rpcwallet=default getnewaddress 2>&1) || { sleep 10; continue; }
+          $$CLI generatetoaddress 1 "$$ADDRESS" > /dev/null 2>&1 && \
+            echo "$$(date): Mined 1 block" || \
+            echo "$$(date): ERROR: Failed to mine block"
+          sleep 10
+        done
+
+  spark-operator-0:
+    <<: *operator-common
+    command:
+      - /opt/spark/entrypoint.sh 0
+    ports:
+      - "127.0.0.1:8535:8535"
+    networks:
+      default:
+        aliases:
+          - spark-operator-0.minikube.local
+
+  spark-operator-1:
+    <<: *operator-common
+    command:
+      - /opt/spark/entrypoint.sh 1
+    ports:
+      - "127.0.0.1:8536:8535"
+    networks:
+      default:
+        aliases:
+          - spark-operator-1.minikube.local
+
+  spark-operator-2:
+    <<: *operator-common
+    command:
+      - /opt/spark/entrypoint.sh 2
+    ports:
+      - "127.0.0.1:8537:8535"
+    networks:
+      default:
+        aliases:
+          - spark-operator-2.minikube.local
+
+  # ---- Lightning backend (decision 5: bitcoind backend) --------------------
+  # Built from a local ldk-server checkout (set LDK_SERVER_REF). The SSP talks
+  # to it over gRPC once built with --features ldk; default builds stay in
+  # fake mode and only need it present for topology parity.
+  ldk-server:
+    build:
+      context: ${LDK_SERVER_REF:-/tmp/opencode/ldk-server-ref}
+      dockerfile: Dockerfile
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3536:3536"
+      - "127.0.0.1:19735:9735"
+    volumes:
+      - ldk-data:/data
+      - ./e2e/ldk-server-config.toml:/config.toml:ro
+    command:
+      - /config.toml
+    restart: unless-stopped
+
+  # ---- Swap-fill sidecar: funded Spark wallet completing leaf swaps ----
+  # Mnemonic persists in sidecar-data; fund once via the sidecar-fund service.
+  x-sidecar-common: &sidecar-common
+    image: ${SIDECAR_IMAGE:-ghcr.io/benthecarman/mutinynet-ssp-sidecar:latest}
+    build:
+      context: .
+      dockerfile: swap-sidecar.Dockerfile
+    volumes:
+      - sidecar-data:/app/data
+      - ./e2e:/app/e2e:ro
+      - tls-certs:/tls:ro
+    environment:
+      # Trust root for SO self-signed certs (SDK loads /tmp/minikube-ca.pem
+      # when SPARK_LOCAL_INGRESS_HOST is set; entrypoint bundles /tls certs).
+      SPARK_LOCAL_INGRESS_HOST: sidecar
+      SPARK_SDK_DIST: /sdk/index.node.js
+      SPARK_NETWORK: LOCAL
+      SO_HOSTS: spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535
+      SSP_URL: http://ssp:5000
+      SIDECAR_MNEMONIC_FILE: /app/data/sidecar.mnemonic
+      SIDECAR_TOKEN: ${SIDECAR_TOKEN:-regtest-sidecar-token}
+      SPARK_DANGEROUSLY_DISABLE_TLS_VERIFICATION: 1
+
+  swap-sidecar:
+    <<: *sidecar-common
+    depends_on:
+      - spark-operator-0
+      - spark-operator-1
+      - spark-operator-2
+      - ssp
+    ports:
+      - "127.0.0.1:5001:5001"
+    environment:
+      PORT: 5001
+      SPARK_LOCAL_INGRESS_HOST: sidecar
+      SPARK_SDK_DIST: /sdk/index.node.js
+      SPARK_NETWORK: LOCAL
+      SO_HOSTS: spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535
+      SSP_URL: http://ssp:5000
+      SIDECAR_MNEMONIC_FILE: /app/data/sidecar.mnemonic
+      SIDECAR_TOKEN: ${SIDECAR_TOKEN:-regtest-sidecar-token}
+    restart: unless-stopped
+
+  # One-shot: fund the sidecar liquidity wallet from the regtest bitcoind.
+  # Usage: docker compose -f docker-compose.regtest.yml run --rm sidecar-fund
+  sidecar-fund:
+    <<: *sidecar-common
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    entrypoint: ["/entrypoint.sh", "node", "fund.mjs"]
+    environment:
+      SPARK_LOCAL_INGRESS_HOST: sidecar
+      SPARK_SDK_DIST: /sdk/index.node.js
+      SPARK_NETWORK: LOCAL
+      SO_HOSTS: spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535
+      SSP_URL: http://ssp:5000
+      SIDECAR_MNEMONIC_FILE: /app/data/sidecar.mnemonic
+      BITCOIN_RPC_URL: http://bitcoind:8332
+      BITCOIN_RPC_USER: testutil
+      BITCOIN_RPC_PASSWORD: testutilpassword
+      FUND_AMOUNT_SATS: 20000000
+
+  ssp:
+    # Prebuilt: docker compose pull (needs GHCR access); or --build locally.
+    image: ${SSP_IMAGE:-ghcr.io/benthecarman/mutinynet-ssp:latest}
+    build:
+      context: .
+      dockerfile: ssp.Dockerfile
+    depends_on:
+      - spark-operator-0
+      - spark-operator-1
+      - spark-operator-2
+      - ldk-server
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - ssp-data:/data
+      - ldk-data:/ldk-data:ro
+    environment:
+      SSP_LISTEN_ADDR: 0.0.0.0:5000
+      SSP_NETWORK: REGTEST
+      # No committed secrets: first boot generates <SSP_DATA_DIR>/ssp.key.
+      # Publish SSP_IDENTITY_PUBKEY from /health into wallet configs.
+      SSP_DATA_DIR: /data
+      # Live LDK backend (decision 5): bitcoind-backed ldk-server above.
+      LDK_GRPC_ADDR: ldk-server:3536
+      LDK_API_KEY_FILE: /ldk-data/regtest/api_key
+      LDK_TLS_CERT_FILE: /ldk-data/tls.crt
+      SSP_LN_FEE_PPM: 0
+      SSP_SWAP_FEE_SATS: 0
+      SIDECAR_URL: http://swap-sidecar:5001
+      SIDECAR_TOKEN: ${SIDECAR_TOKEN:-regtest-sidecar-token}
+      RUST_LOG: info
+
+volumes:
+  postgres-data:
+  bitcoind-data:
+  tls-certs:
+  ldk-data:
+  ssp-data:
+  sidecar-data:

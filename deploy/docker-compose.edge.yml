@@ -1,0 +1,34 @@
+# Deploy overlay: run only the SSP (+ sidecar + ldk-server) against an
+# EXISTING MutinyNet setup that already provides bitcoind, postgres and SOs.
+#
+#   1. cp deploy/.env.example deploy/.env && edit it (all secrets/ described below)
+#   2. docker compose -f docker-compose.regtest.yml --env-file deploy/.env \
+#        up -d ssp swap-sidecar ldk-server
+#      (override SO_HOSTS/BITCOIN hosts in .env to point at your infra)
+#   3. Publish the SSP identity from https://<SSP_DOMAIN>/health as wallets'
+#      sspClientOptions.identityPublicKey (schemaEndpoint graphql/spark/rc).
+#   4. Fund the sidecar: FUND via deploy/fund-sidecar.sh (needs BITCOIN_RPC_*).
+#   5. Open LN channels: deploy/channels.sh connect/open (needs inbound for
+#      receives, outbound for sends).
+#
+# The regtest compose doubles as the deploy template: every external
+# dependency is a hostname already (bitcoind, postgres, spark-operator-N).
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      SSP_DOMAIN: ${SSP_DOMAIN:?set SSP_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+    restart: unless-stopped
+
+volumes:
+  caddy-data:
+  caddy-config:

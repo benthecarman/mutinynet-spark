@@ -1,0 +1,15 @@
+/target
+/target/
+data/
+*.sqlite
+*.sqlite-journal
+node_modules/
+swap-sidecar/node_modules/
+sidecar.mnemonic
+*.mnemonic
+*.key
+.env
+.env.local
+deploy/.env
+e2e/*.log
+.DS_Store

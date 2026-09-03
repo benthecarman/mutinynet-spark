@@ -1,0 +1,10 @@
+{
+  "name": "ssp-swap-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.2.0",
+    "@scure/base": "^1.1.9"
+  }
+}

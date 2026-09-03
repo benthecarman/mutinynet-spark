@@ -1,0 +1,19 @@
+# ldk-server regtest config for the e2e stack (bitcoind backend, decision 5).
+[node]
+network = "regtest"
+listening_addresses = ["0.0.0.0:9735"]
+alias = "mutinynet-ssp-regtest"
+
+[storage.disk]
+dir_path = "/data"
+
+[log]
+level = "Info"
+
+[tls]
+hosts = ["ldk-server"]
+
+[bitcoind]
+rpc_address = "bitcoind:8332"
+rpc_user = "testutil"
+rpc_password = "testutilpassword"
