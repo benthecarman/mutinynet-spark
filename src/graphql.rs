@@ -237,19 +237,12 @@ pub async fn dispatch(
         "RequestSwap" | "request_swap" => {
             let owner = auth::require_session(&state, headers).await?;
             let total = num_of(&input, "total_amount_sats");
-            // rc schema sends target_amount_sats as [Long!]; dated schema as Long.
-            let target = input
-                .get("target_amount_sats")
-                .and_then(|x| {
-                    x.as_u64().or_else(|| {
-                        x.as_array()?
-                            .iter()
-                            .filter_map(|e| e.as_u64())
-                            .sum::<u64>()
-                            .into()
-                    })
-                })
-                .unwrap_or(0);
+            if state.config.max_swap_total_sats > 0 && total > state.config.max_swap_total_sats {
+                return Err(format!(
+                    "swap total {total} exceeds operator cap {}",
+                    state.config.max_swap_total_sats
+                ));
+            }
             let fee = num_of(&input, "fee_sats");
             let ext_id = str_of(&input, "user_outbound_transfer_external_id");
             let network = state.config.network.clone();
@@ -291,7 +284,10 @@ pub async fn dispatch(
                     .await?;
             }
             let field = "request_swap";
-            Ok(json!({ field: {
+            let mut top = serde_json::Map::with_capacity(1);
+            top.insert(
+                field.to_string(),
+                json!({
                 "request": {
                     "__typename": "LeavesSwapRequest",
                     "id": rec["id"],
@@ -311,7 +307,9 @@ pub async fn dispatch(
                     "swap_leaves": swap_leaves,
                     "expires_at": null,
                 }
-            }}))
+                }),
+            );
+            Ok(Value::Object(top))
         }
         // ---- static deposits (SDK uses static_deposit_quote only) ----
         "StaticDepositQuote" | "static_deposit_quote" => {

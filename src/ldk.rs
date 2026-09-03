@@ -8,7 +8,7 @@ use ldk_server_client::{
             Bolt11SendRequest, GetPaymentDetailsRequest,
         },
         events::event_envelope::Event as LdkRawEvent,
-        types::{payment_kind::Kind as PaymentKind, Bolt11InvoiceDescription, PaymentStatus},
+        types::{Bolt11InvoiceDescription, PaymentStatus},
     },
 };
 use sha2::{Digest, Sha256};
@@ -44,14 +44,24 @@ pub trait LdkBackend: Send + Sync {
         memo: &str,
         expiry_secs: u32,
     ) -> Result<CreateInvoiceResult, String>;
+    /// SSP-minted invoice path (hodl with SSP-held preimage). Used by live
+    /// receive flows once the SDK requests it; kept exact to the RPC shape.
+    #[allow(dead_code)]
     async fn create_invoice_with_new_preimage(
         &self,
         amount_sats: u64,
         memo: &str,
         expiry_secs: u32,
     ) -> Result<NewInvoiceResult, String>;
+    /// Called when the SO/user reveals a preimage for a pending hodl invoice.
+    /// Wired to Bolt11ClaimForHash in live mode.
+    #[allow(dead_code)]
     async fn reveal_and_claim(&self, payment_hash_hex: &str, preimage_hex: &str) -> bool;
+    /// Expiry path for hodl invoices (Bolt11FailForHash in live mode).
+    #[allow(dead_code)]
     async fn fail_hold(&self, payment_hash_hex: &str) -> bool;
+    /// SSP-held preimage lookup (None when the wallet owns the preimage).
+    #[allow(dead_code)]
     async fn preimage_for(&self, payment_hash_hex: &str) -> Option<String>;
     async fn apply_ln_event(&self, event: LnEvent);
     fn live_node_id(&self) -> Option<String>;
@@ -64,19 +74,24 @@ pub struct PayResult {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct CreateInvoiceResult {
     pub invoice: String,
+    #[allow(dead_code)]
     pub payment_hash: String,
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct NewInvoiceResult {
     pub invoice: String,
+    #[allow(dead_code)]
     pub payment_hash: String,
 }
 
 /// Minimal SSP view of ldk-server SubscribeEvents payloads.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum LnEvent {
     OutboundSucceeded { payment_id: String },
     OutboundFailed { payment_id: String },
@@ -176,6 +191,9 @@ impl LdkBackend for Backend {
             }
         }
     }
+    /// SSP-minted invoice path (hodl with SSP-held preimage). Used by live
+    /// receive flows once the SDK requests it; kept exact to the RPC shape.
+    #[allow(dead_code)]
     async fn create_invoice_with_new_preimage(
         &self,
         amount_sats: u64,
@@ -393,6 +411,9 @@ impl LdkBackend for LdkGrpcBackend {
         })
     }
 
+    /// SSP-minted invoice path (hodl with SSP-held preimage). Used by live
+    /// receive flows once the SDK requests it; kept exact to the RPC shape.
+    #[allow(dead_code)]
     async fn create_invoice_with_new_preimage(
         &self,
         amount_sats: u64,
@@ -525,6 +546,9 @@ impl LdkBackend for FakeLdkBackend {
         })
     }
 
+    /// SSP-minted invoice path (hodl with SSP-held preimage). Used by live
+    /// receive flows once the SDK requests it; kept exact to the RPC shape.
+    #[allow(dead_code)]
     async fn create_invoice_with_new_preimage(
         &self,
         amount_sats: u64,

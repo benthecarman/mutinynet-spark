@@ -86,6 +86,26 @@ if (mnemonic) {
 }
 console.log("sidecar wallet:", await wallet.getSparkAddress());
 
+// Best-effort drain of inbound transfers addressed to us (user swap
+// outbounds). Uses the wallet's own transfer service (private API surface,
+// same machinery as the SDK background claimer).
+async function claimPendingInbound() {
+  const svc = wallet.transferService ?? wallet._transferService;
+  if (!svc || typeof svc.queryPendingTransfers !== "function") return 0;
+  const pending = await svc.queryPendingTransfers({ limit: 50, offset: 0 });
+  let claimed = 0;
+  for (const t of pending?.transfers ?? []) {
+    try {
+      await svc.claimTransfer(t);
+      claimed++;
+    } catch (e) {
+      console.error(`claim ${t.id} failed:`, e.message);
+    }
+  }
+  if (claimed) console.log(`claimed ${claimed} inbound transfer(s)`);
+  return claimed;
+}
+
 const server = http.createServer(async (req, res) => {
   const send = (code, obj) => {
     res.writeHead(code, { "Content-Type": "application/json" });
@@ -171,6 +191,9 @@ const server = http.createServer(async (req, res) => {
         });
       }
       console.log(`swap-fill ${idempotencyKey}: ${total} sats -> ${receiver.slice(0, 20)}... tx=${tx.id}`);
+      // Claim the user's swap outbounds to us (same machinery as the SDK
+      // background stream; keeps books balanced: user leaves come back).
+      await claimPendingInbound().catch((e) => console.error("claim drain:", e.message));
       return send(200, { inboundTransferSparkId: tx.id, swapLeaves: leaves });
     } catch (e) {
       console.error("swap-fill failed:", e.message);

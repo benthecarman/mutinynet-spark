@@ -32,7 +32,32 @@
   commit, inject via env/files, back up the volumes.
 - Rotate `SIDECAR_TOKEN` by restarting both ssp and swap-sidecar.
 
-## Residual risks (not fixable in this repo)
+## Swap settlement gap (read before mainnet)
+
+User swap outbounds (`PRIMARY_SWAP_V3`) are settled only by SO
+expiry-return: observed on regtest as `SENDER_KEY_TWEAK_PENDING` ->
+`RETURNED`. The receiver-side accept is SO-internal (the actual
+un-open-sourced glue); the sidecar cannot countersign it.
+
+Consequences:
+
+- Honest flows are exact: users get paid, no doubling in the happy path.
+- Inside the return window, a restored/resynced user wallet could resurrect
+  spent leaves and double-spend against sidecar funds.
+- The sidecar only spends; nothing flows back (user outbounds return to
+  users, not to the SSP).
+
+Mitigations (all implemented):
+
+- `MAX_SWAP_TOTAL_SATS` cap per swap (default 1M sats): bounds exposure.
+- Monitor sidecar drain rate (`/swap-sidecar:5001/health` available vs
+  owned) and SO `transfers` for unexpected `RETURNED` volume.
+- Keep ladder topped up (`sidecar-fund`); rotate the liquidity wallet
+  (fresh mnemonic + fund) if leaves wedge.
+- Full settlement needs the SO-internal accept RPC; tracked as the one
+  remaining protocol gap.
+
+## Other residual risks (not fixable in this repo)
 
 - ldk-server has no custom-signet flag. If MutinyNet's genesis differs from
   public signet, ldk-server refuses it until patched upstream. The SSP runs

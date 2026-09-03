@@ -41,9 +41,8 @@ pub struct GraphqlRequest {
     pub query: String,
     #[serde(default)]
     pub variables: serde_json::Value,
-    #[serde(default)]
-    #[allow(non_snake_case)]
-    pub operationName: Option<String>,
+    #[serde(default, rename = "operationName")]
+    pub operation_name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -174,7 +173,7 @@ async fn fetch_sidecar_identity(sidecar_url: &str, token: &str) -> Result<String
 /// Detect the GraphQL operation from operationName or query text.
 /// The JS SDK sends raw documents like `mutation RequestLightningSend(...)`.
 fn detect_operation(req: &GraphqlRequest) -> String {
-    if let Some(name) = &req.operationName {
+    if let Some(name) = &req.operation_name {
         if !name.is_empty() {
             return name.clone();
         }

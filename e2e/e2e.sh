@@ -23,22 +23,36 @@ for i in $(seq 1 60); do
 done
 
 echo "=== wait for SSP ==="
-for i in $(seq 1 30); do
+for i in $(seq 1 90); do
   if curl -sf http://127.0.0.1:5000/health > /dev/null; then break; fi
-  if [ "$i" = 30 ]; then echo "SSP not healthy"; exit 1; fi
-  sleep 2
+  if [ "$i" = 90 ]; then echo "SSP not healthy"; exit 1; fi
+  sleep 4
 done
 curl -s http://127.0.0.1:5000/health; echo
 
 echo "=== swap sidecar up + funded ==="
 docker compose -f docker-compose.regtest.yml up -d swap-sidecar
 sleep 5
-SIDECAR_BAL=$(curl -s http://127.0.0.1:5001/health | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).balance??0)}catch{console.log(0)}})") || SIDECAR_BAL=0
-echo "sidecar balance: $SIDECAR_BAL"
-if [ "${SIDECAR_BAL:-0}" = "0" ] || [ "${SIDECAR_BAL:-0}" = "null" ]; then
-  echo "funding sidecar liquidity wallet..."
+SIDECAR_BAL=$(curl -s http://127.0.0.1:5001/health | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);console.log(j.breakdown?.available ?? j.balance ?? 0)}catch{console.log(0)}})") || SIDECAR_BAL=0
+echo "sidecar available: $SIDECAR_BAL"
+# Ladder denoms deplete as fills consume exact matches; top up well before
+# empty (failed fills lock leaves SO-side and strand liquidity).
+if [ "${SIDECAR_BAL:-0}" = "0" ] || [ "${SIDECAR_BAL:-0}" = "null" ] || [ "${SIDECAR_BAL:-0}" -lt 10000000 ]; then
+  echo "funding/topping up sidecar liquidity wallet..."
   docker compose -f docker-compose.regtest.yml run --rm sidecar-fund
 fi
+
+# SSP publishes the sidecar identity; if the SSP booted before the sidecar
+# it fell back to its local key, so restart it into alignment and verify.
+SIDECAR_ID=$(curl -s http://127.0.0.1:5001/health | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).identityPubkey??'')}catch{console.log('')}})")
+echo "sidecar identity: $SIDECAR_ID"
+docker compose -f docker-compose.regtest.yml restart ssp > /dev/null
+for i in $(seq 1 30); do
+  SSP_ID=$(curl -s http://127.0.0.1:5000/health | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).ssp_identity_pubkey??'')}catch{console.log('')}})")
+  if [ -n "$SSP_ID" ] && [ "$SSP_ID" = "$SIDECAR_ID" ]; then echo "SSP identity aligned: $SSP_ID"; break; fi
+  if [ "$i" = 30 ]; then echo "SSP identity mismatch: ssp=$SSP_ID sidecar=$SIDECAR_ID"; exit 1; fi
+  sleep 4
+done
 
 SDK_DIST="$SPARK_REF/sdks/js/packages/spark-sdk/dist/index.node.js"
 if [ ! -f "$SDK_DIST" ]; then
