@@ -27,10 +27,7 @@ async-trait = "0.1"
 flate2 = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
-# FROST VSS share splitting (mirrors signer/spark-frost vss.rs; pins match
-# upstream so SO verifiers accept our shares).
-frost-core = { git = "https://github.com/lightsparkdev/frost", rev = "997427e5c09e62459230ad711ef3a33fb64b9424" }
-frost-secp256k1-tr = { git = "https://github.com/lightsparkdev/frost", rev = "997427e5c09e62459230ad711ef3a33fb64b9424" }
+# FROST VSS share splitting (mirrors signer/spark-frost vss.rs).
 k256 = { version = "0.13", features = ["arithmetic"] }
 vsss-rs = { version = "5", default-features = false, features = ["alloc", "primitive"] }
 ecies = { version = "0.2.11", default-features = false, features = ["aes-rust"] }

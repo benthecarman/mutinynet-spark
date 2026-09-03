@@ -5,10 +5,11 @@ use ldk_server_client::{
     ldk_server_grpc::{
         api::{
             Bolt11ClaimForHashRequest, Bolt11FailForHashRequest, Bolt11ReceiveForHashRequest,
-            Bolt11SendRequest, Bolt12SendRequest, GetPaymentDetailsRequest,
+            Bolt11SendRequest, Bolt12SendRequest, DecodeInvoiceRequest, GetPaymentDetailsRequest,
+            ListPaymentsRequest,
         },
         events::event_envelope::Event as LdkRawEvent,
-        types::{Bolt11InvoiceDescription, PaymentStatus},
+        types::{Bolt11InvoiceDescription, Payment, PaymentDirection, PaymentStatus},
     },
 };
 use sha2::{Digest, Sha256};
@@ -30,6 +31,13 @@ use crate::{config::Config, db::Db};
 #[async_trait::async_trait]
 pub trait LdkBackend: Send + Sync {
     async fn fee_estimate_msat(&self, invoice: &str, amount_sats: Option<u64>) -> u64;
+    async fn verify_lightning_send_funding(
+        &self,
+        owner: &str,
+        outbound_transfer_id: &str,
+        invoice: &str,
+        amount_sats: Option<u64>,
+    ) -> Result<(), String>;
     async fn pay_invoice(&self, invoice: &str, amount_sats: Option<u64>) -> PayResult;
     async fn payment_status(&self, payment_id: &str) -> String;
     async fn create_invoice(
@@ -39,15 +47,6 @@ pub trait LdkBackend: Send + Sync {
         memo: &str,
         expiry_secs: u32,
     ) -> Result<CreateInvoiceResult, String>;
-    /// SSP-minted invoice path (hodl with SSP-held preimage). Used by live
-    /// receive flows once the SDK requests it; kept exact to the RPC shape.
-    #[allow(dead_code)]
-    async fn create_invoice_with_new_preimage(
-        &self,
-        amount_sats: u64,
-        memo: &str,
-        expiry_secs: u32,
-    ) -> Result<NewInvoiceResult, String>;
     /// Called when the SO/user reveals a preimage for a pending hodl invoice.
     /// Wired to Bolt11ClaimForHash in live mode.
     #[allow(dead_code)]
@@ -76,19 +75,11 @@ pub struct CreateInvoiceResult {
     pub payment_hash: String,
 }
 
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub struct NewInvoiceResult {
-    pub invoice: String,
-    #[allow(dead_code)]
-    pub payment_hash: String,
-}
-
 /// Minimal SSP view of ldk-server SubscribeEvents payloads.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub enum LnEvent {
-    OutboundSucceeded { payment_id: String },
+    OutboundSucceeded { payment: Payment },
     OutboundFailed { payment_id: String },
     InboundClaimable { payment_hash: String },
     InboundReceived { payment_hash: String },
@@ -97,8 +88,8 @@ pub enum LnEvent {
 /// Runtime backend: live ldk-server when configured and reachable, else fake.
 #[derive(Clone)]
 pub enum Backend {
-    Live(LdkGrpcBackend),
-    Fake(FakeLdkBackend),
+    Live(Arc<LdkGrpcBackend>),
+    Fake(Arc<FakeLdkBackend>),
 }
 
 impl Backend {
@@ -111,25 +102,37 @@ impl Backend {
                     "LDK live mode: node {}",
                     live.node_id.clone().unwrap_or_default()
                 );
-                Backend::Live(live)
+                Backend::Live(Arc::new(live))
             }
             Err(e) => {
                 tracing::warn!("LDK fake mode ({e}); set LDK_GRPC_ADDR + credentials for live");
-                Backend::Fake(FakeLdkBackend::new(config.clone(), db))
+                Backend::Fake(Arc::new(FakeLdkBackend::new(config.clone(), db)))
             }
         }
     }
 
-    /// SubscribeEvents pump for a live backend. Takes an owned clone so no
-    /// locks are held across the stream; reconnects forever.
-    pub async fn run_event_pump(live: LdkGrpcBackend) {
+    /// SubscribeEvents pump for a live backend. The upstream streaming client
+    /// does not set a `grpc-timeout` header. Reconnect with capped exponential
+    /// backoff when the server, proxy, or HTTP/2 connection ends the stream.
+    pub async fn run_event_pump(live: Arc<LdkGrpcBackend>) {
+        let mut failures = 0u32;
         loop {
-            match live.client.subscribe_events().await {
-                Ok(mut stream) => {
+            let connected_at = std::time::Instant::now();
+            let mut received_event = false;
+            // Bound only the connection and response-header phase. Do not put
+            // a deadline on the returned server stream.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                live.client.subscribe_events(),
+            )
+            .await
+            {
+                Ok(Ok(mut stream)) => {
                     tracing::info!("ldk event stream connected");
                     while let Some(msg) = stream.next_message().await {
                         match msg {
                             Ok(env) => {
+                                received_event = true;
                                 for ev in map_envelope(env) {
                                     live.apply_ln_event(ev).await;
                                 }
@@ -140,12 +143,39 @@ impl Backend {
                             }
                         }
                     }
+                    tracing::warn!("ldk event stream ended; reconnecting");
                 }
-                Err(e) => tracing::warn!("ldk subscribe_events failed: {e}; retry in 5s"),
+                Ok(Err(e)) => tracing::warn!("ldk subscribe_events failed: {e}"),
+                Err(_) => tracing::warn!("ldk subscribe_events connection timed out"),
             }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if received_event || connected_at.elapsed() >= std::time::Duration::from_secs(30) {
+                failures = 0;
+            } else {
+                failures = failures.saturating_add(1);
+            }
+            let delay = reconnect_delay(failures);
+            tracing::info!(?delay, "waiting before ldk event stream reconnect");
+            tokio::time::sleep(delay).await;
         }
     }
+
+    /// Recover events lost during a stream gap from the durable payment list.
+    pub async fn run_reconciler(live: Arc<LdkGrpcBackend>) {
+        loop {
+            if let Err(e) = live.reconcile_payments().await {
+                tracing::warn!("ldk payment reconcile failed: {e}");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    }
+}
+
+fn reconnect_delay(failures: u32) -> std::time::Duration {
+    use rand::Rng;
+    let exponent = failures.saturating_sub(1).min(5);
+    let base_secs = (1u64 << exponent).min(30);
+    let jitter_ms = rand::thread_rng().gen_range(0..=base_secs * 250);
+    std::time::Duration::from_millis(base_secs * 1000 + jitter_ms)
 }
 
 #[async_trait::async_trait]
@@ -154,6 +184,24 @@ impl LdkBackend for Backend {
         match self {
             Backend::Live(b) => b.fee_estimate_msat(invoice, amount_sats).await,
             Backend::Fake(b) => b.fee_estimate_msat(invoice, amount_sats).await,
+        }
+    }
+    async fn verify_lightning_send_funding(
+        &self,
+        owner: &str,
+        outbound_transfer_id: &str,
+        invoice: &str,
+        amount_sats: Option<u64>,
+    ) -> Result<(), String> {
+        match self {
+            Backend::Live(b) => {
+                b.verify_lightning_send_funding(owner, outbound_transfer_id, invoice, amount_sats)
+                    .await
+            }
+            Backend::Fake(b) => {
+                b.verify_lightning_send_funding(owner, outbound_transfer_id, invoice, amount_sats)
+                    .await
+            }
         }
     }
     async fn pay_invoice(&self, invoice: &str, amount_sats: Option<u64>) -> PayResult {
@@ -182,26 +230,6 @@ impl LdkBackend for Backend {
             }
             Backend::Fake(b) => {
                 b.create_invoice(amount_sats, payment_hash_hex, memo, expiry_secs)
-                    .await
-            }
-        }
-    }
-    /// SSP-minted invoice path (hodl with SSP-held preimage). Used by live
-    /// receive flows once the SDK requests it; kept exact to the RPC shape.
-    #[allow(dead_code)]
-    async fn create_invoice_with_new_preimage(
-        &self,
-        amount_sats: u64,
-        memo: &str,
-        expiry_secs: u32,
-    ) -> Result<NewInvoiceResult, String> {
-        match self {
-            Backend::Live(b) => {
-                b.create_invoice_with_new_preimage(amount_sats, memo, expiry_secs)
-                    .await
-            }
-            Backend::Fake(b) => {
-                b.create_invoice_with_new_preimage(amount_sats, memo, expiry_secs)
                     .await
             }
         }
@@ -241,25 +269,24 @@ impl LdkBackend for Backend {
 fn map_envelope(env: ldk_server_client::ldk_server_grpc::events::EventEnvelope) -> Vec<LnEvent> {
     let mut out = Vec::new();
     let Some(event) = env.event else { return out };
-    let payment_of = |p: Option<ldk_server_client::ldk_server_grpc::types::Payment>| p;
     match event {
         LdkRawEvent::PaymentSuccessful(e) => {
-            if let Some(p) = payment_of(e.payment) {
-                out.push(LnEvent::OutboundSucceeded { payment_id: p.id });
+            if let Some(p) = e.payment {
+                out.push(LnEvent::OutboundSucceeded { payment: p });
             }
         }
         LdkRawEvent::PaymentFailed(e) => {
-            if let Some(p) = payment_of(e.payment) {
+            if let Some(p) = e.payment {
                 out.push(LnEvent::OutboundFailed { payment_id: p.id });
             }
         }
         LdkRawEvent::PaymentClaimable(e) => {
-            if let Some(hash) = bolt11_hash(payment_of(e.payment)) {
+            if let Some(hash) = bolt11_hash(e.payment) {
                 out.push(LnEvent::InboundClaimable { payment_hash: hash });
             }
         }
         LdkRawEvent::PaymentReceived(e) => {
-            if let Some(hash) = bolt11_hash(payment_of(e.payment)) {
+            if let Some(hash) = bolt11_hash(e.payment) {
                 out.push(LnEvent::InboundReceived { payment_hash: hash });
             }
         }
@@ -282,6 +309,8 @@ pub struct LdkGrpcBackend {
     pub client: LdkServerClient,
     pub node_id: Option<String>,
     db: Arc<Db>,
+    config: Config,
+    http: reqwest::Client,
 }
 
 impl LdkGrpcBackend {
@@ -305,16 +334,272 @@ impl LdkGrpcBackend {
         let cert_pem = std::fs::read(&config.ldk_tls_cert_file)
             .map_err(|e| format!("read LDK_TLS_CERT_FILE {}: {e}", config.ldk_tls_cert_file))?;
         let client = LdkServerClient::new(config.ldk_grpc_addr.clone(), api_key, &cert_pem)?;
-        let info = client
-            .get_node_info(ldk_server_client::ldk_server_grpc::api::GetNodeInfoRequest {})
-            .await
-            .map_err(|e| format!("get_node_info: {e}"))?;
+        let info = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.get_node_info(ldk_server_client::ldk_server_grpc::api::GetNodeInfoRequest {}),
+        )
+        .await
+        .map_err(|_| "get_node_info timed out".to_string())?
+        .map_err(|e| format!("get_node_info: {e}"))?;
         Ok(Self {
             client,
             node_id: Some(info.node_id.clone()),
             db,
+            config: config.clone(),
+            http: crate::http_client(),
         })
     }
+
+    async fn sidecar_value(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        if self.config.sidecar_url.is_empty() {
+            return Err("SIDECAR_URL is required for Lightning settlement".to_string());
+        }
+        let mut request = self
+            .http
+            .post(format!("{}{path}", self.config.sidecar_url))
+            .json(&body);
+        if !self.config.sidecar_token.is_empty() {
+            request = request.bearer_auth(&self.config.sidecar_token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("sidecar {path}: {error}"))?;
+        let status = response.status();
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| format!("sidecar {path} response: {error}"))?;
+        if !status.is_success() {
+            return Err(value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("sidecar request failed")
+                .to_string());
+        }
+        if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(format!("sidecar {path} did not confirm the operation"));
+        }
+        Ok(value)
+    }
+
+    async fn sidecar_json(&self, path: &str, body: serde_json::Value) -> Result<(), String> {
+        self.sidecar_value(path, body).await.map(|_| ())
+    }
+
+    async fn settle_succeeded_payment(&self, payment: &Payment) -> Result<(), String> {
+        let payment_id = payment.id.clone();
+        let Some((owner, outbound_transfer_id)) =
+            self.db.lightning_send_for_payment(&payment_id).await?
+        else {
+            return Err(format!(
+                "no Lightning send request for payment {payment_id}"
+            ));
+        };
+        let Some(kind) = payment.kind.as_ref().and_then(|kind| kind.kind.as_ref()) else {
+            return Err(format!("payment {payment_id} has no payment kind"));
+        };
+        let ldk_server_client::ldk_server_grpc::types::payment_kind::Kind::Bolt11(bolt11) = kind
+        else {
+            return Err("only BOLT11 Spark settlement is supported".to_string());
+        };
+        let preimage = bolt11
+            .preimage
+            .as_deref()
+            .ok_or_else(|| format!("payment {payment_id} succeeded without a preimage"))?;
+        self.sidecar_json(
+            "/settle-lightning-send",
+            serde_json::json!({
+                "ownerIdentityPubkey": owner,
+                "outboundTransferId": outbound_transfer_id,
+                "paymentHash": bolt11.hash,
+                "preimage": preimage,
+            }),
+        )
+        .await?;
+        self.db.set_payment(&payment_id, "SUCCEEDED").await
+    }
+
+    async fn is_managed_outbound(&self, payment_id: &str) -> Result<bool, String> {
+        Ok(self
+            .db
+            .lightning_send_for_payment(payment_id)
+            .await?
+            .is_some())
+    }
+
+    async fn fund_lightning_receive(&self, payment_hash: &str) -> Result<bool, String> {
+        let Some((request_id, owner, amount_sats)) =
+            self.db.lightning_receive_for_hash(payment_hash).await?
+        else {
+            return Ok(false);
+        };
+        if self.preimage_for(payment_hash).await.is_none() {
+            return Ok(false);
+        }
+        let response = self
+            .sidecar_value(
+                "/settle-lightning-receive",
+                serde_json::json!({
+                    "ownerIdentityPubkey": owner,
+                    "paymentHash": payment_hash,
+                    "amountSats": amount_sats,
+                }),
+            )
+            .await?;
+        let transfer_id = response
+            .get("transferId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "sidecar did not return a Lightning receive transfer id".to_string())?;
+        self.db
+            .insert_transfer(
+                transfer_id,
+                &request_id,
+                "LIGHTNING_RECEIVE",
+                "TRANSFER_COMPLETED",
+                &owner,
+            )
+            .await?;
+        Ok(true)
+    }
+
+    async fn claim_funded_receive(&self, payment_hash: &str) -> Result<bool, String> {
+        if !self.fund_lightning_receive(payment_hash).await? {
+            return Ok(false);
+        }
+        let preimage = self
+            .preimage_for(payment_hash)
+            .await
+            .ok_or_else(|| format!("preimage disappeared for Lightning receive {payment_hash}"))?;
+        self.client
+            .bolt11_claim_for_hash(Bolt11ClaimForHashRequest {
+                payment_hash: Some(payment_hash.to_string()),
+                claimable_amount_msat: None,
+                preimage,
+            })
+            .await
+            .map_err(|error| format!("claim Lightning receive {payment_hash}: {error}"))?;
+        Ok(true)
+    }
+
+    async fn finish_received_payment(&self, payment_hash: &str) -> Result<bool, String> {
+        if !self.fund_lightning_receive(payment_hash).await? {
+            return Ok(false);
+        }
+        self.db
+            .set_receive_status(payment_hash, "TRANSFER_COMPLETED")
+            .await?;
+        self.db.delete_preimage(payment_hash).await?;
+        Ok(true)
+    }
+
+    async fn reconcile_payments(&self) -> Result<(), String> {
+        let mut page_token = None;
+        for _ in 0..100 {
+            let page = self
+                .client
+                .list_payments(ListPaymentsRequest { page_token })
+                .await
+                .map_err(|e| e.to_string())?;
+            for payment in page.payments {
+                if payment.direction == PaymentDirection::Outbound as i32 {
+                    if !self.is_managed_outbound(&payment.id).await? {
+                        continue;
+                    }
+                    match payment.status {
+                        value if value == PaymentStatus::Succeeded as i32 => {
+                            if let Err(error) = self.settle_succeeded_payment(&payment).await {
+                                tracing::warn!(
+                                    payment_id = %payment.id,
+                                    "Lightning paid but Spark settlement is pending: {error}"
+                                );
+                                self.db.set_payment(&payment.id, "SETTLING").await?;
+                            }
+                        }
+                        value if value == PaymentStatus::Failed as i32 => {
+                            self.db.set_payment(&payment.id, "FAILED").await?;
+                        }
+                        _ => self.db.set_payment(&payment.id, "PENDING").await?,
+                    }
+                    continue;
+                }
+                let Some(payment_hash) = bolt11_hash(Some(payment.clone())) else {
+                    continue;
+                };
+                match payment.status {
+                    value if value == PaymentStatus::Succeeded as i32 => {
+                        if let Err(error) = self.finish_received_payment(&payment_hash).await {
+                            tracing::warn!(
+                                payment_hash,
+                                "Lightning received but Spark payout is pending: {error}"
+                            );
+                        }
+                    }
+                    value if value == PaymentStatus::Failed as i32 => {
+                        if self
+                            .db
+                            .lightning_receive_for_hash(&payment_hash)
+                            .await?
+                            .is_some()
+                        {
+                            self.db
+                                .set_receive_status(&payment_hash, "HTLC_FAILED")
+                                .await?;
+                            self.db.delete_preimage(&payment_hash).await?;
+                        }
+                    }
+                    _ => match self.claim_funded_receive(&payment_hash).await {
+                        Ok(true) => {
+                            self.db
+                                .set_receive_status(&payment_hash, "HTLC_RECEIVED")
+                                .await?;
+                        }
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            payment_hash,
+                            "Spark payout or Lightning claim is pending: {error}"
+                        ),
+                    },
+                }
+            }
+            page_token = page.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+        }
+        if page_token.is_some() {
+            return Err("ldk payment reconciliation exceeded 100 pages".to_string());
+        }
+        for payment_hash in self
+            .db
+            .expired_receive_hashes(chrono::Utc::now().timestamp())
+            .await?
+        {
+            if self
+                .client
+                .bolt11_fail_for_hash(Bolt11FailForHashRequest {
+                    payment_hash: payment_hash.clone(),
+                })
+                .await
+                .is_ok()
+            {
+                self.db
+                    .set_receive_status(&payment_hash, "HTLC_FAILED")
+                    .await?;
+                self.db.delete_preimage(&payment_hash).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn sats_to_msats(sats: u64) -> Result<u64, String> {
+    sats.checked_mul(1000)
+        .ok_or_else(|| "amount_sats is too large".to_string())
 }
 
 fn description_of(memo: &str) -> Option<Bolt11InvoiceDescription> {
@@ -334,13 +619,66 @@ impl LdkBackend for LdkGrpcBackend {
         0
     }
 
+    async fn verify_lightning_send_funding(
+        &self,
+        owner: &str,
+        outbound_transfer_id: &str,
+        invoice: &str,
+        amount_sats: Option<u64>,
+    ) -> Result<(), String> {
+        let decoded = self
+            .client
+            .decode_invoice(DecodeInvoiceRequest {
+                invoice: invoice.to_string(),
+            })
+            .await
+            .map_err(|error| format!("decode invoice: {error}"))?;
+        let amount_msat = match decoded.amount_msat {
+            Some(value) => {
+                if amount_sats.is_some() {
+                    return Err("amount_sats is only valid for zero-amount invoices".to_string());
+                }
+                value
+            }
+            None => sats_to_msats(
+                amount_sats.ok_or_else(|| "zero-amount invoice needs amount_sats".to_string())?,
+            )?,
+        };
+        let total_sats = amount_msat
+            .checked_add(999)
+            .ok_or_else(|| "invoice amount is too large".to_string())?
+            / 1000;
+        if total_sats == 0 {
+            return Err("Lightning send amount must be positive".to_string());
+        }
+        self.sidecar_json(
+            "/verify-lightning-send",
+            serde_json::json!({
+                "ownerIdentityPubkey": owner,
+                "outboundTransferId": outbound_transfer_id,
+                "paymentHash": decoded.payment_hash.to_lowercase(),
+                "totalAmountSats": total_sats,
+            }),
+        )
+        .await
+    }
+
     // Send only inits; finality via SubscribeEvents.
     // BOLT12 offers (lno1…) route to bolt12_send; everything else to bolt11_send.
     async fn pay_invoice(&self, invoice: &str, amount_sats: Option<u64>) -> PayResult {
+        let amount_msat = match amount_sats.map(sats_to_msats).transpose() {
+            Ok(amount) => amount,
+            Err(e) => {
+                return PayResult {
+                    payment_id: format!("init-failed: {e}"),
+                    status: "FAILED".to_string(),
+                };
+            }
+        };
         if invoice.to_lowercase().starts_with("lno1") {
             let req = Bolt12SendRequest {
                 offer: invoice.to_string(),
-                amount_msat: amount_sats.map(|s| s * 1000),
+                amount_msat,
                 quantity: None,
                 payer_note: None,
                 route_parameters: None,
@@ -363,7 +701,7 @@ impl LdkBackend for LdkGrpcBackend {
         }
         let req = Bolt11SendRequest {
             invoice: invoice.to_string(),
-            amount_msat: amount_sats.map(|s| s * 1000),
+            amount_msat,
             route_parameters: None,
         };
         match self.client.bolt11_send(req).await {
@@ -394,7 +732,23 @@ impl LdkBackend for LdkGrpcBackend {
             .await
         {
             Ok(resp) => match resp.payment {
-                Some(p) if p.status == PaymentStatus::Succeeded as i32 => "SUCCEEDED".to_string(),
+                Some(p) if p.status == PaymentStatus::Succeeded as i32 => {
+                    if cached == "SUCCEEDED" {
+                        cached
+                    } else {
+                        match self.settle_succeeded_payment(&p).await {
+                            Ok(()) => "SUCCEEDED".to_string(),
+                            Err(error) => {
+                                tracing::warn!(
+                                    payment_id,
+                                    "Lightning paid but Spark settlement is pending: {error}"
+                                );
+                                let _ = self.db.set_payment(payment_id, "SETTLING").await;
+                                "SETTLING".to_string()
+                            }
+                        }
+                    }
+                }
                 Some(p) if p.status == PaymentStatus::Failed as i32 => "FAILED".to_string(),
                 Some(_) => {
                     if cached.is_empty() || cached == "UNKNOWN" {
@@ -424,7 +778,7 @@ impl LdkBackend for LdkGrpcBackend {
         let resp = self
             .client
             .bolt11_receive_for_hash(Bolt11ReceiveForHashRequest {
-                amount_msat: Some(amount_sats * 1000),
+                amount_msat: Some(sats_to_msats(amount_sats)?),
                 description: description_of(memo),
                 expiry_secs,
                 payment_hash: payment_hash_hex.to_string(),
@@ -437,30 +791,6 @@ impl LdkBackend for LdkGrpcBackend {
         })
     }
 
-    /// SSP-minted invoice path (hodl with SSP-held preimage). Used by live
-    /// receive flows once the SDK requests it; kept exact to the RPC shape.
-    #[allow(dead_code)]
-    async fn create_invoice_with_new_preimage(
-        &self,
-        amount_sats: u64,
-        memo: &str,
-        expiry_secs: u32,
-    ) -> Result<NewInvoiceResult, String> {
-        let preimage: [u8; 32] = rand::random();
-        let hash = hex::encode(Sha256::digest(preimage));
-        let inv = self
-            .create_invoice(amount_sats, &hash, memo, expiry_secs)
-            .await?;
-        self.db
-            .save_preimage(&hash, &hex::encode(preimage))
-            .await
-            .map_err(|e| e)?;
-        Ok(NewInvoiceResult {
-            invoice: inv.invoice,
-            payment_hash: hash,
-        })
-    }
-
     async fn reveal_and_claim(&self, payment_hash_hex: &str, preimage_hex: &str) -> bool {
         let digest = hex::encode(Sha256::digest(
             hex::decode(preimage_hex).unwrap_or_default(),
@@ -468,22 +798,28 @@ impl LdkBackend for LdkGrpcBackend {
         if digest != payment_hash_hex.to_lowercase() {
             return false;
         }
-        if self
-            .db
-            .save_preimage(payment_hash_hex, preimage_hex)
-            .await
-            .is_err()
-        {
-            return false;
-        }
-        self.client
+        let claimed = self
+            .client
             .bolt11_claim_for_hash(Bolt11ClaimForHashRequest {
                 payment_hash: Some(payment_hash_hex.to_string()),
                 claimable_amount_msat: None,
                 preimage: preimage_hex.to_string(),
             })
             .await
-            .is_ok()
+            .is_ok();
+        if claimed {
+            self.db
+                .save_preimage(
+                    payment_hash_hex,
+                    preimage_hex,
+                    "",
+                    &chrono::Utc::now().to_rfc3339(),
+                )
+                .await
+                .is_ok()
+        } else {
+            false
+        }
     }
 
     async fn fail_hold(&self, payment_hash_hex: &str) -> bool {
@@ -501,10 +837,38 @@ impl LdkBackend for LdkGrpcBackend {
 
     async fn apply_ln_event(&self, event: LnEvent) {
         match event {
-            LnEvent::OutboundSucceeded { payment_id } => {
-                let _ = self.db.set_payment(&payment_id, "SUCCEEDED").await;
+            LnEvent::OutboundSucceeded { payment } => {
+                match self.is_managed_outbound(&payment.id).await {
+                    Ok(true) => {}
+                    Ok(false) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            payment_id = %payment.id,
+                            "could not classify outbound Lightning payment: {error}"
+                        );
+                        return;
+                    }
+                }
+                if let Err(error) = self.settle_succeeded_payment(&payment).await {
+                    tracing::warn!(
+                        payment_id = %payment.id,
+                        "Lightning paid but Spark settlement is pending: {error}"
+                    );
+                    let _ = self.db.set_payment(&payment.id, "SETTLING").await;
+                }
             }
             LnEvent::OutboundFailed { payment_id } => {
+                match self.is_managed_outbound(&payment_id).await {
+                    Ok(true) => {}
+                    Ok(false) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            payment_id,
+                            "could not classify outbound Lightning payment: {error}"
+                        );
+                        return;
+                    }
+                }
                 let _ = self.db.set_payment(&payment_id, "FAILED").await;
             }
             // Self-settling: SSP-minted invoices carry an SSP-held preimage,
@@ -512,22 +876,29 @@ impl LdkBackend for LdkGrpcBackend {
             // have no preimage here until revealed via the reveal_preimage
             // mutation; they wait (expiry fails them back).
             LnEvent::InboundClaimable { payment_hash } => {
-                if let Some(preimage) = self.preimage_for(&payment_hash).await {
-                    if self
-                        .client
-                        .bolt11_claim_for_hash(Bolt11ClaimForHashRequest {
-                            payment_hash: Some(payment_hash.clone()),
-                            claimable_amount_msat: None,
-                            preimage,
-                        })
-                        .await
-                        .is_ok()
-                    {
-                        tracing::info!("claimed hodl invoice {payment_hash}");
+                match self.claim_funded_receive(&payment_hash).await {
+                    Ok(true) => {
+                        let _ = self
+                            .db
+                            .set_receive_status(&payment_hash, "HTLC_RECEIVED")
+                            .await;
+                        tracing::info!("funded and claimed hodl invoice {payment_hash}");
                     }
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(
+                        payment_hash,
+                        "Spark payout or Lightning claim is pending: {error}"
+                    ),
                 }
             }
-            LnEvent::InboundReceived { .. } => {}
+            LnEvent::InboundReceived { payment_hash } => {
+                if let Err(error) = self.finish_received_payment(&payment_hash).await {
+                    tracing::warn!(
+                        payment_hash,
+                        "Lightning received but Spark payout is pending: {error}"
+                    );
+                }
+            }
         }
     }
 
@@ -552,6 +923,20 @@ impl FakeLdkBackend {
 impl LdkBackend for FakeLdkBackend {
     async fn fee_estimate_msat(&self, _invoice: &str, _amount_sats: Option<u64>) -> u64 {
         0
+    }
+
+    async fn verify_lightning_send_funding(
+        &self,
+        _owner: &str,
+        outbound_transfer_id: &str,
+        _invoice: &str,
+        _amount_sats: Option<u64>,
+    ) -> Result<(), String> {
+        if outbound_transfer_id.is_empty() {
+            Err("user_outbound_transfer_external_id is required".to_string())
+        } else {
+            Ok(())
+        }
     }
 
     // Send only inits. Simulates the event path with a delayed flip so the
@@ -593,32 +978,6 @@ impl LdkBackend for FakeLdkBackend {
         })
     }
 
-    /// SSP-minted invoice path (hodl with SSP-held preimage). Used by live
-    /// receive flows once the SDK requests it; kept exact to the RPC shape.
-    #[allow(dead_code)]
-    async fn create_invoice_with_new_preimage(
-        &self,
-        amount_sats: u64,
-        _memo: &str,
-        expiry_secs: u32,
-    ) -> Result<NewInvoiceResult, String> {
-        let preimage: [u8; 32] = rand::random();
-        let hash = hex::encode(Sha256::digest(preimage));
-        self.db
-            .save_preimage(&hash, &hex::encode(preimage))
-            .await
-            .map_err(|e| e)?;
-        Ok(NewInvoiceResult {
-            invoice: format!(
-                "lnbc{}n1ssp_new_{}_exp{}",
-                amount_sats,
-                &hash[..8],
-                expiry_secs
-            ),
-            payment_hash: hash,
-        })
-    }
-
     async fn reveal_and_claim(&self, payment_hash_hex: &str, preimage_hex: &str) -> bool {
         let digest = hex::encode(Sha256::digest(
             hex::decode(preimage_hex).unwrap_or_default(),
@@ -627,7 +986,12 @@ impl LdkBackend for FakeLdkBackend {
             return false;
         }
         self.db
-            .save_preimage(payment_hash_hex, preimage_hex)
+            .save_preimage(
+                payment_hash_hex,
+                preimage_hex,
+                "",
+                &chrono::Utc::now().to_rfc3339(),
+            )
             .await
             .is_ok()
     }
@@ -642,17 +1006,51 @@ impl LdkBackend for FakeLdkBackend {
 
     async fn apply_ln_event(&self, event: LnEvent) {
         match event {
-            LnEvent::OutboundSucceeded { payment_id } => {
-                let _ = self.db.set_payment(&payment_id, "SUCCEEDED").await;
+            LnEvent::OutboundSucceeded { payment } => {
+                let _ = self.db.set_payment(&payment.id, "SUCCEEDED").await;
             }
             LnEvent::OutboundFailed { payment_id } => {
                 let _ = self.db.set_payment(&payment_id, "FAILED").await;
             }
-            LnEvent::InboundClaimable { .. } | LnEvent::InboundReceived { .. } => {}
+            LnEvent::InboundClaimable { payment_hash } => {
+                let _ = self
+                    .db
+                    .set_receive_status(&payment_hash, "HTLC_RECEIVED")
+                    .await;
+            }
+            LnEvent::InboundReceived { payment_hash } => {
+                let _ = self
+                    .db
+                    .set_receive_status(&payment_hash, "LIGHTNING_PAYMENT_RECEIVED")
+                    .await;
+            }
         }
     }
 
     fn live_node_id(&self) -> Option<String> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff_is_bounded() {
+        for failures in 0..100 {
+            let delay = reconnect_delay(failures);
+            assert!(delay >= std::time::Duration::from_secs(1));
+            assert!(delay <= std::time::Duration::from_millis(37_500));
+        }
+    }
+
+    #[test]
+    fn millisatoshi_conversion_rejects_overflow() {
+        assert_eq!(
+            sats_to_msats(21_000_000 * 100_000_000),
+            Ok(2_100_000_000_000_000_000)
+        );
+        assert!(sats_to_msats(u64::MAX).is_err());
     }
 }

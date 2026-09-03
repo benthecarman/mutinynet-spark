@@ -33,6 +33,8 @@ pub struct AppState {
     pub identity: Arc<tokio::sync::RwLock<Option<String>>>,
     /// Shared HTTP client (timeouts + pooling) for sidecar calls.
     pub http: reqwest::Client,
+    /// Serializes the check-and-pay section for idempotent Lightning sends.
+    pub send_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// One shared client: 15s total, 5s connect. Never build per-request clients.
@@ -57,12 +59,6 @@ pub async fn ssp_identity(state: &AppState) -> Result<String, String> {
         .ok_or_else(|| "ssp identity pending (sidecar unreachable)".to_string())
 }
 
-#[derive(Clone, Debug)]
-pub struct Session {
-    pub identity_pubkey: String,
-    pub valid_until: chrono::DateTime<chrono::Utc>,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct GraphqlRequest {
     pub query: String,
@@ -83,17 +79,19 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "status": "ok",
         "network": state.config.network,
         "ssp_identity_pubkey": state.identity.read().await.clone(),
-        "identity_source": identity_source(&state.config),
+        "identity_source": identity_source(&state.config, state.identity.read().await.is_some()),
         "ldk_mode": if backend.live_node_id().is_some() { "live" } else { "fake" },
         "ldk_node_id": backend.live_node_id(),
     }))
 }
 
-fn identity_source(config: &Config) -> &'static str {
+fn identity_source(config: &Config, resolved: bool) -> &'static str {
     if config.sidecar_url.is_empty() {
         "local"
-    } else {
+    } else if resolved {
         "sidecar"
+    } else {
+        "pending"
     }
 }
 
@@ -132,15 +130,15 @@ async fn graphql_handler(
     let req: GraphqlRequest = match serde_json::from_str(&body) {
         Ok(r) => r,
         Err(e) => {
-            let head: String = body.chars().take(300).collect();
-            tracing::warn!("unparseable graphql body: {e}; head={head:?}");
+            tracing::warn!("unparseable graphql body: {e}");
             let err =
                 serde_json::json!({ "errors": [{ "message": format!("bad graphql body: {e}") }] });
             return (StatusCode::OK, Json(err)).into_response();
         }
     };
     let op = detect_operation(&req);
-    info!(op = %op, "ssp graphql call");
+    let logged_op: String = op.chars().take(100).collect();
+    info!(op = %logged_op, "ssp graphql call");
     match graphql::dispatch(state, &headers, &op, &req).await {
         Ok(mut data) => {
             // The SDK's generated documents alias every field
@@ -269,12 +267,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let config = Config::from_env();
-    let (secret_hex, local_pubkey_hex) = config
-        .resolve_signing_key()
-        .map_err(|e| format!("signing key: {e}"))?;
-    // Env identity wins when set; otherwise the resolved key's pubkey is used
-    // (first boot publishes it via /health for sspClientOptions).
-    if !config.ssp_identity_pubkey.is_empty() && local_pubkey_hex != config.ssp_identity_pubkey {
+    let (secret_hex, local_pubkey_hex) = if config.sidecar_url.is_empty() {
+        config
+            .resolve_signing_key()
+            .map_err(|e| format!("signing key: {e}"))?
+    } else {
+        (String::new(), String::new())
+    };
+    if config.sidecar_url.is_empty()
+        && !config.ssp_identity_pubkey.is_empty()
+        && local_pubkey_hex != config.ssp_identity_pubkey
+    {
         return Err(format!(
             "resolved key pubkey {local_pubkey_hex} != SSP_IDENTITY_PUBKEY {}",
             config.ssp_identity_pubkey
@@ -308,7 +311,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let backend = backend.clone();
         if let Backend::Live(live) = backend.read().await.clone() {
-            tokio::spawn(async move { Backend::run_event_pump(live).await });
+            tokio::spawn(Backend::run_event_pump(live.clone()));
+            tokio::spawn(Backend::run_reconciler(live));
         }
         let backend = backend.clone();
         let config = config.clone();
@@ -321,8 +325,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 match LdkGrpcBackend::connect(&config, db.clone()).await {
                     Ok(live) => {
+                        let live = Arc::new(live);
                         tracing::info!("ldk-server reachable; switching to live mode");
                         tokio::spawn(Backend::run_event_pump(live.clone()));
+                        tokio::spawn(Backend::run_reconciler(live.clone()));
                         *backend.write().await = Backend::Live(live);
                     }
                     Err(e) => tracing::warn!("ldk-server still unreachable: {e}"),
@@ -341,6 +347,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let _ = db
                     .prune_challenges(&(now - chrono::Duration::hours(1)).to_rfc3339())
                     .await;
+                let _ = db
+                    .prune_orphan_preimages(&(now - chrono::Duration::hours(24)).to_rfc3339())
+                    .await;
             }
         });
     }
@@ -355,6 +364,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             loop {
                 match fetch_sidecar_identity(&config.sidecar_url, &config.sidecar_token).await {
                     Ok(pk) => {
+                        if !config.ssp_identity_pubkey.is_empty()
+                            && pk != config.ssp_identity_pubkey
+                        {
+                            tracing::error!(
+                                "sidecar identity {pk} does not match configured SSP_IDENTITY_PUBKEY"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            continue;
+                        }
                         info!("SSP identity from sidecar: {pk}");
                         *identity.write().await = Some(pk);
                         break;
@@ -374,6 +392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ssp_secret_hex: secret_hex,
         identity: identity.clone(),
         http: http_client(),
+        send_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     info!("SSP listening on {} (network={})", addr, config.network);
     let app = Router::new()
@@ -384,9 +403,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/graphql/spark/2025-03-19", post(graphql_handler))
         .route("/graphql/spark/rc", post(graphql_handler))
         .route("/graphql", post(graphql_handler))
-        .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state);
+    let app = if config.cors_origins.trim().is_empty() {
+        app
+    } else {
+        let origins = config
+            .cors_origins
+            .split(',')
+            .map(str::trim)
+            .filter(|origin| !origin.is_empty())
+            .map(|origin| origin.parse::<axum::http::HeaderValue>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("invalid SSP_CORS_ORIGINS: {e}"))?;
+        app.layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+                .allow_headers(tower_http::cors::Any),
+        )
+    };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn inflate_accepts_zlib_and_raw_deflate() {
+        let input = b"graphql request";
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        zlib.write_all(input).unwrap();
+        assert_eq!(inflate_raw_deflate(&zlib.finish().unwrap()).unwrap(), input);
+
+        let mut raw =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        raw.write_all(input).unwrap();
+        assert_eq!(inflate_raw_deflate(&raw.finish().unwrap()).unwrap(), input);
+    }
+
+    #[test]
+    fn inflate_rejects_expansion_past_limit() {
+        let input = vec![0u8; MAX_INFLATED_BYTES as usize + 1];
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        zlib.write_all(&input).unwrap();
+        assert!(inflate_raw_deflate(&zlib.finish().unwrap()).is_err());
+    }
 }

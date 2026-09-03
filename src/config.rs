@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub listen_addr: String,
+    /// Comma-separated browser origins. Empty disables cross-origin access.
+    pub cors_origins: String,
     pub network: String,
     /// Compressed secp256k1 hex, 33 bytes. This is the `identityPublicKey`
     /// wallets put in `sspClientOptions`. SO sends Spark transfers to this key.
@@ -20,7 +22,6 @@ pub struct Config {
     pub ldk_api_key: String,
     pub ldk_api_key_file: String,
     pub ldk_tls_cert_file: String,
-    pub fee_ppm_lightning_send: u64,
     pub fee_flat_sats_swap: u64,
     /// Swap-fill sidecar (funded Spark wallet). Unset = swaps return empty
     /// swapLeaves, which the SDK rejects by design.
@@ -46,6 +47,7 @@ impl Config {
         let get = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
         Self {
             listen_addr: get("SSP_LISTEN_ADDR", "127.0.0.1:5000"),
+            cors_origins: get("SSP_CORS_ORIGINS", ""),
             network: get("SSP_NETWORK", "REGTEST"),
             // Empty = use the resolved signing key's pubkey (first boot
             // generates into <SSP_DATA_DIR>/ssp.key; publish via /health).
@@ -56,10 +58,8 @@ impl Config {
             ldk_api_key: get("LDK_API_KEY", ""),
             ldk_api_key_file: get("LDK_API_KEY_FILE", ""),
             ldk_tls_cert_file: get("LDK_TLS_CERT_FILE", ""),
-            // Decision: 0 fee. Kept as a knob for later.
-            fee_ppm_lightning_send: get("SSP_LN_FEE_PPM", "0").parse().unwrap_or(0),
             fee_flat_sats_swap: get("SSP_SWAP_FEE_SATS", "0").parse().unwrap_or(0),
-            sidecar_url: get("SIDECAR_URL", ""),
+            sidecar_url: get("SIDECAR_URL", "").trim_end_matches('/').to_string(),
             sidecar_token: get("SIDECAR_TOKEN", ""),
             sidecar_identity_pubkey: get("SIDECAR_IDENTITY_PUBKEY", ""),
             frost_operators_json: get("SSP_FROST_OPERATORS", ""),

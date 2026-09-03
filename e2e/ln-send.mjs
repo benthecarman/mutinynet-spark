@@ -1,83 +1,120 @@
-// LN SEND e2e: invoice on node2 -> SSP RequestLightningSend (init) ->
-// poll SSP UserRequest until SUCCEEDED, assert node2 got paid.
-import { execSync } from "node:child_process";
-import { secp256k1 } from "/tmp/opencode/spark-ref/sdks/js/node_modules/@noble/curves/secp256k1.js";
-import { sha256 } from "/tmp/opencode/spark-ref/sdks/js/node_modules/@noble/hashes/sha2.js";
-import { bytesToHex } from "/tmp/opencode/spark-ref/sdks/js/node_modules/@noble/curves/utils.js";
-import { randomBytes } from "node:crypto";
+// LN send through the public Spark SDK. This verifies the Spark debit, SSP
+// state, exact LDK payment, and retry idempotency for one payment hash.
+import { sendToAddress, mineAndWait } from "./faucet.mjs";
+import {
+  assertPayment,
+  cleanupWallet,
+  initializeWallet,
+  ldkJson,
+  paymentByHash,
+  paymentsByHash,
+  poll,
+} from "./ln-test-helpers.mjs";
 
-const B = process.env.SSP_BASE_URL ?? "http://127.0.0.1:5000";
-const GQL = `${B}/graphql/spark/rc`;
-const gql = (body, tok) =>
-  fetch(GQL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...(tok ? { Authorization: "Bearer " + tok } : {}) },
-    body: JSON.stringify(body),
-  }).then((r) => r.json());
+const LDK1 = process.env.LDK1_CONTAINER;
+const LDK2 = process.env.LDK2_CONTAINER;
+if (!LDK1 || !LDK2) throw new Error("set LDK1_CONTAINER and LDK2_CONTAINER");
 
-const cli2 = (args) =>
-  execSync(
-    `docker exec mutinynet-spark-ldk-server-2-1 sh -c 'ldk-server-cli --base-url localhost:3536 --api-key $(od -A n -t x1 /data/regtest/api_key | tr -d '"'"' \\n'"'"') --tls-cert /data/tls.crt ${args}'`,
-    { encoding: "utf8", shell: "/bin/bash" },
+const AMOUNT_SATS = Number(process.env.LN_SEND_AMOUNT_SATS ?? "3000");
+const FUND_SATS = BigInt(process.env.LN_SEND_FUND_SATS ?? String(AMOUNT_SATS));
+
+let wallet;
+let generateTransferId;
+try {
+  ({ wallet, generateTransferId } = await initializeWallet());
+
+  const depositAddress = await wallet.getSingleUseDepositAddress();
+  const deposit = await sendToAddress(depositAddress, FUND_SATS);
+  await mineAndWait(3, [deposit.id]);
+  await wallet.claimDeposit(deposit.id);
+  await poll("Spark send wallet funding", async () => {
+    await wallet.experimental_syncWallet();
+    return (await wallet.getBalance()).balance === FUND_SATS;
+  });
+
+  const invoiceResult = ldkJson(
+    LDK2,
+    "bolt11-receive",
+    `${AMOUNT_SATS}sat`,
+    "-d",
+    "ssp-sdk-send",
   );
-
-const priv = randomBytes(32);
-const pub = bytesToHex(secp256k1.getPublicKey(priv, true));
-const ch = await gql({
-  query: "mutation GetChallenge($public_key: PublicKey!){ get_challenge(input:{public_key:$public_key}){ protected_challenge } }",
-  variables: { public_key: pub },
-  operationName: "GetChallenge",
-});
-const pc = ch.data.get_challenge.protected_challenge;
-const sig = secp256k1.sign(sha256(Buffer.from(pc, "base64")), priv);
-const vv = await gql({
-  query: "mutation VerifyChallenge($protected_challenge:String! $signature:String! $identity_public_key:PublicKey!){ verify_challenge(input:{protected_challenge:$protected_challenge signature:$signature identity_public_key:$identity_public_key}){ session_token } }",
-  variables: {
-    protected_challenge: pc,
-    signature: Buffer.from(sig.toDERRawBytes()).toString("base64"),
-    identity_public_key: pub,
-  },
-  operationName: "VerifyChallenge",
-});
-const tok = vv.data.verify_challenge.session_token;
-
-// Invoice for 3000 sats on node2.
-const invOut = cli2("bolt11-receive 3000sat -d 'ssp-send-test'");
-const inv = JSON.parse(invOut).invoice;
-console.log("[ln-send] node2 invoice:", inv.slice(0, 40) + "...");
-
-const r = await gql(
-  {
-    query: "mutation RequestLightningSend($encoded_invoice:String!){ request_lightning_send(input:{encoded_invoice:$encoded_invoice}){ request { id status } } }",
-    variables: { encoded_invoice: inv },
-    operationName: "RequestLightningSend",
-  },
-  tok,
-);
-const req = r.data.request_lightning_send.request;
-console.log("[ln-send] SSP request:", req.id, req.status);
-if (req.status !== "LIGHTNING_PAYMENT_INITIATED") throw new Error(`expected INITIATED, got ${req.status}`);
-
-// Poll SSP user request until terminal.
-let final = "";
-for (let i = 0; i < 24; i++) {
-  await new Promise((r) => setTimeout(r, 5000));
-  const u = await gql(
-    {
-      query: "query UserRequest($request_id:ID!){ user_request(request_id:$request_id){ __typename ... on LightningSendRequest { lightning_send_request_status: status } } }",
-      variables: { request_id: req.id },
-      operationName: "UserRequest",
-    },
-    tok,
-  );
-  const ur = u.data.user_request;
-  const st = ur?.lightning_send_request_status ?? ur?.status ?? "";
-  if (st === "LIGHTNING_PAYMENT_SUCCEEDED") {
-    final = st;
-    break;
+  const invoice = invoiceResult.invoice;
+  const paymentHash = invoiceResult.payment_hash?.toLowerCase();
+  if (!invoice || !/^[0-9a-f]{64}$/.test(paymentHash ?? "")) {
+    throw new Error(`invalid LDK invoice response: ${JSON.stringify(invoiceResult)}`);
   }
-  if (st === "LIGHTNING_PAYMENT_FAILED") throw new Error("payment failed");
+
+  const transferIdObject = generateTransferId();
+  const transferId = transferIdObject.toString();
+  const request = await wallet.payLightningInvoice({
+    invoice,
+    maxFeeSats: 0,
+    transferId: transferIdObject,
+  });
+  if (!request?.id || request.status !== "LIGHTNING_PAYMENT_INITIATED") {
+    throw new Error(`unexpected initial send request: ${JSON.stringify(request)}`);
+  }
+
+  const terminal = await poll("SSP Lightning send success", async () => {
+    const current = await wallet.getLightningSendRequest(request.id);
+    if (current?.status === "LIGHTNING_PAYMENT_FAILED") {
+      throw new Error(`SSP payment failed: ${request.id}`);
+    }
+    return current?.status === "LIGHTNING_PAYMENT_SUCCEEDED" ? current : undefined;
+  });
+  if (terminal.idempotencyKey !== transferId) {
+    throw new Error(`SSP idempotency key ${terminal.idempotencyKey} does not match ${transferId}`);
+  }
+
+  const [outbound, inbound] = await Promise.all([
+    poll("SSP LDK payment success", () => {
+      const payment = paymentByHash(LDK1, paymentHash, "OUTBOUND");
+      return payment?.status === "SUCCEEDED" ? payment : undefined;
+    }),
+    poll("LDK counterparty payment success", () => {
+      const payment = paymentByHash(LDK2, paymentHash, "INBOUND");
+      return payment?.status === "SUCCEEDED" ? payment : undefined;
+    }),
+  ]);
+  assertPayment(outbound, {
+    direction: "OUTBOUND",
+    status: "SUCCEEDED",
+    amount_msat: AMOUNT_SATS * 1000,
+  });
+  assertPayment(inbound, {
+    direction: "INBOUND",
+    status: "SUCCEEDED",
+    amount_msat: AMOUNT_SATS * 1000,
+  });
+
+  const expectedBalance = FUND_SATS - BigInt(AMOUNT_SATS);
+  await poll("Spark send balance debit", async () => {
+    await wallet.experimental_syncWallet();
+    return (await wallet.getBalance()).balance === expectedBalance;
+  });
+
+  // Replay the SDK's SSP request with the same funded transfer. The public
+  // pay helper cannot run again after it has spent the local leaf because it
+  // performs local coin selection before it reaches the SSP.
+  const retry = await wallet.getSspClient().requestLightningSend({
+    encodedInvoice: invoice,
+    userOutboundTransferExternalId: transferId,
+  });
+  if (retry.id !== request.id) {
+    throw new Error(`idempotent retry returned ${retry.id}; expected ${request.id}`);
+  }
+  if (
+    paymentsByHash(LDK1, paymentHash, "OUTBOUND").length !== 1 ||
+    paymentsByHash(LDK2, paymentHash, "INBOUND").length !== 1
+  ) {
+    throw new Error("idempotent retry produced more than one matching LDK payment");
+  }
+  if ((await wallet.getBalance()).balance !== expectedBalance) {
+    throw new Error("idempotent retry changed the Spark balance twice");
+  }
+
+  console.log(`[ln-send] PASS hash=${paymentHash} request=${request.id}`);
+} finally {
+  await cleanupWallet(wallet);
 }
-if (final !== "LIGHTNING_PAYMENT_SUCCEEDED") throw new Error(`never succeeded (last: ${final})`);
-console.log("[ln-send] SUCCEEDED via SSP polling");
-process.exit(0);

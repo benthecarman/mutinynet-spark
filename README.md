@@ -4,8 +4,9 @@ Self-hosted Spark Service Provider (SSP) in Rust, wired to `ldk-server`.
 
 - Serves the SSP GraphQL surface the `@buildonspark/spark-sdk` `SspClient` expects
   (`graphql/spark/rc` + `graphql/spark/2025-03-19`).
-- Default build uses fake Lightning data so all SDK flows work with no funds.
-  Enable live LDK with `cargo build --features ldk` (needs a running `ldk-server`).
+- Live Lightning is selected at run time when `LDK_GRPC_ADDR`, an API key,
+  and the TLS certificate are configured. Fake Lightning requires the explicit
+  development-only setting `SSP_ALLOW_FAKE_LN=1`.
 - Works with any network via env (`REGTEST` today, MutinyNet signet at deploy).
 
 ## Run (regtest e2e)
@@ -17,6 +18,10 @@ curl http://127.0.0.1:5000/health
 
 Point the SDK at it via `sspClientOptions` (`baseUrl` + `schemaEndpoint`
 `graphql/spark/rc` + the `ssp_identity_pubkey` from `/health`).
+
+The current Lightning receive quote uses a JSON compatibility manifest. The
+stock SDK expects a protobuf `TransferManifest`, so use the raw GraphQL receive
+path until the protobuf serializer and signing digest are implemented.
 
 ## Deploy
 

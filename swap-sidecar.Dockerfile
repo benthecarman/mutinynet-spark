@@ -23,7 +23,11 @@ COPY swap-sidecar/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 COPY --from=sdk-build /spark/sdks/js/packages/spark-sdk/dist /sdk
 COPY --from=sdk-build /spark/sdks/js/node_modules /node_modules
+RUN install -d -o node -g node /app/data
 ENV SPARK_SDK_DIST=/sdk/index.node.js
+USER node
 EXPOSE 5001
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:5001/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["node", "server.mjs"]

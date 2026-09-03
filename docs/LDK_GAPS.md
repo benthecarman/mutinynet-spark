@@ -1,10 +1,10 @@
 # LDK-server gaps vs Spark SSP needs — decisions (2026-09-03)
 
 1. Fee estimator: none exists -> assume 0 fee. Estimates return 0.
-2. Preimages: receives are non-hodl (regular auto-settling invoices; the
-   wallet's SO-stored shares drive the SO flow, no SSP preimage needed).
-   Explicit hodl remains via `create_invoice_with_new_preimage` +
-   `reveal_and_claim`/`fail_hold` for flows that opt in.
+2. Preimages: receives use hodl invoices. The SSP mints and stores the
+   preimage first, then creates one invoice for that hash. On an LDK event,
+   it sends an idempotent Spark payout to the user before it claims the
+   Lightning HTLC. It reconciles both legs after stream gaps.
 3. Receives stay BOLT11 only (no BOLT12 hodl in ldk-server). Sends accept
    BOLT11 and BOLT12 offers (`lno1…` routes to `bolt12_send`).
 4. Send only inits (`Bolt11Send`); final status comes from `SubscribeEvents`
@@ -14,16 +14,18 @@
    `02b7ed...`, gRPC 3536, chain syncs; fee-estimate warnings are benign
    regtest fallbacks).
 6. SSP subscribes to `SubscribeEvents` internally; no outbound webhooks,
-   internal API only.
+   internal API only. The streaming RPC has no unary deadline. The SSP
+   reconnects it with capped exponential backoff and reconciles payment state.
 7. Autopilot/rebalance/liquidity automation: out of scope (manual channels).
 
-Live-mode RPC map is in `src/ldk.rs` (`live` module, `--features ldk`).
+The live-mode RPC map is in `src/ldk.rs`. Live mode is selected at run time.
 
 Source: `ldk-server-ref` (`api.proto`, `client.rs`) vs
 `spark-ref` SSP schema + `spark-sdk/src/graphql/client.ts`.
 
-Live mode is behind `cargo build --features ldk`. Default build uses
-`FakeLdkBackend` (fake data) so SDK flows work with no funds.
+Set `LDK_GRPC_ADDR`, `LDK_API_KEY` or `LDK_API_KEY_FILE`, and
+`LDK_TLS_CERT_FILE` for live mode. Fake mode is development-only and requires
+`SSP_ALLOW_FAKE_LN=1`.
 
 ## Covered by ldk-server today
 
@@ -36,15 +38,13 @@ Live mode is behind `cargo build --features ldk`. Default build uses
 
 ## Missing, faked in v1
 
-1. **Fee estimator RPC** – none exists. Fake: `fee_ppm` from `SSP_LN_FEE_PPM`
-   (default 2500 = 0.25%% like Lightspark). Live: `DecodeInvoice` + ppm heuristic.
+1. **Fee estimator RPC** – none exists. Both backends return 0 by policy.
    Needed upstream: `EstimateRouteFee(invoice, amount)` using pathfinding scores.
 2. **Preimage lookup by hash** – `PaymentDetails` echoes preimage only for known
-   payments. SSP hold flow needs lookup on SO proof path. Fake: random preimage.
+   payments. The SSP hold flow uses its own persistent preimage store.
    Needed: `GetPreimage(payment_hash)` or expose claimable preimage in event.
-3. **BOLT12 hold / invoice state machine** – only BOLT11 has ReceiveForHash/Claim/Fail.
-   Fake: BOLT12 receive returns fake string. Needed: BOLT12 hold RPCs or document
-   BOLT11-only SSP v1.
+3. **BOLT12 hold / invoice state machine** – only BOLT11 has
+   ReceiveForHash/Claim/Fail. Receives are BOLT11-only.
 4. **Outbound cancel (`abandon_payment`)** – no RPC to drop a stuck outbound before
    claim. Fake: mark SUCCEEDED instantly. Needed for timeout path in
    `RequestLightningSend`.
@@ -70,10 +70,13 @@ Live mode is behind `cargo build --features ldk`. Default build uses
   the SSP must own funded Spark leaves and send a real SO transfer to the
   user; the SDK rejects empty `swapLeaves` and unknown inbound ids by design.
 
-## E2E regtest status (2026-09-03, `docker-compose.regtest.yml` + `e2e/e2e.mjs`)
+## E2E regtest status (2026-09-03)
 
 PASS through the real JS SDK against local SOs: wallet init, L1 fund +
 mine, claim deposit (100000 sats), full-balance Spark transfer A->B with
-background claim, static-deposit quote with SSP signature verified
-cryptographically against the SSP identity pubkey. Partial transfers that
-need an SSP leaf swap fail as the SDK requires (gap above).
+background claim, and a static-deposit quote with a non-empty SSP signature.
+The Lightning suite also proves public SDK send and receive, exact Spark debit
+and credit, funding proof, idempotency, expiry, a 95-second idle stream, LDK
+restart recovery, missed-event reconciliation after an SSP restart, and
+concurrent receives. The test does not independently verify the static quote
+signature.

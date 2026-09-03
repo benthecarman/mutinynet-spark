@@ -121,13 +121,16 @@ pub async fn dispatch(
         }
         // ---- lightning receive (quote is stateless+signed; receive persists request) ----
         "LightningReceiveQuote" | "lightning_receive_quote" => {
+            let _ = auth::require_session(&state, headers).await?;
             let amount = num_of(&input, "amount_sats");
+            validate_sats(amount)?;
             let network = str_of(&input, "network");
             let network = if network.is_empty() {
                 state.config.network.clone()
             } else {
                 network
             };
+            validate_network(&state, &network)?;
             let transfer_id = Uuid::new_v4().to_string();
             // TODO(live): serialize a real TransferManifest proto (see
             // protos/spark + docs/LDK_GAPS.md). The SDK proto-decodes this on
@@ -152,12 +155,21 @@ pub async fn dispatch(
         "RequestLightningReceive" | "request_lightning_receive" => {
             let owner = auth::require_session(&state, headers).await?;
             let amount = num_of(&input, "amount_sats");
+            validate_sats(amount)?;
+            let requested_network = str_of(&input, "network");
+            if !requested_network.is_empty() {
+                validate_network(&state, &requested_network)?;
+            }
             let hash = str_of(&input, "payment_hash").to_lowercase();
             if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err("payment_hash must be 32 bytes hex".to_string());
             }
             let memo = str_of(&input, "memo");
-            let expiry = opt_num(&input, "expiry_secs").unwrap_or(86400) as u32;
+            let expiry = u32::try_from(opt_num(&input, "expiry_secs").unwrap_or(86_400))
+                .map_err(|_| "expiry_secs is out of range".to_string())?;
+            if expiry == 0 {
+                return Err("expiry_secs must be positive".to_string());
+            }
             let inv = crate::backend(&state)
                 .await
                 .create_invoice(amount, &hash, &memo, expiry)
@@ -167,13 +179,16 @@ pub async fn dispatch(
             // shares, encrypt per operator, store via the coordinator with
             // owner = SSP identity (attestor == holder, SO's own rule).
             // Wallet-owned hashes skip this (preimage unknown here).
-            if crate::backend(&state)
-                .await
-                .preimage_for(&hash)
-                .await
+            if state
+                .db
+                .get_preimage_for_owner(&hash, &owner)
+                .await?
                 .is_some()
             {
-                store_preimage_shares(&state, &hash, &inv.invoice).await?;
+                if let Err(e) = store_preimage_shares(&state, &hash, &inv.invoice).await {
+                    let _ = crate::backend(&state).await.fail_hold(&hash).await;
+                    return Err(e);
+                }
             }
             let rec = store_request(
                 &state,
@@ -181,10 +196,15 @@ pub async fn dispatch(
                 &owner,
                 &now,
                 json!({"amount_sats": amount, "payment_hash": hash,
-                       "invoice": inv.invoice, "network": state.config.network}),
+                       "invoice": inv.invoice, "network": state.config.network,
+                       "expiry_secs": expiry}),
                 None,
             )
             .await?;
+            state
+                .db
+                .set_receive_status(&hash, "INVOICE_CREATED")
+                .await?;
             let req_id = rec["id"].as_str().unwrap_or("").to_string();
             Ok(json!({ "request_lightning_receive": {
                 "request": {
@@ -203,7 +223,9 @@ pub async fn dispatch(
                         "expires_at": null,
                         "memo": memo,
                     },
-                    "status": "CREATED",
+                    "status": "INVOICE_CREATED",
+                    "transfer": null,
+                    "receiver_identity_public_key": owner,
                 }
             }}))
         }
@@ -212,15 +234,37 @@ pub async fn dispatch(
             let owner = auth::require_session(&state, headers).await?;
             let inv = str_of(&input, "encoded_invoice");
             let amt = opt_num(&input, "amount_sats");
-            let idem = str_of(&input, "idempotency_key");
             let ext_id = str_of(&input, "user_outbound_transfer_external_id");
-            // Idempotency: a retry with the same key returns the stored
-            // request (with live status) instead of paying twice.
-            if !idem.is_empty() {
-                if let Some(rec) = state.db.find_by_idempotency(&owner, &idem).await? {
-                    return send_response_from_record(&state, &rec, &now).await;
-                }
+            if ext_id.is_empty() {
+                return Err("user_outbound_transfer_external_id is required".to_string());
             }
+            let explicit_idem = str_of(&input, "idempotency_key");
+            let idem = if explicit_idem.is_empty() {
+                ext_id.clone()
+            } else {
+                explicit_idem
+            };
+            let _send_guard = state.send_lock.lock().await;
+            // Idempotency: a retry with the same key returns the stored
+            // request (with live status) instead of paying twice. The lock
+            // makes the lookup and payment one process-local critical section.
+            if let Some(rec) = state.db.find_by_idempotency(&owner, &idem).await? {
+                let payload = rec.get("payload").cloned().unwrap_or(Value::Null);
+                if payload.get("encoded_invoice").and_then(Value::as_str) != Some(inv.as_str())
+                    || payload
+                        .get("user_outbound_transfer_external_id")
+                        .and_then(Value::as_str)
+                        != Some(ext_id.as_str())
+                    || payload.get("amount_sats").and_then(Value::as_u64) != amt
+                {
+                    return Err("idempotency key was already used for another payment".to_string());
+                }
+                return send_response_from_record(&state, &rec, &now).await;
+            }
+            crate::backend(&state)
+                .await
+                .verify_lightning_send_funding(&owner, &ext_id, &inv, amt)
+                .await?;
             let pay = crate::backend(&state).await.pay_invoice(&inv, amt).await;
             let rec = store_request(
                 &state,
@@ -232,11 +276,7 @@ pub async fn dispatch(
                        "payment_id": pay.payment_id, "status": pay.status,
                        "network": state.config.network,
                        "user_outbound_transfer_external_id": ext_id}),
-                if idem.is_empty() {
-                    None
-                } else {
-                    Some(idem.as_str())
-                },
+                Some(idem.as_str()),
             )
             .await?;
             state
@@ -255,6 +295,9 @@ pub async fn dispatch(
         "RequestSwap" | "request_swap" => {
             let owner = auth::require_session(&state, headers).await?;
             let total = num_of(&input, "total_amount_sats");
+            if total == 0 {
+                return Err("swap total must be positive".to_string());
+            }
             // The sidecar serves fills from exact leaves only. If IT needs a
             // swap, its ladder is depleted: fail fast so no leaves lock
             // SO-side in a recursive swap. Top up the ladder instead.
@@ -277,6 +320,9 @@ pub async fn dispatch(
             // client input is ignored so a forged fee changes nothing.
             let fee = state.config.fee_flat_sats_swap;
             let ext_id = str_of(&input, "user_outbound_transfer_external_id");
+            if ext_id.is_empty() {
+                return Err("user_outbound_transfer_external_id is required".to_string());
+            }
             let network = state.config.network.clone();
             // Target list (rc schema) or scalar (dated schema).
             let targets: Vec<u64> = match input.get("target_amount_sats") {
@@ -284,23 +330,28 @@ pub async fn dispatch(
                 Some(v) => v.as_u64().map(|t| vec![t]).unwrap_or_default(),
                 None => vec![],
             };
-            let target: u64 = targets.iter().sum();
+            let target = targets.iter().try_fold(0u64, |sum, value| {
+                sum.checked_add(*value)
+                    .ok_or_else(|| "target amount overflow".to_string())
+            })?;
+            let payout_total = total
+                .checked_sub(fee)
+                .ok_or_else(|| "swap fee exceeds total".to_string())?;
+            if target > payout_total {
+                return Err("target amounts plus fee exceed swap total".to_string());
+            }
             // Funded sidecar completes the swap with a real SO transfer.
             // Without it swapLeaves stays empty and the SDK rejects the swap.
             let (inbound_id, swap_leaves) =
-                match fill_swap_via_sidecar(&state, &owner, &targets, total).await {
-                    Ok(fill) => fill,
-                    Err(e) => {
-                        tracing::warn!("swap sidecar unavailable ({e}); returning unfillable stub");
-                        (Uuid::new_v4().to_string(), vec![])
-                    }
-                };
+                fill_swap_via_sidecar(&state, &owner, &ext_id, &targets, total, payout_total)
+                    .await?;
             let rec = store_request(
                 &state,
                 "LEAVES_SWAP",
                 &owner,
                 &now,
                 json!({"total_amount_sats": total, "target_amount_sats": target,
+                       "fee_sats": fee,
                        "inbound_transfer_spark_id": inbound_id}),
                 None,
             )
@@ -316,11 +367,7 @@ pub async fn dispatch(
                     .insert_transfer(&ext_id, &rid, "TRANSFER", "CREATED", &owner)
                     .await?;
             }
-            let field = "request_swap";
-            let mut top = serde_json::Map::with_capacity(1);
-            top.insert(
-                field.to_string(),
-                json!({
+            Ok(json!({ "request_swap": {
                 "request": {
                     "__typename": "LeavesSwapRequest",
                     "id": rec["id"],
@@ -340,9 +387,7 @@ pub async fn dispatch(
                     "swap_leaves": swap_leaves,
                     "expires_at": null,
                 }
-                }),
-            );
-            Ok(Value::Object(top))
+            }}))
         }
         // ---- static deposits (SDK uses static_deposit_quote only) ----
         "StaticDepositQuote" | "static_deposit_quote" => {
@@ -355,7 +400,8 @@ pub async fn dispatch(
             } else {
                 network
             };
-            if network != "REGTEST" && network != "LOCAL" {
+            validate_network(&state, &network)?;
+            if state.config.network != "REGTEST" && state.config.network != "LOCAL" {
                 return Err("static deposit quotes are regtest-only".to_string());
             }
             let txid = str_of(&input, "transaction_id").to_lowercase();
@@ -371,11 +417,12 @@ pub async fn dispatch(
             // TODO(live): look up the UTXO via bitcoind/esplora and apply fees.
             let credit: u64 = 100_000;
             let payload = format!("{txid}:{vout}:{credit}");
-            let sig = sign_with_ssp(&state, &payload).await?;
-            state
+            let proposed_signature = sign_with_ssp(&state, &payload).await?;
+            let sig = state
                 .db
-                .record_static_quote(&txid, vout as u32, credit, &sig, &now)
-                .await?;
+                .record_static_quote(&txid, vout as u32, credit, &proposed_signature, &now)
+                .await?
+                .ok_or_else(|| "static deposit output was already claimed".to_string())?;
             let quote = json!({
                 "__typename": "StaticDepositQuoteOutput",
                 "transaction_id": txid, "output_index": vout,
@@ -387,6 +434,22 @@ pub async fn dispatch(
         // SDK ClaimStaticDeposit mutation only (no fixed-amount variant in SspClient).
         "ClaimStaticDeposit" | "claim_static_deposit" => {
             let owner = auth::require_session(&state, headers).await?;
+            let txid = str_of(&input, "transaction_id").to_lowercase();
+            let vout = num_of(&input, "output_index");
+            let quote_signature = str_of(&input, "quote_signature");
+            if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("transaction_id must be 64 hex chars".to_string());
+            }
+            if vout > u32::MAX as u64 {
+                return Err("output_index out of range".to_string());
+            }
+            if !state
+                .db
+                .consume_static_quote(&txid, vout as u32, &quote_signature)
+                .await?
+            {
+                return Err("unknown, mismatched, or already claimed quote".to_string());
+            }
             store_request(
                 &state,
                 "CLAIM_STATIC_DEPOSIT",
@@ -432,8 +495,24 @@ pub async fn dispatch(
             } else {
                 exit_speed
             };
-            let rec = store_request(&state, "COOP_EXIT", &owner, &now, input.clone(), None).await?;
+            let coop_exit_txid = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+            let mut payload = input.clone();
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "coop_exit_txid".to_string(),
+                    Value::String(coop_exit_txid.clone()),
+                );
+                object.insert("exit_speed".to_string(), Value::String(exit_speed.clone()));
+            }
+            let rec = store_request(&state, "COOP_EXIT", &owner, &now, payload, None).await?;
             let req_id = rec["id"].as_str().unwrap_or("").to_string();
+            let ext_id = str_of(&input, "user_outbound_transfer_external_id");
+            if !ext_id.is_empty() {
+                state
+                    .db
+                    .insert_transfer(&ext_id, &req_id, "COOP_EXIT", "CREATED", &owner)
+                    .await?;
+            }
             Ok(json!({ "request_coop_exit": {
                 "request": {
                     "__typename": "CoopExitRequest",
@@ -449,14 +528,24 @@ pub async fn dispatch(
                     "expires_at": null,
                     "raw_connector_transaction": "",
                     "raw_coop_exit_transaction": "",
-                    "coop_exit_txid": format!("00{}", Uuid::new_v4().simple()),
+                    "coop_exit_txid": coop_exit_txid,
                 }
             }}))
         }
         "CompleteCoopExit" | "complete_coop_exit" => {
-            let _ = auth::require_session(&state, headers).await?;
+            let owner = auth::require_session(&state, headers).await?;
+            let transfer_id = str_of(&input, "user_outbound_transfer_external_id");
+            let request_id = state
+                .db
+                .request_id_for_transfer(&transfer_id, &owner)
+                .await?
+                .ok_or_else(|| "cooperative exit request not found".to_string())?;
+            state
+                .db
+                .insert_transfer(&transfer_id, &request_id, "COOP_EXIT", "COMPLETED", &owner)
+                .await?;
             Ok(json!({ "complete_coop_exit": {
-                "request": {"id": str_of(&input, "user_outbound_transfer_external_id"),
+                "request": {"id": request_id,
                             "status": "COMPLETED"}
             }}))
         }
@@ -466,21 +555,25 @@ pub async fn dispatch(
         // before payment (compliant: attestor == holder). On LN arrival the
         // SSP auto-claims; cooperative wallets can also reveal explicitly.
         "MintInvoicePreimage" | "mint_invoice_preimage" => {
-            let _ = auth::require_session(&state, headers).await?;
-            let minted = crate::backend(&state)
-                .await
-                .create_invoice_with_new_preimage(0, "", 86400)
-                .await
-                .map_err(|e| format!("ldk mint: {e}"))?;
+            let owner = auth::require_session(&state, headers).await?;
+            let preimage: [u8; 32] = rand::random();
+            let payment_hash = hex::encode(Sha256::digest(preimage));
+            state
+                .db
+                .save_preimage(&payment_hash, &hex::encode(preimage), &owner, &now)
+                .await?;
             Ok(json!({ "mint_invoice_preimage": {
                 "__typename": "MintInvoicePreimageOutput",
-                "payment_hash": minted.payment_hash,
+                "payment_hash": payment_hash,
             }}))
         }
         "RevealPreimage" | "reveal_preimage" => {
-            let _ = auth::require_session(&state, headers).await?;
+            let owner = auth::require_session(&state, headers).await?;
             let hash = str_of(&input, "payment_hash").to_lowercase();
             let preimage = str_of(&input, "preimage").to_lowercase();
+            if !state.db.has_receive_request(&hash, &owner).await? {
+                return Err("no matching lightning receive request".to_string());
+            }
             let claimed = crate::backend(&state)
                 .await
                 .reveal_and_claim(&hash, &preimage)
@@ -492,18 +585,29 @@ pub async fn dispatch(
             }}))
         }
         // ---- reads ----
-        // SDK Transfers query only. user_request is null for transfers the SSP
-        // did not participate in (client reads userRequest?.__typename, null-safe).
+        // SDK Transfers query only. All rows here were created by this SSP, so
+        // keep the transfer-to-request join intact.
         "Transfers" | "transfers" => {
             let owner = auth::require_session(&state, headers).await?;
             let ids = ids_of(&input, v);
             let rows = state.db.transfers_for(&ids, &owner).await?;
             let map_row = |t: &Value| {
+                let request_typename = match t.get("type").and_then(Value::as_str) {
+                    Some("PREIMAGE_SWAP") => "LightningSendRequest",
+                    Some("COOP_EXIT") => "CoopExitRequest",
+                    _ => "LeavesSwapRequest",
+                };
                 json!({
                     "__typename": "Transfer",
-                    "total_amount": {"original_value": 0, "original_unit": "SATOSHI"},
+                    "total_amount": {
+                        "original_value": t.get("total_amount_sats").and_then(Value::as_u64).unwrap_or(0),
+                        "original_unit": "SATOSHI"
+                    },
                     "spark_id": t.get("spark_id").cloned().unwrap_or(Value::Null),
-                    "user_request": null,
+                    "user_request": {
+                        "__typename": request_typename,
+                        "id": t.get("user_request_id").cloned().unwrap_or(Value::Null),
+                    },
                 })
             };
             let list: Vec<Value> = rows.iter().map(map_row).collect();
@@ -610,12 +714,14 @@ fn collect_aliases(query: &str) -> Vec<(String, String)> {
                     }
                     let field = &stripped[fstart..j];
                     // skip `__typename` (bare, no alias) and fragment spreads
-                    if name != "__typename" && name != field && !name.starts_with("...") {
-                        if seen.insert((name.to_string(), field.to_string())) {
-                            out.push((name.to_string(), field.to_string()));
-                            if out.len() >= MAX_ALIASES {
-                                break;
-                            }
+                    if name != "__typename"
+                        && name != field
+                        && !name.starts_with("...")
+                        && seen.insert((name.to_string(), field.to_string()))
+                    {
+                        out.push((name.to_string(), field.to_string()));
+                        if out.len() >= MAX_ALIASES {
+                            break;
                         }
                     }
                     i = j;
@@ -675,7 +781,7 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
     match kind {
         "LIGHTNING_SEND" => {
             let pid = p.get("payment_id").and_then(|v| v.as_str()).unwrap_or("");
-            let status = match crate::backend(&state)
+            let status = match crate::backend(state)
                 .await
                 .payment_status(pid)
                 .await
@@ -697,6 +803,31 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
         }
         "LIGHTNING_RECEIVE" => {
             let amount = p.get("amount_sats").and_then(|v| v.as_u64()).unwrap_or(0);
+            let payment_hash = p.get("payment_hash").and_then(|v| v.as_str()).unwrap_or("");
+            let request_id = rec.get("id").and_then(Value::as_str).unwrap_or("");
+            let owner = rec
+                .get("owner_identity_pubkey")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let status = state
+                .db
+                .receive_status(payment_hash)
+                .await
+                .unwrap_or_else(|_| "INVOICE_CREATED".to_string());
+            let transfer = state
+                .db
+                .transfer_for_request(request_id, owner)
+                .await
+                .ok()
+                .flatten()
+                .map(|spark_id| {
+                    json!({
+                        "__typename": "Transfer",
+                        "total_amount": sats(amount),
+                        "spark_id": spark_id,
+                        "user_request": {"id": request_id},
+                    })
+                });
             json!({
                 "__typename": "LightningReceiveRequest",
                 "id": id, "created_at": created, "updated_at": created,
@@ -709,7 +840,9 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
                     "amount": sats(amount),
                     "created_at": created, "expires_at": null, "memo": null,
                 },
-                "status": "CREATED",
+                "status": status,
+                "transfer": transfer,
+                "receiver_identity_public_key": owner,
             })
         }
         "LEAVES_SWAP" => {
@@ -721,6 +854,7 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
                 .get("target_amount_sats")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+            let fee = p.get("fee_sats").and_then(|v| v.as_u64()).unwrap_or(0);
             let inbound = p
                 .get("inbound_transfer_spark_id")
                 .and_then(|v| v.as_str())
@@ -730,7 +864,7 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
                 "id": id, "created_at": created, "updated_at": created,
                 "network": net, "status": "CREATED",
                 "total_amount": sats(total), "target_amount": sats(target),
-                "fee": sats(0),
+                "fee": sats(fee),
                 "inbound_transfer": {
                     "__typename": "Transfer",
                     "total_amount": sats(total),
@@ -745,10 +879,12 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
             "id": id, "created_at": created, "updated_at": created,
             "network": net,
             "fee": sats(1000), "l1_broadcast_fee": sats(500),
-            "fee_quote": null, "exit_speed": "MEDIUM", "status": "CREATED",
+            "fee_quote": null,
+            "exit_speed": p.get("exit_speed").and_then(Value::as_str).unwrap_or("MEDIUM"),
+            "status": "CREATED",
             "expires_at": null,
             "raw_connector_transaction": "", "raw_coop_exit_transaction": "",
-            "coop_exit_txid": null,
+            "coop_exit_txid": p.get("coop_exit_txid").cloned().unwrap_or(Value::Null),
         }),
         "CLAIM_STATIC_DEPOSIT" => json!({
             "__typename": "ClaimStaticDeposit",
@@ -825,8 +961,10 @@ async fn store_request(
 async fn fill_swap_via_sidecar(
     state: &AppState,
     owner_identity_pubkey: &str,
+    outbound_transfer_id: &str,
     targets: &[u64],
-    total_amount_sats: u64,
+    received_total_sats: u64,
+    payout_total_sats: u64,
 ) -> Result<(String, Vec<Value>), String> {
     if state.config.sidecar_url.is_empty() {
         return Err("SIDECAR_URL unset".to_string());
@@ -839,9 +977,11 @@ async fn fill_swap_via_sidecar(
         .post(format!("{}/swap-fill", state.config.sidecar_url))
         .json(&serde_json::json!({
             "ownerIdentityPubkey": owner_identity_pubkey,
+            "outboundTransferId": outbound_transfer_id,
             "targetAmountsSats": targets,
-            "totalAmountSats": total_amount_sats,
-            "idempotencyKey": Uuid::new_v4().to_string(),
+            "receivedTotalAmountSats": received_total_sats,
+            "payoutTotalAmountSats": payout_total_sats,
+            "idempotencyKey": outbound_transfer_id,
         }));
     if !state.config.sidecar_token.is_empty() {
         req = req.bearer_auth(&state.config.sidecar_token);
@@ -898,13 +1038,17 @@ async fn store_preimage_shares(
         #[serde(rename = "identityPublicKey")]
         identity_public_key: String,
     }
-    let mut operators: Vec<Operator> = serde_json::from_str(&state.config.frost_operators_json)
-        .map_err(|_| "SSP_FROST_OPERATORS unset or invalid; cannot store shares".to_string())?;
+    let mut operators: Vec<Operator> = if state.config.frost_operators_json.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&state.config.frost_operators_json)
+            .map_err(|_| "SSP_FROST_OPERATORS is invalid".to_string())?
+    };
     if operators.is_empty() {
-        return Err("SSP_FROST_OPERATORS empty; cannot store shares".to_string());
+        return Ok(());
     }
     operators.sort_by_key(|o| o.id);
-    let preimage_hex = crate::backend(&state)
+    let preimage_hex = crate::backend(state)
         .await
         .preimage_for(payment_hash_hex)
         .await
@@ -914,6 +1058,13 @@ async fn store_preimage_shares(
         frost::split_secret_with_proofs(&preimage, state.config.frost_threshold, operators.len())?;
     let mut wire = serde_json::Map::with_capacity(operators.len());
     for (op, share) in operators.iter().zip(shares.iter()) {
+        let expected_identifier = format!("{:064x}", share.index);
+        if share.index != op.id + 1 || op.identifier.to_lowercase() != expected_identifier {
+            return Err(format!(
+                "FROST operator {} does not match share index {}",
+                op.id, share.index
+            ));
+        }
         // Self-check before sending: a bad share would fail SO-side.
         frost::validate_share(&share.share, share.index, &share.proofs)?;
         let proto = frost::encode_secret_share_proto(&share.share, &share.proofs);
@@ -932,7 +1083,7 @@ async fn store_preimage_shares(
             "shares": wire,
             "threshold": state.config.frost_threshold,
             "invoiceString": invoice,
-            "ownerIdentityPubkeyHex": crate::ssp_identity(&state).await?,
+            "ownerIdentityPubkeyHex": crate::ssp_identity(state).await?,
         }));
     if !state.config.sidecar_token.is_empty() {
         req = req.bearer_auth(&state.config.sidecar_token);
@@ -951,15 +1102,33 @@ async fn store_preimage_shares(
 }
 
 fn str_of(v: &Value, k: &str) -> String {
-    v.get(k)
-        .and_then(|x| {
-            if let Some(s) = x.as_str() {
-                Some(s.to_string())
-            } else {
-                Some(x.to_string().trim_matches('"').to_string())
-            }
-        })
-        .unwrap_or_default()
+    match v.get(k) {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Number(value)) => value.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn validate_sats(amount: u64) -> Result<(), String> {
+    if amount == 0 {
+        return Err("amount_sats must be positive".to_string());
+    }
+    amount
+        .checked_mul(1000)
+        .map(|_| ())
+        .ok_or_else(|| "amount_sats is too large".to_string())
+}
+
+fn validate_network(state: &AppState, requested: &str) -> Result<(), String> {
+    if requested == state.config.network {
+        Ok(())
+    } else {
+        Err(format!(
+            "network mismatch: configured {}, requested {requested}",
+            state.config.network
+        ))
+    }
 }
 fn num_of(v: &Value, k: &str) -> u64 {
     v.get(k)
@@ -1045,4 +1214,25 @@ async fn sign_via_sidecar(state: &AppState, message: &str) -> Result<String, Str
                     .unwrap_or("unknown")
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::str_of;
+    use serde_json::json;
+
+    #[test]
+    fn string_input_does_not_turn_null_into_text() {
+        let input = json!({
+            "missing": null,
+            "object": {"unexpected": true},
+            "string": "value",
+            "number": 42,
+        });
+
+        assert_eq!(str_of(&input, "missing"), "");
+        assert_eq!(str_of(&input, "object"), "");
+        assert_eq!(str_of(&input, "string"), "value");
+        assert_eq!(str_of(&input, "number"), "42");
+    }
 }

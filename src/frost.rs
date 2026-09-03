@@ -175,7 +175,7 @@ mod tests {
                 validate_share(&s.share, s.index, &s.proofs).unwrap();
             }
             // Any `threshold` shares recover the secret (Lagrange over indices).
-            let recovered = recover_subset(&shares[..threshold].to_vec(), threshold).unwrap();
+            let recovered = recover_subset(&shares[..threshold], threshold).unwrap();
             assert_eq!(recovered, secret);
             // Tampered share fails validation.
             let mut bad = shares[0].share.clone();
@@ -207,7 +207,6 @@ mod tests {
         shares: &[VerifiableSecretShare],
         threshold: usize,
     ) -> Result<Vec<u8>, String> {
-        use vsss_rs::Share as _;
         let vsss: Vec<VsssShare> = shares
             .iter()
             .map(|s| {

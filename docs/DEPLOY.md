@@ -23,21 +23,19 @@
   (no stranded leaves) and `/swap-fill` answers 507 `NEEDS_TOPUP`.
 - Small denoms deplete first: a handful of fills can exhaust them while the
   total looks healthy. Top up with a small-denom skew, e.g.
-  `FUND_DENOMS=1000,2000,4000,8000,16000,32000,64000,128000
+  `FUND_LADDER=1000,2000,4000,8000,16000,32000,64000,128000
   FUND_MULTIPLICITY=12 docker compose run --rm sidecar-fund`.
+- Lightning receives also spend sidecar leaves. Keep exact leaves for common
+  invoice amounts, or the wallet must use the swap path to make change. The
+  regtest Lightning harness provisions one exact leaf for each receive case.
 - The SSP rejects swaps FROM the sidecar identity fast for the same reason:
   the sidecar must never recurse into its own swap flow.
 - Monitor `/swap-sidecar:5001/health` (`available` vs `owned`, `needsTopup`
   flag); re-run `sidecar-fund` to top up. Rotate the liquidity wallet
   (fresh mnemonic + fund) if leaves wedge.
-- Boot order is deadlock-free by construction: the SSP blocks until the
-  sidecar publishes its identity (never serves a fallback key while
-  healthy); the sidecar never blocks on the SSP. `/health` reports
-  `identity_source` so pinning can be asserted.
-- Boot order is deadlock-free by construction: the SSP blocks until the
-  sidecar publishes its identity (never serves a fallback key while
-  healthy); the sidecar never blocks on the SSP. `/health` reports
-  `identity_source` so pinning can be asserted.
+- The SSP binds immediately. `/health` reports `identity_source: pending`
+  until the sidecar publishes its identity. Identity-dependent operations
+  fail closed during this interval.
 - LDK: rebalance/close via `deploy/channels.sh` (`list-channels`,
   `close-channel`). No autopilot by decision.
 
@@ -60,12 +58,14 @@ Consequences:
 - Honest flows are exact: users get paid, no doubling in the happy path.
 - Inside the return window, a restored/resynced user wallet could resurrect
   spent leaves and double-spend against sidecar funds.
-- The sidecar only spends; nothing flows back (user outbounds return to
-  users, not to the SSP).
+- The sidecar verifies and claims the named user outbound before it pays.
+  It stores fill receipts on its data volume for idempotent retries.
 
 Mitigations (all implemented):
 
-- `MAX_SWAP_TOTAL_SATS` cap per swap (default 1M sats): bounds exposure.
+- `MAX_SWAP_TOTAL_SATS` cap per swap (default 1M sats) bounds exposure.
+- The sidecar checks sender identity and claimed value before payout, then
+  uses one atomic multi-receiver transfer for all target amounts.
 - Monitor sidecar drain rate (`/swap-sidecar:5001/health` available vs
   owned) and SO `transfers` for unexpected `RETURNED` volume.
 - Keep ladder topped up (`sidecar-fund`); rotate the liquidity wallet
@@ -76,8 +76,9 @@ Mitigations (all implemented):
 ## Other residual risks (not fixable in this repo)
 
 - ldk-server has no custom-signet flag. If MutinyNet's genesis differs from
-  public signet, ldk-server refuses it until patched upstream. The SSP runs
-  in fake Lightning mode until live connects (see `/health ldk_mode`).
+  public signet, ldk-server refuses it until patched upstream. The SSP refuses
+  to start without live LDK unless `SSP_ALLOW_FAKE_LN=1` is explicitly set for
+  development (see `/health ldk_mode`).
 - SO leaf lifetimes are block-driven: on fast chains, wallets need regular
   syncs; the sidecar self-syncs per fill.
 - No webhook push: wallets poll Transfers/UserRequest (by decision).

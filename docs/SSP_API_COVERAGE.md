@@ -11,11 +11,11 @@ SDK's generated fragments read aliased keys.
 |---|---|---|
 | get_challenge / verify_challenge | live (secp256k1 verify, DER or compact, base64 or hex) | in-memory sessions, 24h |
 | lightning_receive_quote | shape-exact, real ECDSA issuer_signature | manifest is JSON (SDK proto-decodes it: LN-receive needs real TransferManifest proto, see LDK_GAPS) |
-| request_lightning_receive | live (hodl, SSP-owned preimage) | FROST split + ECIES per operator, stored via sidecar (owner = SSP); needs SSP_FROST_OPERATORS |
+| request_lightning_receive | live (hodl, SSP-owned preimage, Spark payout) | idempotent sidecar transfer before LDK claim; FROST split + ECIES per operator; needs SSP_FROST_OPERATORS |
 | mint_invoice_preimage | live (SSP extension) | wallets mint the hash first, then createLightningHodlInvoice with it |
 | reveal_preimage | live (SSP extension) | cooperative wallets reveal; stock wallets never call it |
 | request_lightning_send | shape-exact | FakeLdkBackend; live: Bolt11Send |
-| lightning_send_fee_estimate | live heuristic | ppm config |
+| lightning_send_fee_estimate | fixed at zero by policy | both backends |
 | request_swap | live via funded sidecar (real SO inbound + change, exact SDK shape) | sidecar wallet; needs ladder liquidity (see DEPLOY.md) |
 | leaves_swap_fee_estimate | live (flat config) | SSP_SWAP_FEE_SATS |
 | static_deposit_quote | live, real ECDSA signature verifiable vs identity pubkey | fixed 100k credit (must stay <= UTXO; TODO UTXO lookup) |
@@ -23,7 +23,7 @@ SDK's generated fragments read aliased keys.
 | create_instant_static_deposit_quote / create_claim_instant_static_deposit | shape stubs | TODO |
 | request_coop_exit / complete_coop_exit | shape-exact | stored; TODO PSBT + OnchainSend |
 | coop_exit_fee_estimates / coop_exit_fee_quote | static tiers, exact `quote{}` nesting | TODO fee estimator |
-| transfers | exact Transfer shape, `user_request: null` (client null-safe) | in-memory; unknown SO ids -> [] |
+| transfers | exact Transfer shape with request join | SQLite; unknown SO ids -> [] |
 | user_request | stored-or-null | TODO full union objects |
 | FetchCurrentUserToUserRequestsConnection | exact empty connection | TODO postgres |
 | wallet_webhooks CRUD | empty stub | TODO SubscribeEvents bridge |

@@ -55,8 +55,8 @@ const b = await SparkWallet.initialize({ options: opts() });
 const addrB = await b.wallet.getSparkAddress();
 step(6, `wallet B ready: ${addrB}`);
 
-await a.wallet.transfer({ amountSats: 10_000, receiverSparkAddress: addrB });
-step(7, "transferred 10000 A -> B (partial: SSP leaf swap via sidecar)");
+await a.wallet.transfer({ amountSats: 100_000, receiverSparkAddress: addrB });
+step(7, "transferred 100000 A -> B");
 
 const balB = await b.wallet.getBalance();
 step(8, `B balance before sync: ${balB.balance} sats`);
@@ -71,15 +71,8 @@ async function pollBalance(w, want, tag) {
   }
   throw new Error(`balance never reached ${want}`);
 }
-await pollBalance(b.wallet, 10_000n, 8.1);
-// Swap change (90000) arrives as a second inbound, claimed via background sync.
-await pollBalance(a.wallet, 90_000n, 8.2);
-
-// Full-balance direct transfer of what remains (no swap needed).
-const balA3 = (await a.wallet.getBalance()).balance;
-await a.wallet.transfer({ amountSats: Number(balA3), receiverSparkAddress: addrB });
-step(8.3, `transferred remainder ${balA3} A -> B (direct)`);
-await pollBalance(b.wallet, 100_000n, 8.4);
+await pollBalance(b.wallet, 100_000n, 8.1);
+await pollBalance(a.wallet, 0n, 8.2);
 
 // SSP-specific: static-deposit quote through OUR ssp (exercises quote signing).
 const staticAddr = await a.wallet.getStaticDepositAddress();

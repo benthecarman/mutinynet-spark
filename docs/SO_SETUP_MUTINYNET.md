@@ -3,6 +3,9 @@
 The SSP needs the open-source Spark Operator (SO) + signer running.
 This repo does NOT vendor the SO; use `spark-ref` in `/tmp/opencode/spark-ref`.
 
+The keys in `e2e/upstream/` are test fixtures. Never reuse them on a network
+that carries value.
+
 ## 1. Regtest first (proves SSP wiring)
 
 ```sh

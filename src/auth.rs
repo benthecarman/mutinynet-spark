@@ -8,9 +8,10 @@ use crate::AppState;
 /// Create a challenge for a wallet identity pubkey.
 /// Mirrors `mutation GetChallenge(public_key)`. Single-use, 5-minute expiry.
 pub async fn get_challenge(state: &AppState, identity_pubkey: &str) -> Result<String, String> {
-    if identity_pubkey.trim().is_empty() {
-        return Err("public_key required".to_string());
-    }
+    let public_key =
+        hex::decode(identity_pubkey).map_err(|_| "malformed public_key".to_string())?;
+    secp256k1::PublicKey::from_slice(&public_key)
+        .map_err(|_| "malformed public_key".to_string())?;
     let raw = format!(
         "spark-ssp-challenge:{}:{}",
         identity_pubkey,

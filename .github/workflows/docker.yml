@@ -12,6 +12,52 @@ env:
   IMAGE_OWNER: ${{ vars.IMAGE_OWNER || github.repository_owner }}
 
 jobs:
+  rust:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      SPARK_REF: /tmp/opencode/spark-ref
+      LDK_SERVER_REF: /tmp/opencode/ldk-server-ref
+      SIDECAR_TOKEN: regtest-sidecar-token
+      LN_STREAM_IDLE_SECONDS: 95
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check out pinned upstream sources
+        run: |
+          mkdir -p /tmp/opencode
+          git clone --filter=blob:none --no-checkout https://github.com/buildonspark/spark "$SPARK_REF"
+          git -C "$SPARK_REF" fetch --depth=1 origin 0b3a32a05c9ac06cc411683551dd1f1bde9d0caa
+          git -C "$SPARK_REF" checkout --detach FETCH_HEAD
+          git clone --filter=blob:none --no-checkout https://github.com/lightningdevkit/ldk-server "$LDK_SERVER_REF"
+          git -C "$LDK_SERVER_REF" fetch --depth=1 origin 6d6d810714706c225ce7effc2163eff6a1b54221
+          git -C "$LDK_SERVER_REF" checkout --detach FETCH_HEAD
+      - name: Build pinned Spark SDK
+        working-directory: /tmp/opencode/spark-ref/sdks/js
+        run: |
+          corepack enable
+          yarn install --immutable
+          yarn build:sdk
+      - name: Run full regtest suite
+        run: ./e2e/e2e.sh
+      - name: Stop test stack
+        if: always()
+        run: docker compose -f docker-compose.regtest.yml down --volumes --remove-orphans
+
   ssp:
     runs-on: ubuntu-latest
     permissions:

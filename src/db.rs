@@ -25,9 +25,10 @@ impl Db {
              CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, identity TEXT NOT NULL, valid_until TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, kind TEXT NOT NULL, owner TEXT NOT NULL, created_at TEXT NOT NULL, payload TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS transfers(spark_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS preimages(hash TEXT PRIMARY KEY, preimage TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS preimages(hash TEXT PRIMARY KEY, preimage TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00');
              CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, status TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS static_quotes(txid TEXT NOT NULL, vout INTEGER NOT NULL, credit INTEGER NOT NULL, signature TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(txid, vout));",
+             CREATE TABLE IF NOT EXISTS receive_payments(hash TEXT PRIMARY KEY, status TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS static_quotes(txid TEXT NOT NULL, vout INTEGER NOT NULL, credit INTEGER NOT NULL, signature TEXT NOT NULL, created_at TEXT NOT NULL, claimed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(txid, vout));",
         )
         .map_err(|e| e.to_string())?;
         // Lightweight migrations for DBs created by older builds: probe for
@@ -57,6 +58,33 @@ impl Db {
                 .map_err(|e| e.to_string())?;
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_owner_idem ON requests(owner, idempotency_key) WHERE idempotency_key IS NOT NULL AND idempotency_key <> ''",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if conn.prepare("SELECT owner FROM preimages LIMIT 0").is_err() {
+            conn.execute(
+                "ALTER TABLE preimages ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if conn
+            .prepare("SELECT created_at FROM preimages LIMIT 0")
+            .is_err()
+        {
+            conn.execute(
+                "ALTER TABLE preimages ADD COLUMN created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if conn
+            .prepare("SELECT claimed FROM static_quotes LIMIT 0")
+            .is_err()
+        {
+            conn.execute(
+                "ALTER TABLE static_quotes ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
                 [],
             )
             .map_err(|e| e.to_string())?;
@@ -105,21 +133,23 @@ impl Db {
         now_epoch_secs: i64,
         max_age_secs: i64,
     ) -> Result<bool, String> {
-        let conn = self.inner.lock().await;
-        let row: Option<(String, String)> = conn
-            .query_row(
-                "SELECT protected, issued_at FROM challenges WHERE identity=?1",
-                (identity,),
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(e),
+        let row: Option<(String, String)> = self
+            .with(|conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT protected, issued_at FROM challenges WHERE identity=?1",
+                        (identity,),
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map(Some)
+                    .or_else(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                        e => Err(e),
+                    })?;
+                conn.execute("DELETE FROM challenges WHERE identity=?1", (identity,))?;
+                Ok(row)
             })
-            .map_err(|e: rusqlite::Error| e.to_string())?;
-        conn.execute("DELETE FROM challenges WHERE identity=?1", (identity,))
-            .map_err(|e: rusqlite::Error| e.to_string())?;
+            .await?;
         let Some((stored, issued_at)) = row else {
             return Ok(false);
         };
@@ -129,7 +159,8 @@ impl Db {
         let issued = chrono::DateTime::parse_from_rfc3339(&issued_at)
             .map(|d| d.timestamp())
             .unwrap_or(0);
-        Ok(now_epoch_secs - issued <= max_age_secs)
+        let age = now_epoch_secs.saturating_sub(issued);
+        Ok(issued <= now_epoch_secs && age <= max_age_secs)
     }
 
     pub async fn prune_challenges(&self, older_than_rfc3339: &str) -> Result<(), String> {
@@ -259,6 +290,75 @@ impl Db {
         .await
     }
 
+    pub async fn lightning_send_for_payment(
+        &self,
+        payment_id: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT owner,
+                        json_extract(payload, '$.user_outbound_transfer_external_id')
+                 FROM requests
+                 WHERE kind='LIGHTNING_SEND'
+                   AND json_extract(payload, '$.payment_id')=?1
+                 LIMIT 1",
+                (payment_id,),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                error => Err(error),
+            })
+        })
+        .await
+    }
+
+    pub async fn lightning_receive_for_hash(
+        &self,
+        payment_hash: &str,
+    ) -> Result<Option<(String, String, u64)>, String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT id, owner, json_extract(payload, '$.amount_sats')
+                 FROM requests
+                 WHERE kind='LIGHTNING_RECEIVE'
+                   AND json_extract(payload, '$.payment_hash')=?1
+                 LIMIT 1",
+                (payment_hash,),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                error => Err(error),
+            })
+        })
+        .await
+    }
+
+    pub async fn transfer_for_request(
+        &self,
+        request_id: &str,
+        owner: &str,
+    ) -> Result<Option<String>, String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT spark_id FROM transfers
+                 WHERE request_id=?1 AND owner=?2
+                 LIMIT 1",
+                (request_id, owner),
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                error => Err(error),
+            })
+        })
+        .await
+    }
+
     pub async fn prune_expired_sessions(&self, now_rfc3339: &str) -> Result<(), String> {
         self.with(|c| {
             c.execute("DELETE FROM sessions WHERE valid_until<=?1", (now_rfc3339,))
@@ -276,15 +376,20 @@ impl Db {
         status: &str,
         owner: &str,
     ) -> Result<(), String> {
-        self.with(|c| {
-            c.execute(
+        let changed = self
+            .with(|c| {
+                c.execute(
                 "INSERT INTO transfers(spark_id,request_id,kind,status,owner) VALUES(?1,?2,?3,?4,?5)
                  ON CONFLICT(spark_id) DO UPDATE SET status=excluded.status WHERE transfers.owner=excluded.owner",
                 (spark_id, request_id, kind, status, owner),
             )
-            .map(|_| ())
-        })
-        .await
+            })
+            .await?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err("transfer id belongs to another owner".to_string())
+        }
     }
 
     /// Single query, capped row count.
@@ -293,11 +398,17 @@ impl Db {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let ids: Vec<&String> = ids.iter().take(MAX_IDS).collect();
+        if ids.len() > MAX_IDS {
+            return Err(format!("at most {MAX_IDS} transfer ids are allowed"));
+        }
+        let ids: Vec<&String> = ids.iter().collect();
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         // rusqlite params must be homogeneous: build owned Vec<Value-ish> via params_from_iter.
         let sql = format!(
-            "SELECT spark_id,request_id,kind,status FROM transfers WHERE owner=? AND spark_id IN ({placeholders})"
+            "SELECT t.spark_id,t.request_id,t.kind,t.status,r.payload
+             FROM transfers t
+             LEFT JOIN requests r ON r.id=t.request_id AND r.owner=t.owner
+             WHERE t.owner=? AND t.spark_id IN ({placeholders})"
         );
         self.with(move |c| {
             let mut stmt = c.prepare(&sql)?;
@@ -306,14 +417,44 @@ impl Db {
                 params.push(id);
             }
             let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+                let payload = r
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+                    .unwrap_or(Value::Null);
+                let total_amount_sats = payload
+                    .get("total_amount_sats")
+                    .or_else(|| payload.get("amount_sats"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 Ok(serde_json::json!({
                     "spark_id": r.get::<_, String>(0)?,
                     "user_request_id": r.get::<_, String>(1)?,
                     "type": r.get::<_, String>(2)?,
                     "status": r.get::<_, String>(3)?,
+                    "total_amount_sats": total_amount_sats,
                 }))
             })?;
             rows.collect::<rusqlite::Result<Vec<Value>>>()
+        })
+        .await
+    }
+
+    pub async fn request_id_for_transfer(
+        &self,
+        spark_id: &str,
+        owner: &str,
+    ) -> Result<Option<String>, String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT request_id FROM transfers WHERE spark_id=?1 AND owner=?2",
+                (spark_id, owner),
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
         })
         .await
     }
@@ -326,24 +467,69 @@ impl Db {
         credit: u64,
         signature: &str,
         created_at: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
+        self.with(|c| {
+            let existing = c
+                .query_row(
+                    "SELECT credit,signature,claimed FROM static_quotes WHERE txid=?1 AND vout=?2",
+                    (txid, vout),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .map(Some)
+                .or_else(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    error => Err(error),
+                })?;
+            if let Some((stored_credit, stored_signature, claimed)) = existing {
+                return Ok(
+                    (stored_credit == credit as i64 && claimed == 0).then_some(stored_signature)
+                );
+            }
+            c.execute(
+                "INSERT INTO static_quotes(txid,vout,credit,signature,created_at)
+                 VALUES(?1,?2,?3,?4,?5)",
+                (txid, vout, credit as i64, signature, created_at),
+            )?;
+            Ok(Some(signature.to_string()))
+        })
+        .await
+    }
+
+    pub async fn consume_static_quote(
+        &self,
+        txid: &str,
+        vout: u32,
+        signature: &str,
+    ) -> Result<bool, String> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO static_quotes(txid,vout,credit,signature,created_at) VALUES(?1,?2,?3,?4,?5)
-                 ON CONFLICT(txid,vout) DO UPDATE SET credit=excluded.credit, signature=excluded.signature, created_at=excluded.created_at",
-                (txid, vout, credit as i64, signature, created_at),
+                "UPDATE static_quotes SET claimed=1
+                 WHERE txid=?1 AND vout=?2 AND signature=?3 AND claimed=0",
+                (txid, vout, signature),
             )
-            .map(|_| ())
+            .map(|changed| changed == 1)
         })
         .await
     }
     // ---- preimages ----
-    pub async fn save_preimage(&self, hash: &str, preimage: &str) -> Result<(), String> {
+    pub async fn save_preimage(
+        &self,
+        hash: &str,
+        preimage: &str,
+        owner: &str,
+        created_at: &str,
+    ) -> Result<(), String> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO preimages(hash,preimage) VALUES(?1,?2)
-                 ON CONFLICT(hash) DO UPDATE SET preimage=excluded.preimage",
-                (hash, preimage),
+                "INSERT INTO preimages(hash,preimage,owner,created_at) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(hash) DO UPDATE SET preimage=excluded.preimage, owner=excluded.owner, created_at=excluded.created_at",
+                (hash, preimage, owner, created_at),
             )
             .map(|_| ())
         })
@@ -364,6 +550,130 @@ impl Db {
             })
         })
         .await
+    }
+
+    pub async fn get_preimage_for_owner(
+        &self,
+        hash: &str,
+        owner: &str,
+    ) -> Result<Option<String>, String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT preimage FROM preimages WHERE hash=?1 AND owner=?2",
+                (hash, owner),
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
+        })
+        .await
+    }
+
+    pub async fn delete_preimage(&self, hash: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute("DELETE FROM preimages WHERE hash=?1", (hash,))
+                .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn prune_orphan_preimages(&self, older_than_rfc3339: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM preimages
+                 WHERE created_at<?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM requests
+                     WHERE kind='LIGHTNING_RECEIVE'
+                       AND json_extract(payload, '$.payment_hash')=preimages.hash
+                   )",
+                (older_than_rfc3339,),
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn expired_receive_hashes(&self, now_epoch: i64) -> Result<Vec<String>, String> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT r.created_at,r.payload
+                 FROM requests r
+                 LEFT JOIN receive_payments p
+                   ON p.hash=json_extract(r.payload, '$.payment_hash')
+                 WHERE r.kind='LIGHTNING_RECEIVE'
+                   AND COALESCE(p.status, '') NOT IN ('TRANSFER_COMPLETED','HTLC_FAILED')",
+            )?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut expired = Vec::new();
+            for row in rows {
+                let (created_at, payload) = row?;
+                let created = chrono::DateTime::parse_from_rfc3339(&created_at)
+                    .map(|value| value.timestamp())
+                    .unwrap_or(i64::MAX);
+                let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+                let expiry = payload
+                    .get("expiry_secs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(86_400);
+                if created.saturating_add(expiry.min(i64::MAX as u64) as i64) <= now_epoch {
+                    if let Some(hash) = payload.get("payment_hash").and_then(Value::as_str) {
+                        expired.push(hash.to_string());
+                    }
+                }
+            }
+            Ok(expired)
+        })
+        .await
+    }
+
+    pub async fn has_receive_request(&self, hash: &str, owner: &str) -> Result<bool, String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM requests
+                    WHERE kind='LIGHTNING_RECEIVE' AND owner=?1
+                      AND json_extract(payload, '$.payment_hash')=?2
+                )",
+                (owner, hash),
+                |r| r.get(0),
+            )
+        })
+        .await
+    }
+
+    pub async fn set_receive_status(&self, hash: &str, status: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO receive_payments(hash,status) VALUES(?1,?2)
+                 ON CONFLICT(hash) DO UPDATE SET status=excluded.status",
+                (hash, status),
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn receive_status(&self, hash: &str) -> Result<String, String> {
+        let found: Option<String> = self
+            .with(|c| {
+                c.query_row(
+                    "SELECT status FROM receive_payments WHERE hash=?1",
+                    (hash,),
+                    |r| r.get(0),
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(e),
+                })
+            })
+            .await?;
+        Ok(found.unwrap_or_else(|| "INVOICE_CREATED".to_string()))
     }
 
     // ---- payments ----
@@ -393,5 +703,155 @@ impl Db {
             })
             .await?;
         Ok(found.unwrap_or_else(|| "UNKNOWN".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> (Db, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mutinynet-ssp-{}", uuid::Uuid::new_v4()));
+        (Db::open(dir.to_str().unwrap()).unwrap(), dir)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn challenge_is_single_use() {
+        let (db, dir) = test_db();
+        let now = chrono::Utc::now();
+        db.save_challenge("owner", "challenge", &now.to_rfc3339())
+            .await
+            .unwrap();
+
+        assert!(db
+            .consume_challenge("owner", "challenge", now.timestamp(), 300)
+            .await
+            .unwrap());
+        assert!(!db
+            .consume_challenge("owner", "challenge", now.timestamp(), 300)
+            .await
+            .unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn challenge_rejects_unknown_expired_and_future_values() {
+        let (db, dir) = test_db();
+        let now = chrono::Utc::now();
+
+        assert!(!db
+            .consume_challenge("owner", "never-issued", now.timestamp(), 300)
+            .await
+            .unwrap());
+
+        db.save_challenge(
+            "owner",
+            "expired",
+            &(now - chrono::Duration::seconds(301)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .consume_challenge("owner", "expired", now.timestamp(), 300)
+            .await
+            .unwrap());
+
+        db.save_challenge(
+            "owner",
+            "future",
+            &(now + chrono::Duration::seconds(1)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .consume_challenge("owner", "future", now.timestamp(), 300)
+            .await
+            .unwrap());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn minted_preimage_is_owner_scoped() {
+        let (db, dir) = test_db();
+        db.save_preimage("hash", "preimage", "alice", "now")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_preimage_for_owner("hash", "alice").await.unwrap(),
+            Some("preimage".to_string())
+        );
+        assert_eq!(
+            db.get_preimage_for_owner("hash", "bob").await.unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lightning_receive_links_request_and_transfer() {
+        let (db, dir) = test_db();
+        db.insert_request(
+            "request",
+            "LIGHTNING_RECEIVE",
+            "owner",
+            "now",
+            &serde_json::json!({"payment_hash": "hash", "amount_sats": 1234}),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.lightning_receive_for_hash("hash").await.unwrap(),
+            Some(("request".to_string(), "owner".to_string(), 1234))
+        );
+        assert_eq!(
+            db.transfer_for_request("request", "owner").await.unwrap(),
+            None
+        );
+
+        db.insert_transfer(
+            "transfer",
+            "request",
+            "LIGHTNING_RECEIVE",
+            "TRANSFER_COMPLETED",
+            "owner",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.transfer_for_request("request", "owner").await.unwrap(),
+            Some("transfer".to_string())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn static_quote_is_retryable_but_claims_once() {
+        let (db, dir) = test_db();
+        let txid = "00".repeat(32);
+        assert_eq!(
+            db.record_static_quote(&txid, 0, 100_000, "first", "now")
+                .await
+                .unwrap(),
+            Some("first".to_string())
+        );
+        assert_eq!(
+            db.record_static_quote(&txid, 0, 100_000, "retry", "later")
+                .await
+                .unwrap(),
+            Some("first".to_string())
+        );
+        assert!(db.consume_static_quote(&txid, 0, "first").await.unwrap());
+        assert!(!db.consume_static_quote(&txid, 0, "first").await.unwrap());
+        assert_eq!(
+            db.record_static_quote(&txid, 0, 100_000, "after", "later")
+                .await
+                .unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -8,8 +8,8 @@
 # SPARK_REF must point at a checkout of https://github.com/buildonspark/spark
 # (used to build the SO image and for the SDK test). Defaults below.
 #
-# Host ports (system postgres already owns 5432 here, so we use 5434):
-#   bitcoind RPC 8332, ZMQ 28332/28333, SOs 8535-8537, SSP 5000, postgres 5434.
+# Host ports: bitcoind RPC uses BITCOIN_RPC_PORT (8332 by default), SOs use
+# 8535-8537, and SSP uses 5000. PostgreSQL and bitcoind ZMQ stay private.
 
 x-operator-common: &operator-common
   build:
@@ -75,8 +75,6 @@ services:
     image: postgres:16-bookworm
     environment:
       POSTGRES_HOST_AUTH_METHOD: trust
-    ports:
-      - "127.0.0.1:5434:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./e2e/upstream/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
@@ -91,9 +89,7 @@ services:
     command:
       - -conf=/bitcoin.conf
     ports:
-      - "127.0.0.1:8332:8332"
-      - "127.0.0.1:28332:28332"
-      - "127.0.0.1:28333:28333"
+      - "127.0.0.1:${BITCOIN_RPC_PORT:-8332}:8332"
     volumes:
       - bitcoind-data:/data/.bitcoin
       - ./e2e/upstream/bitcoin.conf:/bitcoin.conf:ro
@@ -114,8 +110,12 @@ services:
       - |
         set -e
         CLI="bitcoin-cli -regtest -rpcuser=testutil -rpcpassword=testutilpassword -rpcconnect=bitcoind -rpcport=8332"
-        if ! $$CLI listwallets | grep -q default; then
-          $$CLI createwallet default false false '' false true
+        if ! $$CLI listwallets | grep -q '"default"'; then
+          if $$CLI listwalletdir | grep -q '"name": "default"'; then
+            $$CLI loadwallet default > /dev/null
+          else
+            $$CLI createwallet default false false '' false true > /dev/null
+          fi
         fi
         BALANCE=$$($$CLI -rpcwallet=default getbalance)
         case "$$BALANCE" in
@@ -182,8 +182,7 @@ services:
 
   # ---- Lightning backend (decision 5: bitcoind backend) --------------------
   # Built from a local ldk-server checkout (set LDK_SERVER_REF). The SSP talks
-  # to it over gRPC once built with --features ldk; default builds stay in
-  # fake mode and only need it present for topology parity.
+  # to it over gRPC whenever LDK_GRPC_ADDR and credentials are set.
   ldk-server:
     build:
       context: ${LDK_SERVER_REF:-/tmp/opencode/ldk-server-ref}
@@ -195,15 +194,27 @@ services:
       - "127.0.0.1:3536:3536"
       - "127.0.0.1:19735:9735"
     healthcheck:
-      test: ["CMD-SHELL", "(echo > /dev/tcp/127.0.0.1/3536) 2>/dev/null"]
+      test: ["CMD-SHELL", "test -r /data/regtest/api_key && ldk-server-cli --base-url localhost:3536 --api-key $$(od -A n -t x1 /data/regtest/api_key | tr -d ' \\n') --tls-cert /data/tls.crt get-node-info >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 12
     volumes:
       - ldk-data:/data
       - ./e2e/ldk-server-config.toml:/config.toml:ro
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - /config.toml
+      - |
+        ldk-server /config.toml &
+        PID=$$!
+        trap 'kill -TERM "$$PID"' TERM INT
+        while kill -0 "$$PID" 2>/dev/null; do
+          if [ -f /data/regtest/api_key ] && [ -f /data/tls.crt ]; then
+            chmod 0444 /data/regtest/api_key /data/tls.crt
+            break
+          fi
+          sleep 1
+        done
+        wait "$$PID"
     restart: unless-stopped
 
   # Second node: LN counterparty for e2e send/receive (channel peer for ldk-server).
@@ -223,6 +234,11 @@ services:
     command:
       - /config.toml
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -r /data/regtest/api_key && ldk-server-cli --base-url localhost:3536 --api-key $$(od -A n -t x1 /data/regtest/api_key | tr -d ' \\n') --tls-cert /data/tls.crt get-node-info >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
   # ---- Swap-fill sidecar: funded Spark wallet completing leaf swaps ----
   # Mnemonic persists in sidecar-data; fund once via the sidecar-fund service.
@@ -244,10 +260,11 @@ services:
       PORT: 5001
       SPARK_LOCAL_INGRESS_HOST: sidecar
       SPARK_SDK_DIST: /sdk/index.node.js
-      SPARK_NETWORK: LOCAL
-      SO_HOSTS: spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535
+      SPARK_NETWORK: ${SPARK_NETWORK:-LOCAL}
+      SO_HOSTS: ${SO_HOSTS:-spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535}
       SSP_URL: http://ssp:5000
       SIDECAR_MNEMONIC_FILE: /app/data/sidecar.mnemonic
+      SIDECAR_FILL_RECEIPTS_FILE: /app/data/swap-fills.json
       SIDECAR_TOKEN: ${SIDECAR_TOKEN:?set SIDECAR_TOKEN}
     restart: unless-stopped
 
@@ -255,6 +272,7 @@ services:
   # Usage: docker compose -f docker-compose.regtest.yml run --rm sidecar-fund
   sidecar-fund:
     <<: *sidecar-common
+    profiles: ["tools"]
     depends_on:
       bitcoind:
         condition: service_healthy
@@ -263,13 +281,14 @@ services:
       MINING: 1
       SPARK_LOCAL_INGRESS_HOST: sidecar
       SPARK_SDK_DIST: /sdk/index.node.js
-      SPARK_NETWORK: LOCAL
-      SO_HOSTS: spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535
+      SPARK_NETWORK: ${SPARK_NETWORK:-LOCAL}
+      SO_HOSTS: ${SO_HOSTS:-spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535}
       SSP_URL: http://ssp:5000
       SIDECAR_MNEMONIC_FILE: /app/data/sidecar.mnemonic
+      # This process runs inside Compose. Do not pass the host RPC URL here.
       BITCOIN_RPC_URL: http://bitcoind:8332
-      BITCOIN_RPC_USER: testutil
-      BITCOIN_RPC_PASSWORD: testutilpassword
+      BITCOIN_RPC_USER: ${BITCOIN_RPC_USER:-testutil}
+      BITCOIN_RPC_PASSWORD: ${BITCOIN_RPC_PASSWORD:-testutilpassword}
       FUND_AMOUNT_SATS: 20000000
 
   ssp:
@@ -286,7 +305,7 @@ services:
     ports:
       - "127.0.0.1:5000:5000"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5000/health | grep -q '\"status\":\"ok\"'"]
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:5000/health | grep -q '\"status\":\"ok\"'"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -295,15 +314,16 @@ services:
       - ldk-data:/ldk-data:ro
     environment:
       SSP_LISTEN_ADDR: 0.0.0.0:5000
-      SSP_NETWORK: REGTEST
+      SSP_CORS_ORIGINS: ${SSP_CORS_ORIGINS:-}
+      SSP_NETWORK: ${SSP_NETWORK:-REGTEST}
       # No committed secrets: first boot generates <SSP_DATA_DIR>/ssp.key.
       # Publish SSP_IDENTITY_PUBKEY from /health into wallet configs.
       SSP_DATA_DIR: /data
       # Live LDK backend (decision 5): bitcoind-backed ldk-server above.
-      LDK_GRPC_ADDR: ldk-server:3536
-      LDK_API_KEY_FILE: /ldk-data/regtest/api_key
-      LDK_TLS_CERT_FILE: /ldk-data/tls.crt
-      SSP_LN_FEE_PPM: 0
+      LDK_GRPC_ADDR: ${LDK_GRPC_ADDR:-ldk-server:3536}
+      LDK_API_KEY: ${LDK_API_KEY:-}
+      LDK_API_KEY_FILE: ${LDK_API_KEY_FILE:-/ldk-data/regtest/api_key}
+      LDK_TLS_CERT_FILE: ${LDK_TLS_CERT_FILE:-/ldk-data/tls.crt}
       SSP_SWAP_FEE_SATS: 0
       SIDECAR_URL: http://swap-sidecar:5001
       SIDECAR_TOKEN: ${SIDECAR_TOKEN:?set SIDECAR_TOKEN}
