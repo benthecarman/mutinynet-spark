@@ -66,6 +66,7 @@ pub async fn dispatch(
         }
         "LightningSendFeeEstimate" | "lightning_send_fee_estimate" => {
             let inv = str_of(&input, "encoded_invoice");
+            validate_internal_send_support(&state.db, &inv).await?;
             let amt = opt_num(&input, "amount_sats");
             let msat = crate::backend(&state)
                 .await
@@ -379,6 +380,7 @@ pub async fn dispatch(
                 state.db.lightning_receive_hash_for_invoice(&inv).await?
             };
             if let Some(payment_hash) = local_payment_hash.as_deref() {
+                validate_internal_send_support(&state.db, &inv).await?;
                 let decoded = lightning_invoice::Bolt11Invoice::from_str(&inv)
                     .map_err(|error| format!("decode internal BOLT11 invoice: {error}"))?;
                 if amt.is_some() {
@@ -438,8 +440,10 @@ pub async fn dispatch(
             } else {
                 "BOLT11"
             };
-            let pay = if let Some(payment_hash) = local_payment_hash.as_deref() {
-                let payment_id = format!("internal:{payment_hash}");
+            let pay = if local_payment_hash.is_some() {
+                // Each attempt needs its own payment row. Reusing the hash
+                // would revive failed requests with stale funding transfers.
+                let payment_id = format!("internal:{}", Uuid::new_v4());
                 state.db.set_payment(&payment_id, "PENDING").await?;
                 crate::ldk::PayResult {
                     payment_id,
@@ -1161,6 +1165,19 @@ fn transfer_response(row: &Value, user_request: Value) -> Value {
     })
 }
 
+/// Reject unsupported local invoices before the wallet locks sender funding.
+async fn validate_internal_send_support(db: &crate::db::Db, invoice: &str) -> Result<(), String> {
+    if let Some(hash) = db.lightning_receive_hash_for_invoice(invoice).await? {
+        if db.get_preimage(&hash).await?.is_none() {
+            return Err(
+                "this invoice cannot be paid internally; use an external Lightning wallet"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Build the request_lightning_send response from a stored LIGHTNING_SEND
 /// record, refreshing status from the payment tracker (M4 idempotent replay
 /// shares this with the fresh-send path).
@@ -1401,6 +1418,39 @@ mod tests {
         validate_network_name, validate_sats,
     };
     use serde_json::json;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn internal_invoice_support_requires_an_ssp_owned_secret() {
+        let dir =
+            std::env::temp_dir().join(format!("open-ssp-internal-quote-{}", uuid::Uuid::new_v4()));
+        let db = crate::db::Db::open(dir.to_str().unwrap()).unwrap();
+        db.insert_request(
+            "receive",
+            "LIGHTNING_RECEIVE",
+            "owner",
+            "now",
+            &json!({"payment_hash": "hash", "invoice": "local-invoice", "amount_sats": 1000}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            super::validate_internal_send_support(&db, "external-invoice")
+                .await
+                .is_ok()
+        );
+        let error = super::validate_internal_send_support(&db, "local-invoice")
+            .await
+            .unwrap_err();
+        assert!(error.contains("cannot be paid internally"));
+        db.save_preimage("hash", "secret", "owner", "now")
+            .await
+            .unwrap();
+        assert!(super::validate_internal_send_support(&db, "local-invoice")
+            .await
+            .is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn string_input_does_not_turn_null_into_text() {

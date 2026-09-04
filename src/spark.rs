@@ -66,6 +66,13 @@ pub struct LightningReceiveSwap {
     pub preimage: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LightningFundingState {
+    Claimable,
+    Settled,
+    Unavailable,
+}
+
 pub struct SparkService {
     wallet: Arc<SparkWallet>,
     network: Network,
@@ -429,10 +436,16 @@ impl SparkService {
             .find_htlc(outbound_transfer_id, payment_hash)
             .await?
             .ok_or_else(|| "matching preimage swap was not found".to_string())?;
-        if request.status == PreimageRequestStatus::PreimageShared && request.preimage.is_some() {
+        if request.status == PreimageRequestStatus::PreimageShared
+            && request.preimage.is_some()
+            && request
+                .transfer
+                .as_ref()
+                .is_some_and(|transfer| funding_transfer_committed(&transfer.status))
+        {
             return Ok(());
         }
-        if request.status != PreimageRequestStatus::WaitingForPreimage {
+        if request.status == PreimageRequestStatus::Returned {
             return Err("preimage swap can no longer be settled".to_string());
         }
         let transfer = self
@@ -443,7 +456,32 @@ impl SparkService {
         if transfer.id.to_string() != outbound_transfer_id {
             return Err("settled transfer id does not match the funded transfer".to_string());
         }
+        if !funding_transfer_committed(&transfer.status) {
+            return Err("sender funding has not committed".to_string());
+        }
         Ok(())
+    }
+
+    /// A transport failure is retryable. An expired, returned, or missing
+    /// transfer is a terminal funding failure and must not cause a payout.
+    pub async fn lightning_funding_state(
+        &self,
+        outbound_transfer_id: &str,
+        payment_hash: &str,
+    ) -> Result<LightningFundingState, String> {
+        let Some(request) = self.find_htlc(outbound_transfer_id, payment_hash).await? else {
+            return Ok(LightningFundingState::Unavailable);
+        };
+        let Some(transfer) = request.transfer.as_ref() else {
+            return Ok(LightningFundingState::Unavailable);
+        };
+        Ok(lightning_funding_state(
+            request.status,
+            request.preimage.is_some(),
+            &transfer.status,
+            request.expiry_time,
+            std::time::SystemTime::now(),
+        ))
     }
 
     pub async fn settle_lightning_receive(
@@ -1049,6 +1087,48 @@ impl SparkService {
     }
 }
 
+fn lightning_funding_state(
+    status: PreimageRequestStatus,
+    has_preimage: bool,
+    transfer_status: &TransferStatus,
+    expiry: std::time::SystemTime,
+    now: std::time::SystemTime,
+) -> LightningFundingState {
+    if matches!(
+        transfer_status,
+        TransferStatus::Returned | TransferStatus::Expired
+    ) {
+        return LightningFundingState::Unavailable;
+    }
+    match status {
+        PreimageRequestStatus::PreimageShared if has_preimage => {
+            if funding_transfer_committed(transfer_status) {
+                LightningFundingState::Settled
+            } else {
+                // A prepare can reveal the secret before the transfer commits.
+                // Retry the claim, but never treat that reveal as payment.
+                LightningFundingState::Claimable
+            }
+        }
+        PreimageRequestStatus::WaitingForPreimage if !has_preimage && expiry > now => {
+            LightningFundingState::Claimable
+        }
+        _ => LightningFundingState::Unavailable,
+    }
+}
+
+fn funding_transfer_committed(status: &TransferStatus) -> bool {
+    matches!(
+        status,
+        TransferStatus::SenderKeyTweaked
+            | TransferStatus::ReceiverKeyTweaked
+            | TransferStatus::ReceiverKeyTweakLocked
+            | TransferStatus::ReceiverKeyTweakApplied
+            | TransferStatus::ReceiverRefundSigned
+            | TransferStatus::Completed
+    )
+}
+
 fn build_lightning_receive_swap_request(
     payment_hash: &sha256::Hash,
     invoice: &str,
@@ -1397,6 +1477,83 @@ mod tests {
         assert_eq!(parse_network("TESTNET").unwrap(), Network::Testnet);
         assert_eq!(parse_network("SIGNET").unwrap(), Network::Signet);
         assert_eq!(parse_network("LOCAL").unwrap(), Network::Regtest);
+    }
+
+    #[test]
+    fn funding_expiry_and_return_are_terminal_before_claim() {
+        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        for expiry in [now - Duration::from_secs(1), now] {
+            assert_eq!(
+                lightning_funding_state(
+                    PreimageRequestStatus::WaitingForPreimage,
+                    false,
+                    &TransferStatus::SenderKeyTweakPending,
+                    expiry,
+                    now,
+                ),
+                LightningFundingState::Unavailable
+            );
+        }
+        assert_eq!(
+            lightning_funding_state(
+                PreimageRequestStatus::Returned,
+                false,
+                &TransferStatus::Returned,
+                now + Duration::from_secs(60),
+                now,
+            ),
+            LightningFundingState::Unavailable
+        );
+        assert_eq!(
+            lightning_funding_state(
+                PreimageRequestStatus::WaitingForPreimage,
+                false,
+                &TransferStatus::SenderKeyTweakPending,
+                now + Duration::from_secs(60),
+                now,
+            ),
+            LightningFundingState::Claimable
+        );
+    }
+
+    #[test]
+    fn shared_preimage_is_not_payment_until_funding_commits() {
+        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let expiry = now - Duration::from_secs(1);
+        assert_eq!(
+            lightning_funding_state(
+                PreimageRequestStatus::PreimageShared,
+                true,
+                &TransferStatus::SenderKeyTweakPending,
+                expiry,
+                now,
+            ),
+            LightningFundingState::Claimable
+        );
+        for status in [TransferStatus::SenderKeyTweaked, TransferStatus::Completed] {
+            assert_eq!(
+                lightning_funding_state(
+                    PreimageRequestStatus::PreimageShared,
+                    true,
+                    &status,
+                    expiry,
+                    now,
+                ),
+                LightningFundingState::Settled
+            );
+        }
+        for status in [TransferStatus::Returned, TransferStatus::Expired] {
+            assert_eq!(
+                lightning_funding_state(
+                    PreimageRequestStatus::PreimageShared,
+                    true,
+                    &status,
+                    expiry,
+                    now,
+                ),
+                LightningFundingState::Unavailable
+            );
+        }
     }
 
     #[test]

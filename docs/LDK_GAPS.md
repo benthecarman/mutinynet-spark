@@ -18,10 +18,20 @@ Retries with the same wallet, invoice, transfer ID, and idempotency key return
 the stored request and do not start a second Lightning payment.
 
 If the encoded BOLT11 invoice exactly matches an open receive request created
-by the same SSP, the SSP does not call `Bolt11Send`. It completes the receiver's
-Spark transfer, recovers the preimage, and uses it to claim the payer's Spark
-preimage swap. Pending internal settlements are stored and reconciled after a
-retry or process restart.
+by the same SSP, internal settlement is available only for the explicit
+SSP-owned HODL extension, where the SSP already holds the preimage. The SSP
+claims the payer's Spark funding before paying the receiver. A persistent
+reservation prevents a competing Lightning payment from claiming the same
+receive. Pending settlements resume after a retry or process restart;
+expired or returned funding produces a failed send.
+
+Standard wallet-created invoices from the same SSP are rejected during fee
+estimation and send validation. Recovering their preimage requires an
+irreversible receiver payout, while the payer's funding can expire before it
+is claimed. Supporting these invoices safely requires an operator operation
+that commits both transfers atomically. They can still be paid from an
+external Lightning wallet. Existing pending internal requests without a
+reservation cannot reuse a receive that has already started or completed.
 
 ### BOLT11 receive
 

@@ -22,6 +22,7 @@ pub struct LightningReceive {
     pub transfer_id: Option<String>,
     pub preimage: Option<String>,
     pub claim_submitted: bool,
+    pub internal_payment_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,6 +183,11 @@ impl Db {
                 "receive_payments",
                 "claim_submitted",
                 "ALTER TABLE receive_payments ADD COLUMN claim_submitted INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "receive_payments",
+                "internal_payment_id",
+                "ALTER TABLE receive_payments ADD COLUMN internal_payment_id TEXT",
             ),
         ] {
             ensure_column(&conn, table, column, migration).map_err(|e| e.to_string())?;
@@ -523,7 +529,7 @@ impl Db {
                         json_extract(r.payload, '$.amount_sats'),
                         COALESCE(json_extract(r.payload, '$.invoice'), ''),
                         COALESCE(p.status, 'INVOICE_CREATED'), p.transfer_id,
-                        p.preimage, COALESCE(p.claim_submitted, 0)
+                        p.preimage, COALESCE(p.claim_submitted, 0), p.internal_payment_id
                  FROM requests r
                  LEFT JOIN receive_payments p ON p.hash=?1
                  WHERE r.kind='LIGHTNING_RECEIVE'
@@ -541,6 +547,7 @@ impl Db {
                         transfer_id: row.get(6)?,
                         preimage: row.get(7)?,
                         claim_submitted: row.get::<_, i64>(8)? != 0,
+                        internal_payment_id: row.get(9)?,
                     })
                 },
             )
@@ -615,14 +622,53 @@ impl Db {
         self.with(|c| {
             c.query_row(
                 "SELECT EXISTS(
-                    SELECT 1 FROM requests
-                    WHERE kind='LIGHTNING_SEND'
-                      AND json_extract(payload, '$.payment_kind')='INTERNAL_BOLT11'
-                      AND json_extract(payload, '$.internal_payment_hash')=?1
+                    SELECT 1 FROM requests r
+                    JOIN payments p ON p.id=json_extract(r.payload, '$.payment_id')
+                    WHERE r.kind='LIGHTNING_SEND'
+                      AND json_extract(r.payload, '$.payment_kind')='INTERNAL_BOLT11'
+                      AND json_extract(r.payload, '$.internal_payment_hash')=?1
+                      AND p.status != 'FAILED'
                 )",
                 (payment_hash,),
                 |row| row.get(0),
             )
+        })
+        .await
+    }
+
+    /// Choose the internal settlement path before contacting the operators.
+    /// Callers share the receive lock with the Lightning event handlers.
+    pub async fn reserve_internal_receive(
+        &self,
+        hash: &str,
+        payment_id: &str,
+    ) -> Result<bool, String> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE receive_payments SET internal_payment_id=?2
+                 WHERE hash=?1 AND status='INVOICE_CREATED'
+                   AND transfer_id IS NULL AND internal_payment_id IS NULL",
+                (hash, payment_id),
+            )
+            .map(|changed| changed == 1)
+        })
+        .await
+    }
+
+    /// Release a failed attempt only if it has not committed a payout.
+    pub async fn fail_internal_send(&self, hash: &str, payment_id: &str) -> Result<(), String> {
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE payments SET status='FAILED' WHERE id=?1",
+                (payment_id,),
+            )?;
+            tx.execute(
+                "UPDATE receive_payments SET internal_payment_id=NULL
+                 WHERE hash=?1 AND internal_payment_id=?2 AND transfer_id IS NULL",
+                (hash, payment_id),
+            )?;
+            tx.commit()
         })
         .await
     }
@@ -1008,6 +1054,7 @@ impl Db {
                  WHERE r.kind='LIGHTNING_RECEIVE'
                    AND COALESCE(p.status, '') NOT IN ('TRANSFER_COMPLETED','HTLC_FAILED')
                    AND p.transfer_id IS NULL
+                   AND p.internal_payment_id IS NULL
                    AND NOT EXISTS (
                      SELECT 1 FROM transfers t
                      WHERE t.request_id=r.id AND t.kind='LIGHTNING_RECEIVE'
@@ -1058,6 +1105,19 @@ impl Db {
                 "INSERT INTO receive_payments(hash,status) VALUES(?1,?2)
                  ON CONFLICT(hash) DO UPDATE SET status=excluded.status",
                 (hash, status),
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn fail_external_receive(&self, hash: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE receive_payments SET status='HTLC_FAILED'
+                 WHERE hash=?1 AND internal_payment_id IS NULL
+                   AND status != 'TRANSFER_COMPLETED'",
+                (hash,),
             )
             .map(|_| ())
         })
@@ -1783,6 +1843,7 @@ mod tests {
                 transfer_id: None,
                 preimage: None,
                 claim_submitted: false,
+                internal_payment_id: None,
             })
         );
         assert_eq!(

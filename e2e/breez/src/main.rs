@@ -1108,7 +1108,7 @@ async fn pay_between(
     Ok(payment_hash)
 }
 
-async fn pay_internally(
+async fn reject_unsafe_internal_payment(
     client: &Client,
     config: &TestConfig,
     sender: &Wallet,
@@ -1140,7 +1140,7 @@ async fn pay_internally(
         "LDK already has a payment for the internal invoice"
     );
 
-    let prepared = sender
+    let error = sender
         .sdk
         .prepare_send_payment(PrepareSendPaymentRequest {
             payment_request: PaymentRequest::Input {
@@ -1151,73 +1151,23 @@ async fn pay_internally(
             conversion_options: None,
             fee_policy: None,
         })
-        .await?;
-    let sent = sender
-        .sdk
-        .send_payment(SendPaymentRequest {
-            prepare_response: prepared,
-            options: None,
-            idempotency_key: None,
-        })
-        .await?;
-    let sender_payment = poll("internal Breez send", config.timeout, || {
-        completed_payment(sender, &sent.payment.id)
-    })
-    .await?;
-    let receiver_payment = poll("internal Breez receive", config.timeout, || {
-        received_payment(receiver, &invoice)
-    })
-    .await?;
-
+        .await
+        .expect_err("unsafe internal invoice was accepted for funding");
     ensure!(
-        sender_payment.payment_type == PaymentType::Send
-            && sender_payment.amount == u128::from(amount_sats)
-            && sender_payment.fees == 0,
-        "unexpected internal sender payment: {sender_payment:?}"
+        error.to_string().contains("cannot be paid internally"),
+        "unexpected internal payment error: {error}"
     );
+    exact_balance(sender, sender_before).await?;
+    exact_balance(receiver, receiver_before).await?;
     ensure!(
-        receiver_payment.amount == u128::from(amount_sats) && receiver_payment.fees == 0,
-        "unexpected internal receiver payment: {receiver_payment:?}"
+        ssp_available_balance(client, config, sender.ssp_url).await? == ssp_before,
+        "rejected internal payment changed SSP balance"
     );
-    poll("internal sender balance", config.timeout, || {
-        exact_balance(sender, sender_before - amount_sats)
-    })
-    .await?;
-    poll("internal receiver balance", config.timeout, || {
-        exact_balance(receiver, receiver_before + amount_sats)
-    })
-    .await?;
-    poll("internal SSP balance conservation", config.timeout, || async {
-        let balance = ssp_available_balance(client, config, sender.ssp_url).await?;
-        ensure!(
-            balance == ssp_before,
-            "internal payment changed SSP balance from {ssp_before} to {balance}"
-        );
-        Ok(balance)
-    })
-    .await?;
     ensure!(
         bolt11_payment_count(&sender.ldk, &payment_hash).await? == 0,
-        "internal payment created an LDK payment"
+        "rejected internal payment created an LDK payment"
     );
-
-    let htlc = match receiver_payment.details {
-        Some(PaymentDetails::Lightning { htlc_details, .. }) => htlc_details,
-        _ => bail!("internal Breez receive has no Lightning details"),
-    };
-    let preimage = htlc
-        .preimage
-        .context("internal Breez receive has no preimage")?;
-    ensure!(
-        htlc.payment_hash == payment_hash
-            && hex::encode(Sha256::digest(hex::decode(preimage)?)) == payment_hash,
-        "internal payment preimage does not match its hash"
-    );
-
-    println!(
-        "PASS internal SSP payment: {} sent {amount_sats} sats to {} without LDK payment {payment_hash}",
-        sender.name, receiver.name
-    );
+    println!("PASS unsafe internal invoice rejected before funding: {payment_hash}");
     Ok(())
 }
 
@@ -1454,7 +1404,7 @@ async fn run(
     .context("wallet A repeated split receive failed after SSP restart")?;
 
     println!("seed exact leaves for the Lightning send matrix");
-    for _ in 0..4 {
+    for _ in 0..3 {
         fund_ssp(client, config, wallet_a.ssp_url, config.send_amount_sats).await?;
     }
     for _ in 0..3 {
@@ -1478,26 +1428,10 @@ async fn run(
     )
     .await
     .context("wallet A send-liquidity bootstrap failed")?;
-    bootstrap_wallet(
-        wallet_a,
-        &wallet_b.ldk,
-        config.send_amount_sats,
-        config.send_amount_sats,
-        config.timeout,
-    )
-    .await
-    .context("wallet A internal-send bootstrap failed")?;
-
-    println!("send between two wallets on SSP A without Lightning");
-    pay_internally(
-        client,
-        config,
-        wallet_a,
-        wallet_c,
-        config.send_amount_sats,
-    )
-    .await
-    .context("internal SSP payment failed")?;
+    println!("reject unsafe internal payment before funding");
+    reject_unsafe_internal_payment(client, config, wallet_a, wallet_c, config.send_amount_sats)
+        .await
+        .context("unsafe internal payment rejection failed")?;
 
     println!("send from wallet B to wallet A over Lightning");
     let first_hash = pay_between(

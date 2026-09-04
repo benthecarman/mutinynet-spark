@@ -114,8 +114,9 @@ With the two checkouts at their default paths, run:
 The script always creates a separate Compose project with empty volumes. It
 funds each SSP with 1,000-sat receive leaves, creates bidirectional Lightning
 liquidity, and bootstraps both Breez wallets with 1,500-sat standard BOLT11
-receives. It makes a 1,000-sat payment between two wallets on the same SSP and
-verifies that no LDK payment exists for it. It then makes payments in both
+receives. It verifies that an unsafe internal payment between two wallets on
+the same SSP is rejected before funding, with unchanged balances and no LDK
+payment. It then makes payments in both
 directions between the SSPs. Finally, one wallet sends to a BOLT12 offer through
 its SSP, and another Lightning node pays an SSP offer that credits the wallet.
 This proves that a receive can combine two leaves for the larger invoice and

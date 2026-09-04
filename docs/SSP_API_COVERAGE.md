@@ -47,8 +47,9 @@ the SSP emits the required protobuf manifest.
 `e2e/ln-e2e.sh` runs this flow on a fresh local regtest network through the
 Rust Breez SDK at revision `c7eecfe`. It uses local Electrs for Breez chain
 data, two SSP instances, and two `ldk-server` nodes. The wallets send and
-receive BOLT11 payments between SSPs. Two wallets also make an internal payment
-through one SSP, with no LDK payment. The test has separate BOLT12 send and
+receive BOLT11 payments between SSPs. Two wallets also check that an unsafe
+internal invoice is rejected before funding, with unchanged balances and no
+LDK payment. The test has separate BOLT12 send and
 receive flows. It checks Spark balances, offer IDs, LDK payment state, and
 preimage hashes.
 
