@@ -62,7 +62,7 @@ impl TestConfig {
         let send_amount_sats = optional_env("BREEZ_SEND_AMOUNT_SATS", "1000")
             .parse()
             .context("BREEZ_SEND_AMOUNT_SATS is not an integer")?;
-        let receive_amount_sats = optional_env("BREEZ_RECEIVE_AMOUNT_SATS", "1500")
+        let receive_amount_sats = optional_env("BREEZ_RECEIVE_AMOUNT_SATS", "2000")
             .parse()
             .context("BREEZ_RECEIVE_AMOUNT_SATS is not an integer")?;
         let ssp_receive_leaf_sats: u64 = optional_env("BREEZ_SSP_RECEIVE_LEAF_SATS", "1000")
@@ -83,13 +83,16 @@ impl TestConfig {
             send_amount_sats == ssp_receive_leaf_sats,
             "BREEZ_SEND_AMOUNT_SATS must equal one SSP receive leaf"
         );
+        // Receives are exactly value-conserving: the SSP pays exactly the
+        // invoice amount from whole leaves and cannot split its own leaves
+        // (Spark leaf swaps are SSP-mediated), so the bootstrap amount must
+        // be composable from the coarse ladder - here exactly two leaves.
         ensure!(
-            receive_amount_sats > ssp_receive_leaf_sats
-                && receive_amount_sats
-                    <= ssp_receive_leaf_sats
-                        .checked_mul(2)
-                        .context("BREEZ_SSP_RECEIVE_LEAF_SATS is too large")?,
-            "BREEZ_RECEIVE_AMOUNT_SATS must require exactly two SSP receive leaves"
+            receive_amount_sats
+                == ssp_receive_leaf_sats
+                    .checked_mul(2)
+                    .context("BREEZ_SSP_RECEIVE_LEAF_SATS is too large")?,
+            "BREEZ_RECEIVE_AMOUNT_SATS must equal exactly two SSP receive leaves"
         );
 
         Ok(Self {
@@ -951,7 +954,7 @@ async fn bootstrap_wallet(
     })
     .await?;
     println!(
-        "PASS two-leaf receive: {} invoice was {amount_sats} sats; Spark credited {spark_credit_sats} sats",
+        "PASS exact receive: {} invoice was {amount_sats} sats; Spark credited {spark_credit_sats} sats",
         wallet.name
     );
     Ok(())
@@ -1270,38 +1273,32 @@ async fn run(
     wallet_a: &Wallet,
     wallet_b: &Wallet,
 ) -> Result<()> {
-    let combined_receive_leaf_sats = config
-        .ssp_receive_leaf_sats
-        .checked_mul(2)
-        .context("combined SSP receive leaf value overflow")?;
-
     println!("fund coarse SSP receive leaves");
     for wallet in [wallet_a, wallet_b] {
         for _ in 0..3 {
             fund_ssp(client, config, wallet.ssp_url, config.ssp_receive_leaf_sats).await?;
         }
     }
-
-    println!("bootstrap both wallets through Lightning receive");
+    // Receives are exactly value-conserving: the wallet is credited exactly
+    // the invoice amount in Spark, never a rounded-up whole-leaf sum.
     bootstrap_wallet(
         wallet_b,
         &wallet_a.ldk,
         config.receive_amount_sats,
-        combined_receive_leaf_sats,
+        config.receive_amount_sats,
         config.timeout,
     )
     .await
-    .context("wallet B two-leaf bootstrap receive failed")?;
+    .context("wallet B exact bootstrap receive failed")?;
     bootstrap_wallet(
         wallet_a,
         &wallet_b.ldk,
         config.receive_amount_sats,
-        combined_receive_leaf_sats,
+        config.receive_amount_sats,
         config.timeout,
     )
     .await
-    .context("wallet A two-leaf bootstrap receive failed")?;
-
+    .context("wallet A exact bootstrap receive failed")?;
     println!("send one full leaf from wallet B to wallet A over Lightning");
     let first_hash = pay_between(
         wallet_b,
