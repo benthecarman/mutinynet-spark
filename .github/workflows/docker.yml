@@ -30,12 +30,14 @@ jobs:
     permissions:
       contents: read
     env:
-      SPARK_REF: ${{ runner.temp }}/spark-ref
-      LDK_SERVER_REF: ${{ runner.temp }}/ldk-server-ref
       SPARK_ADMIN_TOKEN: regtest-spark-admin-token
       LN_STREAM_IDLE_SECONDS: 95
     steps:
       - uses: actions/checkout@v5
+      - name: Configure temporary checkouts
+        run: |
+          echo "SPARK_REF=$RUNNER_TEMP/spark-ref" >> "$GITHUB_ENV"
+          echo "LDK_SERVER_REF=$RUNNER_TEMP/ldk-server-ref" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
@@ -48,8 +50,8 @@ jobs:
           git -C "$LDK_SERVER_REF" fetch --depth=1 origin 6d6d810714706c225ce7effc2163eff6a1b54221
           git -C "$LDK_SERVER_REF" checkout --detach FETCH_HEAD
       - name: Build pinned Spark SDK
-        working-directory: ${{ runner.temp }}/spark-ref/sdks/js
         run: |
+          cd "$SPARK_REF/sdks/js"
           corepack enable
           yarn install --no-immutable
           yarn build:sdk
@@ -65,13 +67,15 @@ jobs:
     permissions:
       contents: read
     env:
-      SPARK_REF: ${{ runner.temp }}/spark-ref
       SPARK_OPERATOR_COMMIT: dad8bc6cf109b5946eec6860fb84bf247c8cae98
-      LDK_SERVER_REF: ${{ runner.temp }}/ldk-server-ref
       SPARK_ADMIN_TOKEN: regtest-spark-admin-token
       BREEZ_E2E_PROJECT_NAME: open-ssp-breez-e2e-ci
     steps:
       - uses: actions/checkout@v5
+      - name: Configure temporary checkouts
+        run: |
+          echo "SPARK_REF=$RUNNER_TEMP/spark-ref" >> "$GITHUB_ENV"
+          echo "LDK_SERVER_REF=$RUNNER_TEMP/ldk-server-ref" >> "$GITHUB_ENV"
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libprotobuf-dev protobuf-compiler
       - name: Check out pinned upstream sources
