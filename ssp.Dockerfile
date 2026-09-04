@@ -1,5 +1,8 @@
 FROM rust:1.92-slim-bookworm AS builder
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libprotobuf-dev protobuf-compiler \
+ && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock* ./
 RUN mkdir src \
  && echo 'fn main() {}' > src/main.rs \
@@ -9,7 +12,7 @@ COPY src ./src
 RUN touch src/main.rs && cargo build --release
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates curl \
+RUN apt-get update && apt-get install -y ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 ssp \
  && useradd --system --uid 10001 --gid ssp --home-dir /data ssp \
@@ -19,5 +22,5 @@ ENV SSP_DATA_DIR=/data
 USER ssp
 EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD curl --fail --silent http://127.0.0.1:5000/health > /dev/null || exit 1
+  CMD ["mutinynet-ssp", "healthcheck"]
 ENTRYPOINT ["mutinynet-ssp"]

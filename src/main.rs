@@ -8,6 +8,8 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tracing::info;
 
 mod auth;
@@ -16,34 +18,21 @@ mod db;
 mod frost;
 mod graphql;
 mod ldk;
+mod spark;
 
 use config::Config;
 use db::Db;
 use ldk::{Backend, LdkBackend, LdkGrpcBackend};
+use spark::SparkService;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
     pub db: Arc<Db>,
     pub ldk: Arc<tokio::sync::RwLock<Backend>>,
-    /// Hex secret (resolved) for local signing fallback.
-    pub ssp_secret_hex: String,
-    /// Published SSP identity. None while the sidecar identity is pending;
-    /// identity-dependent ops reject until it resolves.
-    pub identity: Arc<tokio::sync::RwLock<Option<String>>>,
-    /// Shared HTTP client (timeouts + pooling) for sidecar calls.
-    pub http: reqwest::Client,
+    pub spark: Arc<SparkService>,
     /// Serializes the check-and-pay section for idempotent Lightning sends.
     pub send_lock: Arc<tokio::sync::Mutex<()>>,
-}
-
-/// One shared client: 15s total, 5s connect. Never build per-request clients.
-pub fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .build()
-        .expect("http client builds")
 }
 
 pub async fn backend(state: &AppState) -> tokio::sync::RwLockReadGuard<'_, Backend> {
@@ -51,12 +40,7 @@ pub async fn backend(state: &AppState) -> tokio::sync::RwLockReadGuard<'_, Backe
 }
 
 pub async fn ssp_identity(state: &AppState) -> Result<String, String> {
-    state
-        .identity
-        .read()
-        .await
-        .clone()
-        .ok_or_else(|| "ssp identity pending (sidecar unreachable)".to_string())
+    Ok(state.spark.identity())
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,23 +59,85 @@ struct GraphqlResponse {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let backend = state.ldk.read().await;
+    let spark = state.spark.health().await;
     Json(serde_json::json!({
         "status": "ok",
         "network": state.config.network,
-        "ssp_identity_pubkey": state.identity.read().await.clone(),
-        "identity_source": identity_source(&state.config, state.identity.read().await.is_some()),
+        "ssp_identity_pubkey": state.spark.identity(),
+        "identity_source": "spark-wallet",
+        "spark": spark.as_ref().ok(),
+        "spark_error": spark.as_ref().err(),
         "ldk_mode": if backend.live_node_id().is_some() { "live" } else { "fake" },
         "ldk_node_id": backend.live_node_id(),
     }))
 }
 
-fn identity_source(config: &Config, resolved: bool) -> &'static str {
-    if config.sidecar_url.is_empty() {
-        "local"
-    } else if resolved {
-        "sidecar"
-    } else {
-        "pending"
+fn admin_authorized(config: &Config, headers: &HeaderMap) -> bool {
+    if config.spark_admin_token.is_empty() {
+        return std::env::var("SPARK_ADMIN_ALLOW_NO_AUTH").unwrap_or_default() == "1";
+    }
+    let supplied = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    Sha256::digest(supplied.as_bytes())
+        .ct_eq(&Sha256::digest(config.spark_admin_token.as_bytes()))
+        .into()
+}
+
+async fn spark_deposit_address(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !admin_authorized(&state.config, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        );
+    }
+    match state.spark.generate_deposit_address().await {
+        Ok(address) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"address": address})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error})),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct ClaimDepositRequest {
+    transaction_hex: String,
+    vout: u32,
+}
+
+async fn spark_claim_deposit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ClaimDepositRequest>,
+) -> impl IntoResponse {
+    if !admin_authorized(&state.config, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        );
+    }
+    match state
+        .spark
+        .claim_deposit(&request.transaction_hex, request.vout)
+        .await
+    {
+        Ok(values) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "leaf_values": values})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error})),
+        ),
     }
 }
 
@@ -179,37 +225,6 @@ fn inflate_raw_deflate(input: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Fetch the sidecar wallet identity (with retries; sidecar may boot later).
-async fn fetch_sidecar_identity(sidecar_url: &str, token: &str) -> Result<String, String> {
-    let mut req = http_client().get(format!("{sidecar_url}/health"));
-    if !token.is_empty() {
-        req = req.bearer_auth(token);
-    }
-    let mut last = "unreachable".to_string();
-    for _ in 0..24 {
-        match req
-            .try_clone()
-            .unwrap()
-            .send()
-            .await
-            .map_err(|e| e.to_string())
-        {
-            Ok(resp) => {
-                let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-                if let Some(pk) = body.get("identityPubkey").and_then(|v| v.as_str()) {
-                    if !pk.is_empty() {
-                        return Ok(pk.to_string());
-                    }
-                }
-                last = "sidecar /health has no identityPubkey yet".to_string();
-            }
-            Err(e) => last = e,
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    }
-    Err(last)
-}
-
 /// Detect the GraphQL operation from operationName or query text.
 /// The JS SDK sends raw documents like `mutation RequestLightningSend(...)`.
 fn detect_operation(req: &GraphqlRequest) -> String {
@@ -263,45 +278,27 @@ fn detect_operation(req: &GraphqlRequest) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        return binary_healthcheck().await;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let config = Config::from_env();
-    let (secret_hex, local_pubkey_hex) = if config.sidecar_url.is_empty() {
-        config
-            .resolve_signing_key()
-            .map_err(|e| format!("signing key: {e}"))?
-    } else {
-        (String::new(), String::new())
-    };
-    if config.sidecar_url.is_empty()
-        && !config.ssp_identity_pubkey.is_empty()
-        && local_pubkey_hex != config.ssp_identity_pubkey
+    if config.spark_admin_token.is_empty()
+        && std::env::var("SPARK_ADMIN_ALLOW_NO_AUTH").unwrap_or_default() != "1"
     {
-        return Err(format!(
-            "resolved key pubkey {local_pubkey_hex} != SSP_IDENTITY_PUBKEY {}",
-            config.ssp_identity_pubkey
-        )
-        .into());
+        return Err("SPARK_ADMIN_TOKEN is required unless SPARK_ADMIN_ALLOW_NO_AUTH=1".into());
     }
-    // Identity starts as the local key (or pinned env key). With a sidecar
-    // configured it is replaced by the sidecar identity once reachable; until
-    // then identity-dependent ops reject with a clear error and /health shows
-    // a null pubkey. The listener binds immediately (M16).
-    let initial_identity = if config.sidecar_url.is_empty() {
-        Some(if config.ssp_identity_pubkey.is_empty() {
-            local_pubkey_hex.clone()
-        } else {
-            config.ssp_identity_pubkey.clone()
-        })
-    } else {
-        None
-    };
+    let spark = SparkService::connect(&config)
+        .await
+        .map_err(|e| format!("spark: {e}"))?;
+    info!(identity = %spark.identity(), "embedded Spark wallet connected");
     let db = Arc::new(Db::open(&config.data_dir).map_err(|e| format!("db: {e}"))?);
     // Fake Lightning is never silent: refuse unless explicitly allowed.
     let allow_fake = std::env::var("SSP_ALLOW_FAKE_LN").unwrap_or_default() == "1";
     let backend = Arc::new(tokio::sync::RwLock::new(
-        Backend::select(&config, db.clone()).await,
+        Backend::select(&config, db.clone(), spark.clone()).await,
     ));
     if backend.read().await.live_node_id().is_none() && !allow_fake {
         return Err("ldk-server unreachable and SSP_ALLOW_FAKE_LN!=1; refusing fake mode".into());
@@ -317,13 +314,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let backend = backend.clone();
         let config = config.clone();
         let db = db.clone();
+        let retry_spark = spark.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 if backend.read().await.live_node_id().is_some() {
                     continue;
                 }
-                match LdkGrpcBackend::connect(&config, db.clone()).await {
+                match LdkGrpcBackend::connect(&config, db.clone(), retry_spark.clone()).await {
                     Ok(live) => {
                         let live = Arc::new(live);
                         tracing::info!("ldk-server reachable; switching to live mode");
@@ -354,50 +352,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
     let addr: SocketAddr = config.listen_addr.parse()?;
-    let identity = Arc::new(tokio::sync::RwLock::new(initial_identity));
-    // Sidecar identity resolution runs in the background; ops needing it fail
-    // closed until it resolves.
-    if !config.sidecar_url.is_empty() {
-        let identity = identity.clone();
-        let config = config.clone();
-        tokio::spawn(async move {
-            loop {
-                match fetch_sidecar_identity(&config.sidecar_url, &config.sidecar_token).await {
-                    Ok(pk) => {
-                        if !config.ssp_identity_pubkey.is_empty()
-                            && pk != config.ssp_identity_pubkey
-                        {
-                            tracing::error!(
-                                "sidecar identity {pk} does not match configured SSP_IDENTITY_PUBKEY"
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                            continue;
-                        }
-                        info!("SSP identity from sidecar: {pk}");
-                        *identity.write().await = Some(pk);
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!("sidecar identity unavailable ({e}); retrying in 10s");
-                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                    }
-                }
-            }
-        });
-    }
     let state = AppState {
         config: config.clone(),
         db,
         ldk: backend,
-        ssp_secret_hex: secret_hex,
-        identity: identity.clone(),
-        http: http_client(),
+        spark: spark.clone(),
         send_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     info!("SSP listening on {} (network={})", addr, config.network);
     let app = Router::new()
         .route("/health", get(health))
         .route("/", get(health))
+        .route("/admin/spark/deposit-address", post(spark_deposit_address))
+        .route("/admin/spark/claim-deposit", post(spark_claim_deposit))
         // Both schema endpoints the SDK uses:
         // default "graphql/spark/2025-03-19", LOCAL override "graphql/spark/rc".
         .route("/graphql/spark/2025-03-19", post(graphql_handler))
@@ -423,8 +390,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    spark.start_background_processing().await;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "failed to install Ctrl-C handler");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => tracing::error!(%error, "failed to install SIGTERM handler"),
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received");
+}
+
+async fn binary_healthcheck() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listen = std::env::var("SSP_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:5000".into());
+    let port = listen
+        .rsplit_once(':')
+        .ok_or("SSP_LISTEN_ADDR has no port")?
+        .1
+        .parse::<u16>()?;
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await??;
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await?;
+    let mut response = [0u8; 64];
+    let count = stream.read(&mut response).await?;
+    if response[..count].starts_with(b"HTTP/1.1 200") {
+        Ok(())
+    } else {
+        Err("SSP health endpoint did not return HTTP 200".into())
+    }
 }
 
 #[cfg(test)]

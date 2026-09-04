@@ -1,84 +1,58 @@
 # Deploy runbook
 
-## First boot order
+## First boot
 
-1. `docker compose -f docker-compose.regtest.yml up -d` (or your MutinyNet
-   equivalent providing bitcoind + SOs).
-2. SSP generates `<SSP_DATA_DIR>/ssp.key` on first boot; read the matching
-   `ssp_identity_pubkey` from `/health` and publish it as wallets'
-   `sspClientOptions.identityPublicKey`. Back up `ssp-data` (key + sqlite).
-3. Fund the sidecar liquidity wallet:
-   `docker compose -f docker-compose.regtest.yml run --rm sidecar-fund`
-   (binary ladder, dust-safe floor 1000 sats, multiplicity 3). Verify
-   `/swap-sidecar:5001/health` shows available = owned.
-4. LDK channels (`deploy/channels.sh`): `connect` to peers, `open` channels.
-   Receives need inbound capacity (or JIT), sends need outbound. ldk-server
-   uses the bitcoind backend; fund its on-chain wallet first
-   (`onchain-receive` via the CLI).
-5. Put Caddy in front (`deploy/docker-compose.edge.yml`) for TLS.
+1. Start bitcoind, the Spark operators, and `ldk-server`.
+2. Set `SO_HOSTS`, `SO_IDENTITY_PUBKEYS`, and `SO_CERT_FILES` for the same
+   ordered operator set. Set `SSP_FROST_THRESHOLD` to its signing threshold.
+3. Mount durable SSP storage at `/data` and set `SPARK_MNEMONIC_FILE` to
+   `/data/spark.mnemonic`. For an upgrade, copy the old `sidecar.mnemonic`
+   into that location before startup. This keeps the SSP identity and all
+   funded leaves. Set `SPARK_MNEMONIC_REQUIRED=1` after the file exists.
+4. Set `SPARK_ADMIN_TOKEN`, start the SSP, and read its identity from
+   `/health`. Put that key in client `sspClientOptions.identityPublicKey`.
+5. Fund exact Spark leaves through the authenticated endpoints:
+   `POST /admin/spark/deposit-address`, then
+   `POST /admin/spark/claim-deposit` with the confirmed transaction hex and
+   output index. The regtest helper `node e2e/fund-ssp.mjs` does both steps.
+6. Fund `ldk-server`, connect peers, and open channels. Lightning receives
+   need inbound capacity. Lightning sends need outbound capacity.
 
-## Liquidity ops (recurring)
+The operator image must include the small public Swap V3 counter RPC wrapper
+until buildonspark/spark issue 150 is complete. The wrapper calls the existing
+operator consensus code. It does not change the Spark protocol.
 
-- Sidecar fills consume ladder denoms; exact-match failures error pre-lock
-  (no stranded leaves) and `/swap-fill` answers 507 `NEEDS_TOPUP`.
-- Small denoms deplete first: a handful of fills can exhaust them while the
-  total looks healthy. Top up with a small-denom skew, e.g.
-  `FUND_LADDER=1000,2000,4000,8000,16000,32000,64000,128000
-  FUND_MULTIPLICITY=12 docker compose run --rm sidecar-fund`.
-- Lightning receives also spend sidecar leaves. Keep exact leaves for common
-  invoice amounts, or the wallet must use the swap path to make change. The
-  regtest Lightning harness provisions one exact leaf for each receive case.
-- The SSP rejects swaps FROM the sidecar identity fast for the same reason:
-  the sidecar must never recurse into its own swap flow.
-- Monitor `/swap-sidecar:5001/health` (`available` vs `owned`, `needsTopup`
-  flag); re-run `sidecar-fund` to top up. Rotate the liquidity wallet
-  (fresh mnemonic + fund) if leaves wedge.
-- The SSP binds immediately. `/health` reports `identity_source: pending`
-  until the sidecar publishes its identity. Identity-dependent operations
-  fail closed during this interval.
-- LDK: rebalance/close via `deploy/channels.sh` (`list-channels`,
-  `close-channel`). No autopilot by decision.
+## Liquidity operations
 
-## Secrets
+- Swap fills use exact denominations and never start a recursive SSP swap.
+  An exact-match failure returns `NEEDS_TOPUP` before the SSP spends leaves.
+- Lightning receives also spend SSP leaves. Keep exact leaves for common
+  invoice amounts.
+- Monitor `spark.available_sats`, `spark.owned_sats`, and
+  `spark.needs_topup` in `/health`.
+- Add small denominations more often than large denominations. For regtest:
+  `FUND_LADDER=1000,2000,4000,8000 FUND_MULTIPLICITY=12
+  node e2e/fund-ssp.mjs`.
+- Keep `MAX_SWAP_TOTAL_SATS` set to a safe value for the available liquidity.
 
-- `SSP_SECRET_KEY_HEX` (or `ssp-data/ssp.key`), `SIDECAR_TOKEN`,
-  `LDK_API_KEY`, sidecar mnemonic (`sidecar-data/sidecar.mnemonic`): never
-  commit, inject via env/files, back up the volumes.
-- Rotate `SIDECAR_TOKEN` by restarting both ssp and swap-sidecar.
+## Secrets and backups
 
-## Swap settlement gap (read before mainnet)
+- Do not commit `SPARK_ADMIN_TOKEN`, `LDK_API_KEY`, or the BIP39 mnemonic.
+- Back up the mnemonic and the SSP SQLite volume. The mnemonic controls the
+  SSP identity and Spark funds.
+- The admin token protects endpoints that can create and claim deposits. Do
+  not expose them without authentication.
 
-User swap outbounds (`PRIMARY_SWAP_V3`) are settled only by SO
-expiry-return: observed on regtest as `SENDER_KEY_TWEAK_PENDING` ->
-`RETURNED`. The receiver-side accept is SO-internal (the actual
-un-open-sourced glue); the sidecar cannot countersign it.
+## Health checks
 
-Consequences:
+The container uses `mutinynet-ssp healthcheck`. It does not need curl, wget,
+Node.js, or Python. `/health` reports the embedded wallet identity and balance,
+plus the live or fake Lightning mode.
 
-- Honest flows are exact: users get paid, no doubling in the happy path.
-- Inside the return window, a restored/resynced user wallet could resurrect
-  spent leaves and double-spend against sidecar funds.
-- The sidecar verifies and claims the named user outbound before it pays.
-  It stores fill receipts on its data volume for idempotent retries.
+## Residual risks
 
-Mitigations (all implemented):
-
-- `MAX_SWAP_TOTAL_SATS` cap per swap (default 1M sats) bounds exposure.
-- The sidecar checks sender identity and claimed value before payout, then
-  uses one atomic multi-receiver transfer for all target amounts.
-- Monitor sidecar drain rate (`/swap-sidecar:5001/health` available vs
-  owned) and SO `transfers` for unexpected `RETURNED` volume.
-- Keep ladder topped up (`sidecar-fund`); rotate the liquidity wallet
-  (fresh mnemonic + fund) if leaves wedge.
-- Full settlement needs the SO-internal accept RPC; tracked as the one
-  remaining protocol gap.
-
-## Other residual risks (not fixable in this repo)
-
-- ldk-server has no custom-signet flag. If MutinyNet's genesis differs from
-  public signet, ldk-server refuses it until patched upstream. The SSP refuses
-  to start without live LDK unless `SSP_ALLOW_FAKE_LN=1` is explicitly set for
-  development (see `/health ldk_mode`).
-- SO leaf lifetimes are block-driven: on fast chains, wallets need regular
-  syncs; the sidecar self-syncs per fill.
-- No webhook push: wallets poll Transfers/UserRequest (by decision).
+- `ldk-server` must support the deployed custom signet. The SSP refuses fake
+  Lightning unless `SSP_ALLOW_FAKE_LN=1` is explicit.
+- Leaf lifetimes are block based. Keep the SSP online so the embedded wallet
+  can sync and claim transfers.
+- Wallet webhooks are not implemented. Clients must poll transfer state.

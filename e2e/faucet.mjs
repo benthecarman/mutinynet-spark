@@ -32,6 +32,10 @@ export async function sendToAddress(address, sats) {
   return { id: txid };
 }
 
+export async function rawTransaction(txid) {
+  return rpc("getrawtransaction", [txid, true]);
+}
+
 export async function mine(n) {
   if (MINING !== "1") throw new Error("generatetoaddress needs MINING=1 (regtest only)");
   const addr = await rpc("getnewaddress", [], WALLET);

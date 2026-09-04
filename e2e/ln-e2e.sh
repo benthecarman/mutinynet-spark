@@ -4,11 +4,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 COMPOSE=(docker compose -f docker-compose.regtest.yml)
-export SIDECAR_TOKEN="${SIDECAR_TOKEN:-regtest-sidecar-token}"
+export SPARK_ADMIN_TOKEN="${SPARK_ADMIN_TOKEN:-regtest-spark-admin-token}"
 export SSP_BASE_URL="${SSP_BASE_URL:-http://127.0.0.1:5000}"
 export SPARK_DANGEROUSLY_DISABLE_TLS_VERIFICATION="${SPARK_DANGEROUSLY_DISABLE_TLS_VERIFICATION:-1}"
 export SPARK_REF="${SPARK_REF:-/tmp/opencode/spark-ref}"
-export SPARK_SDK_DIST="${SPARK_SDK_DIST:-$SPARK_REF/sdks/js/packages/spark-sdk/dist/index.node.js}"
+export SDK_REF="${SDK_REF:-$SPARK_REF}"
+export SPARK_SDK_DIST="${SPARK_SDK_DIST:-$SDK_REF/sdks/js/packages/spark-sdk/dist/index.node.js}"
 export LN_RECEIVE_AMOUNT_SATS="${LN_RECEIVE_AMOUNT_SATS:-5000}"
 CONCURRENCY=${LN_RECEIVE_CONCURRENCY:-2}
 RECEIVE_CASES=$((CONCURRENCY + 4))
@@ -37,7 +38,7 @@ failure_logs() {
   local status=$?
   if [ "$status" -ne 0 ]; then
     echo "=== Lightning e2e failure logs ===" >&2
-    "${COMPOSE[@]}" logs --tail=150 ssp swap-sidecar ldk-server ldk-server-2 >&2 || true
+    "${COMPOSE[@]}" logs --tail=150 ssp ldk-server ldk-server-2 >&2 || true
   fi
   exit "$status"
 }
@@ -130,10 +131,9 @@ fi
 wait_until "node2 outbound Lightning balance is ready" 60 node2_outbound_ready
 
 echo "=== provision exact Spark receive liquidity ==="
-"${COMPOSE[@]}" run --rm \
-  -e "FUND_LADDER=$LN_RECEIVE_AMOUNT_SATS" \
-  -e "FUND_MULTIPLICITY=$RECEIVE_CASES" \
-  sidecar-fund
+FUND_LADDER="$LN_RECEIVE_AMOUNT_SATS" \
+  FUND_MULTIPLICITY="$RECEIVE_CASES" \
+  node e2e/fund-ssp.mjs
 
 echo "=== public SDK receive ==="
 node e2e/ln-receive.mjs

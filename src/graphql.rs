@@ -298,16 +298,12 @@ pub async fn dispatch(
             if total == 0 {
                 return Err("swap total must be positive".to_string());
             }
-            // The sidecar serves fills from exact leaves only. If IT needs a
-            // swap, its ladder is depleted: fail fast so no leaves lock
-            // SO-side in a recursive swap. Top up the ladder instead.
-            // Identity pending counts as unknown: allow (guard re-arms
-            // once the sidecar identity resolves).
+            // The embedded wallet serves fills from exact leaves only. If it
+            // needs a swap, its ladder is depleted. Fail before a recursive
+            // swap can lock SSP leaves on the operators.
             if let Ok(resolved) = crate::ssp_identity(&state).await {
                 if !resolved.is_empty() && owner == resolved {
-                    return Err(
-                        "NEEDS_TOPUP: sidecar ladder depleted, top up liquidity".to_string()
-                    );
+                    return Err("NEEDS_TOPUP: SSP ladder depleted, top up liquidity".to_string());
                 }
             }
             if state.config.max_swap_total_sats > 0 && total > state.config.max_swap_total_sats {
@@ -346,18 +342,33 @@ pub async fn dispatch(
             if target > payout_total {
                 return Err("target amounts plus fee exceed swap total".to_string());
             }
-            // Funded sidecar completes the swap with a real SO transfer.
-            // Without it swapLeaves stays empty and the SDK rejects the swap.
-            let (inbound_id, swap_leaves) = fill_swap_via_sidecar(
-                &state,
-                &owner,
-                &ext_id,
-                &adaptor_pubkey,
-                &targets,
-                total,
-                payout_total,
-            )
-            .await?;
+            let fill = state
+                .spark
+                .fill_swap(
+                    &owner,
+                    &ext_id,
+                    &adaptor_pubkey,
+                    &targets,
+                    total,
+                    payout_total,
+                )
+                .await?;
+            let inbound_id = fill.transfer_id;
+            let swap_leaves = fill
+                .leaf_ids
+                .into_iter()
+                .map(|leaf_id| {
+                    json!({
+                        "leaf_id": leaf_id,
+                        "raw_unsigned_refund_transaction": "",
+                        "adaptor_signed_signature": "",
+                        "direct_raw_unsigned_refund_transaction": "",
+                        "direct_adaptor_signed_signature": "",
+                        "direct_from_cpfp_raw_unsigned_refund_transaction": "",
+                        "direct_from_cpfp_adaptor_signed_signature": "",
+                    })
+                })
+                .collect::<Vec<_>>();
             let rec = store_request(
                 &state,
                 "LEAVES_SWAP",
@@ -968,77 +979,8 @@ async fn store_request(
     }))
 }
 
-/// Ask the funded sidecar wallet to send SUM(targets) to the session owner.
-/// Returns (real SO inbound transfer id, swap leaves). The SDK only
-/// null-checks swapLeaves; the user claims the inbound transfer from the SO.
-async fn fill_swap_via_sidecar(
-    state: &AppState,
-    owner_identity_pubkey: &str,
-    outbound_transfer_id: &str,
-    adaptor_pubkey: &str,
-    targets: &[u64],
-    received_total_sats: u64,
-    payout_total_sats: u64,
-) -> Result<(String, Vec<Value>), String> {
-    if state.config.sidecar_url.is_empty() {
-        return Err("SIDECAR_URL unset".to_string());
-    }
-    if targets.is_empty() {
-        return Err("no targets".to_string());
-    }
-    let client = state.http.clone();
-    let mut req = client
-        .post(format!("{}/swap-fill", state.config.sidecar_url))
-        .json(&serde_json::json!({
-            "ownerIdentityPubkey": owner_identity_pubkey,
-            "outboundTransferId": outbound_transfer_id,
-            "adaptorPublicKey": adaptor_pubkey,
-            "targetAmountsSats": targets,
-            "receivedTotalAmountSats": received_total_sats,
-            "payoutTotalAmountSats": payout_total_sats,
-            "idempotencyKey": outbound_transfer_id,
-        }));
-    if !state.config.sidecar_token.is_empty() {
-        req = req.bearer_auth(&state.config.sidecar_token);
-    }
-    let fill: Value = req
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-    if let Some(err) = fill.get("error").and_then(|e| e.as_str()) {
-        return Err(err.to_string());
-    }
-    let inbound = fill
-        .get("inboundTransferSparkId")
-        .and_then(|v| v.as_str())
-        .ok_or("sidecar: missing inboundTransferSparkId")?
-        .to_string();
-    let leaves = fill
-        .get("swapLeaves")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|l| {
-            json!({
-                "leaf_id": l.get("leaf_id").cloned().unwrap_or(Value::Null),
-                "raw_unsigned_refund_transaction": "",
-                "adaptor_signed_signature": "",
-                "direct_raw_unsigned_refund_transaction": "",
-                "direct_adaptor_signed_signature": "",
-                "direct_from_cpfp_raw_unsigned_refund_transaction": "",
-                "direct_from_cpfp_adaptor_signed_signature": "",
-            })
-        })
-        .collect();
-    Ok((inbound, leaves))
-}
-
 /// Split the SSP-held preimage for `payment_hash` into FROST shares, ECIES
-/// each to its operator, and store via the sidecar's coordinator session
+/// each to its operator, and store via the embedded wallet's coordinator session
 /// (same `store_preimage_share_v2` call a wallet makes; owner = SSP).
 async fn store_preimage_shares(
     state: &AppState,
@@ -1071,7 +1013,7 @@ async fn store_preimage_shares(
     let preimage = hex::decode(preimage_hex).map_err(|e| e.to_string())?;
     let shares =
         frost::split_secret_with_proofs(&preimage, state.config.frost_threshold, operators.len())?;
-    let mut wire = serde_json::Map::with_capacity(operators.len());
+    let mut wire = std::collections::HashMap::with_capacity(operators.len());
     for (op, share) in operators.iter().zip(shares.iter()) {
         let expected_identifier = format!("{:064x}", share.index);
         if share.index != op.id + 1 || op.identifier.to_lowercase() != expected_identifier {
@@ -1084,36 +1026,17 @@ async fn store_preimage_shares(
         frost::validate_share(&share.share, share.index, &share.proofs)?;
         let proto = frost::encode_secret_share_proto(&share.share, &share.proofs);
         let enc = frost::encrypt_share_to_operator(&proto, &op.identity_public_key)?;
-        wire.insert(op.identifier.clone(), Value::String(hex::encode(enc)));
+        wire.insert(op.identifier.clone(), enc);
     }
-    if state.config.sidecar_url.is_empty() {
-        return Err("SIDECAR_URL unset; cannot reach store_preimage_share_v2".to_string());
-    }
-    let mut req = state
-        .http
-        .clone()
-        .post(format!("{}/store-shares", state.config.sidecar_url))
-        .json(&serde_json::json!({
-            "paymentHashHex": payment_hash_hex,
-            "shares": wire,
-            "threshold": state.config.frost_threshold,
-            "invoiceString": invoice,
-            "ownerIdentityPubkeyHex": crate::ssp_identity(state).await?,
-        }));
-    if !state.config.sidecar_token.is_empty() {
-        req = req.bearer_auth(&state.config.sidecar_token);
-    }
-    let resp: Value = req
-        .send()
+    state
+        .spark
+        .store_preimage_shares(
+            hex::decode(payment_hash_hex).map_err(|e| e.to_string())?,
+            wire,
+            state.config.frost_threshold as u32,
+            invoice.to_string(),
+        )
         .await
-        .map_err(|e| format!("sidecar store-shares: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("sidecar store-shares decode: {e}"))?;
-    if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
-        return Err(format!("sidecar store-shares: {err}"));
-    }
-    Ok(())
 }
 
 fn str_of(v: &Value, k: &str) -> String {
@@ -1182,53 +1105,9 @@ fn ext_id_or_new(ext: &str) -> String {
     }
 }
 
-/// SSP signature: ECDSA (DER, hex) over sha256(message) with the SSP identity
-/// key. When a swap sidecar is configured, the sidecar wallet OWNS the SSP
-/// identity and signs via its public wallet API (one consistent identity for
-/// receiving swap outbounds and signing quotes). Otherwise the resolved local
-/// key signs.
+/// SSP signature with the identity key of the embedded Spark wallet.
 async fn sign_with_ssp(state: &AppState, message: &str) -> Result<String, String> {
-    if !state.config.sidecar_url.is_empty() {
-        return sign_via_sidecar(state, message).await;
-    }
-    use secp256k1::{Message, Secp256k1, SecretKey};
-    let digest = Sha256::digest(message.as_bytes());
-    let secret = SecretKey::from_slice(
-        &hex::decode(state.ssp_secret_hex.trim()).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    let secp = Secp256k1::new();
-    let sig = secp.sign_ecdsa(&Message::from_digest(*digest.as_ref()), &secret);
-    Ok(hex::encode(sig.serialize_der()))
-}
-
-async fn sign_via_sidecar(state: &AppState, message: &str) -> Result<String, String> {
-    let mut req = state
-        .http
-        .clone()
-        .post(format!("{}/sign", state.config.sidecar_url))
-        .json(&serde_json::json!({ "message": message }));
-    if !state.config.sidecar_token.is_empty() {
-        req = req.bearer_auth(&state.config.sidecar_token);
-    }
-    let resp: Value = req
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
-    resp.get("signature")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            format!(
-                "sidecar sign failed: {}",
-                resp.get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-            )
-        })
+    state.spark.sign_message(message).await
 }
 
 #[cfg(test)]

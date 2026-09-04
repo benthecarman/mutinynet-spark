@@ -8,13 +8,10 @@ pub struct Config {
     /// Comma-separated browser origins. Empty disables cross-origin access.
     pub cors_origins: String,
     pub network: String,
-    /// Compressed secp256k1 hex, 33 bytes. This is the `identityPublicKey`
-    /// wallets put in `sspClientOptions`. SO sends Spark transfers to this key.
+    /// Optional deployment guard. If set, the embedded wallet must derive this
+    /// compressed identity public key from its mnemonic.
     pub ssp_identity_pubkey: String,
-    /// Hex secret for signing static-deposit quotes + receive manifests.
-    /// Unset = generate on first boot into <SSP_DATA_DIR>/ssp.key.
-    pub ssp_secret_key_hex: String,
-    /// Directory for sqlite + key file (volume-mount in compose).
+    /// Directory for sqlite state (volume-mount in compose).
     pub data_dir: String,
     /// Live LDK backend (host:port WITHOUT scheme, e.g. "ldk-server:3536").
     /// Empty = fake mode.
@@ -23,14 +20,21 @@ pub struct Config {
     pub ldk_api_key_file: String,
     pub ldk_tls_cert_file: String,
     pub fee_flat_sats_swap: u64,
-    /// Swap-fill sidecar (funded Spark wallet). Unset = swaps return empty
-    /// swapLeaves, which the SDK rejects by design.
-    pub sidecar_url: String,
-    pub sidecar_token: String,
-    /// Sidecar wallet identity. Swaps FROM this identity are rejected fast:
-    /// the sidecar must serve fills from exact leaves only, never recurse
-    /// into its own swap flow (that strands leaves SO-side).
-    pub sidecar_identity_pubkey: String,
+    /// Public URL used by the embedded wallet for SSP GraphQL calls.
+    pub ssp_public_url: String,
+    /// BIP39 mnemonic storage for the embedded Spark wallet.
+    pub spark_mnemonic_file: String,
+    /// Refuse to create a new mnemonic when the configured file is absent.
+    /// Production enables this to prevent an accidental identity change.
+    pub spark_mnemonic_required: bool,
+    /// Custom operator endpoints and identities, in the same order.
+    pub so_hosts: String,
+    pub so_identity_pubkeys: String,
+    /// Optional comma-separated CA certificate files for custom operators.
+    pub so_cert_files: String,
+    /// Token for the integrated funding endpoints. A missing token fails
+    /// closed unless SPARK_ADMIN_ALLOW_NO_AUTH=1 is explicit.
+    pub spark_admin_token: String,
     /// SO set for FROST share encryption: JSON array of
     /// {id, identifier, identityPublicKey}. Empty = skip share storage.
     pub frost_operators_json: String,
@@ -50,61 +54,35 @@ impl Config {
             cors_origins: get("SSP_CORS_ORIGINS", ""),
             network: get("SSP_NETWORK", "REGTEST"),
             // Empty = use the resolved signing key's pubkey (first boot
-            // generates into <SSP_DATA_DIR>/ssp.key; publish via /health).
+            // generates its mnemonic and publishes the key via /health).
             ssp_identity_pubkey: get("SSP_IDENTITY_PUBKEY", ""),
-            ssp_secret_key_hex: get("SSP_SECRET_KEY_HEX", ""),
             data_dir: get("SSP_DATA_DIR", "./data"),
             ldk_grpc_addr: get("LDK_GRPC_ADDR", ""),
             ldk_api_key: get("LDK_API_KEY", ""),
             ldk_api_key_file: get("LDK_API_KEY_FILE", ""),
             ldk_tls_cert_file: get("LDK_TLS_CERT_FILE", ""),
             fee_flat_sats_swap: get("SSP_SWAP_FEE_SATS", "0").parse().unwrap_or(0),
-            sidecar_url: get("SIDECAR_URL", "").trim_end_matches('/').to_string(),
-            sidecar_token: get("SIDECAR_TOKEN", ""),
-            sidecar_identity_pubkey: get("SIDECAR_IDENTITY_PUBKEY", ""),
+            ssp_public_url: get("SSP_PUBLIC_URL", "http://127.0.0.1:5000")
+                .trim_end_matches('/')
+                .to_string(),
+            spark_mnemonic_file: get("SPARK_MNEMONIC_FILE", "./data/spark.mnemonic"),
+            spark_mnemonic_required: matches!(
+                get("SPARK_MNEMONIC_REQUIRED", "0")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "1" | "true" | "yes"
+            ),
+            so_hosts: get("SO_HOSTS", ""),
+            so_identity_pubkeys: get("SO_IDENTITY_PUBKEYS", ""),
+            so_cert_files: get("SO_CERT_FILES", ""),
+            spark_admin_token: std::env::var("SPARK_ADMIN_TOKEN")
+                .or_else(|_| std::env::var("SIDECAR_TOKEN"))
+                .unwrap_or_default(),
             frost_operators_json: get("SSP_FROST_OPERATORS", ""),
             frost_threshold: get("SSP_FROST_THRESHOLD", "2").parse().unwrap_or(2),
             max_swap_total_sats: get("MAX_SWAP_TOTAL_SATS", "1000000")
                 .parse()
                 .unwrap_or(1000000),
         }
-    }
-
-    /// Resolve the signing key: env, else key file, else generate + persist.
-    /// Returns (secret_hex, pubkey_hex).
-    pub fn resolve_signing_key(&self) -> Result<(String, String), String> {
-        use secp256k1::{Secp256k1, SecretKey};
-        if !self.ssp_secret_key_hex.is_empty() {
-            let secret = SecretKey::from_slice(
-                &hex::decode(self.ssp_secret_key_hex.trim()).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-            let pubkey =
-                secp256k1::PublicKey::from_secret_key(&Secp256k1::new(), &secret).to_string();
-            if !self.ssp_identity_pubkey.is_empty() && pubkey != self.ssp_identity_pubkey {
-                return Err(format!(
-                    "SSP_SECRET_KEY_HEX does not match SSP_IDENTITY_PUBKEY (derived {pubkey})"
-                ));
-            }
-            return Ok((self.ssp_secret_key_hex.clone(), pubkey));
-        }
-        let key_path = std::path::Path::new(&self.data_dir).join("ssp.key");
-        if key_path.exists() {
-            let secret_hex = std::fs::read_to_string(&key_path).map_err(|e| e.to_string())?;
-            let secret =
-                SecretKey::from_slice(&hex::decode(secret_hex.trim()).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-            let pubkey =
-                secp256k1::PublicKey::from_secret_key(&Secp256k1::new(), &secret).to_string();
-            return Ok((secret_hex.trim().to_string(), pubkey));
-        }
-        // First boot: generate. Caller must publish the pubkey as identityPublicKey.
-        let secret_bytes: [u8; 32] = rand::random();
-        let secret = SecretKey::from_slice(&secret_bytes).map_err(|e| e.to_string())?;
-        let secret_hex = hex::encode(secret_bytes);
-        let pubkey = secp256k1::PublicKey::from_secret_key(&Secp256k1::new(), &secret).to_string();
-        std::fs::create_dir_all(&self.data_dir).map_err(|e| e.to_string())?;
-        std::fs::write(&key_path, &secret_hex).map_err(|e| e.to_string())?;
-        Ok((secret_hex, pubkey))
     }
 }

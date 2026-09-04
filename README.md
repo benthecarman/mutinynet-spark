@@ -1,18 +1,22 @@
 # mutinynet-ssp
 
-Self-hosted Spark Service Provider (SSP) in Rust, wired to `ldk-server`.
+Self-hosted Spark Service Provider (SSP) in one Rust binary, wired to
+`ldk-server` and the Breez Spark SDK.
 
 - Serves the SSP GraphQL surface the `@buildonspark/spark-sdk` `SspClient` expects
   (`graphql/spark/rc` + `graphql/spark/2025-03-19`).
 - Live Lightning is selected at run time when `LDK_GRPC_ADDR`, an API key,
   and the TLS certificate are configured. Fake Lightning requires the explicit
   development-only setting `SSP_ALLOW_FAKE_LN=1`.
+- The funded Spark liquidity wallet, Swap V3 settlement, FROST share storage,
+  and quote signing run inside the SSP process. There is no runtime JavaScript
+  sidecar.
 - Works with any network via env (`REGTEST` today, MutinyNet signet at deploy).
 
 ## Run (regtest e2e)
 
 ```sh
-./e2e/e2e.sh   # compose up, fund sidecar, SDK e2e (deposit, swap, transfer, quote)
+./e2e/e2e.sh   # compose up, fund the SSP, then test Spark and Lightning
 curl http://127.0.0.1:5000/health
 ```
 

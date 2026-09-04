@@ -33,16 +33,6 @@ x-operator-common: &operator-common
     - ./e2e/upstream/operator_2.key:/opt/spark/keys/operator_2.key:ro
     - tls-certs:/opt/spark/tls:ro
 
-x-sidecar-common: &sidecar-common
-  image: ${SIDECAR_IMAGE:-ghcr.io/benthecarman/mutinynet-ssp-sidecar:latest}
-  build:
-    context: .
-    dockerfile: swap-sidecar.Dockerfile
-  volumes:
-    - sidecar-data:/app/data
-    - ./e2e:/app/e2e:ro
-    - tls-certs:/tls:ro
-
 services:
   cert-init:
     image: alpine:3.20
@@ -55,17 +45,26 @@ services:
         for i in 0 1 2; do
           KEY="/tls/server_$${i}.key"
           CERT="/tls/server_$${i}.crt"
-          if [ -f "$$KEY" ] && [ -f "$$CERT" ]; then
+          if [ -f "$$KEY" ] && [ -f "$$CERT" ] \
+            && openssl x509 -in "$$CERT" -noout -ext basicConstraints 2>/dev/null \
+              | grep -q "CA:FALSE"; then
             echo "TLS key/cert for operator $$i already exist, skipping"
             continue
           fi
-          echo "Generating TLS key/cert for operator $$i..."
-          openssl genrsa -out "$$KEY" 2048 2>/dev/null
+          echo "Generating TLS server key/cert for operator $$i..."
+          TMP_KEY="$${KEY}.tmp"
+          TMP_CERT="$${CERT}.tmp"
+          openssl genrsa -out "$$TMP_KEY" 2048 2>/dev/null
           openssl req -new -x509 \
-            -key "$$KEY" -out "$$CERT" \
+            -key "$$TMP_KEY" -out "$$TMP_CERT" \
             -days 3650 \
             -subj "/CN=spark-operator-$${i}" \
-            -addext "subjectAltName = DNS:spark-operator-$${i},DNS:localhost,DNS:spark-operator-$${i}.minikube.local"
+            -addext "subjectAltName = DNS:spark-operator-$${i},DNS:localhost,DNS:spark-operator-$${i}.minikube.local" \
+            -addext "basicConstraints = critical,CA:FALSE" \
+            -addext "keyUsage = critical,digitalSignature,keyEncipherment" \
+            -addext "extendedKeyUsage = serverAuth"
+          mv "$$TMP_KEY" "$$KEY"
+          mv "$$TMP_CERT" "$$CERT"
         done
         echo "TLS certificates ready"
     volumes:
@@ -240,57 +239,6 @@ services:
       timeout: 5s
       retries: 12
 
-  # ---- Swap-fill sidecar: funded Spark wallet completing leaf swaps ----
-  # Mnemonic persists in sidecar-data; fund once via the sidecar-fund service.
-  swap-sidecar:
-    <<: *sidecar-common
-    depends_on:
-      - spark-operator-0
-      - spark-operator-1
-      - spark-operator-2
-      - ssp
-    ports:
-      - "127.0.0.1:5001:5001"
-    healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:5001/health').then(r=>{if(!r.ok)process.exit(1)})\""]
-      interval: 15s
-      timeout: 10s
-      retries: 20
-    environment:
-      PORT: 5001
-      SPARK_LOCAL_INGRESS_HOST: sidecar
-      SPARK_SDK_DIST: /sdk/index.node.js
-      SPARK_NETWORK: ${SPARK_NETWORK:-LOCAL}
-      SO_HOSTS: ${SO_HOSTS:-spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535}
-      SSP_URL: http://ssp:5000
-      SIDECAR_MNEMONIC_FILE: /app/data/sidecar.mnemonic
-      SIDECAR_FILL_RECEIPTS_FILE: /app/data/swap-fills.json
-      SIDECAR_TOKEN: ${SIDECAR_TOKEN:?set SIDECAR_TOKEN}
-    restart: unless-stopped
-
-  # One-shot: fund the sidecar liquidity wallet from the regtest bitcoind.
-  # Usage: docker compose -f docker-compose.regtest.yml run --rm sidecar-fund
-  sidecar-fund:
-    <<: *sidecar-common
-    profiles: ["tools"]
-    depends_on:
-      bitcoind:
-        condition: service_healthy
-    entrypoint: ["/entrypoint.sh", "node", "fund.mjs"]
-    environment:
-      MINING: 1
-      SPARK_LOCAL_INGRESS_HOST: sidecar
-      SPARK_SDK_DIST: /sdk/index.node.js
-      SPARK_NETWORK: ${SPARK_NETWORK:-LOCAL}
-      SO_HOSTS: ${SO_HOSTS:-spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535}
-      SSP_URL: http://ssp:5000
-      SIDECAR_MNEMONIC_FILE: /app/data/sidecar.mnemonic
-      # This process runs inside Compose. Do not pass the host RPC URL here.
-      BITCOIN_RPC_URL: http://bitcoind:8332
-      BITCOIN_RPC_USER: ${BITCOIN_RPC_USER:-testutil}
-      BITCOIN_RPC_PASSWORD: ${BITCOIN_RPC_PASSWORD:-testutilpassword}
-      FUND_AMOUNT_SATS: 20000000
-
   ssp:
     # Prebuilt: docker compose pull (needs GHCR access); or --build locally.
     image: ${SSP_IMAGE:-ghcr.io/benthecarman/mutinynet-ssp:latest}
@@ -305,28 +253,31 @@ services:
     ports:
       - "127.0.0.1:5000:5000"
     healthcheck:
-      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:5000/health | grep -q '\"status\":\"ok\"'"]
+      test: ["CMD", "mutinynet-ssp", "healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 12
     volumes:
       - ssp-data:/data
       - ldk-data:/ldk-data:ro
+      - tls-certs:/tls:ro
     environment:
       SSP_LISTEN_ADDR: 0.0.0.0:5000
       SSP_CORS_ORIGINS: ${SSP_CORS_ORIGINS:-}
       SSP_NETWORK: ${SSP_NETWORK:-REGTEST}
-      # No committed secrets: first boot generates <SSP_DATA_DIR>/ssp.key.
-      # Publish SSP_IDENTITY_PUBKEY from /health into wallet configs.
       SSP_DATA_DIR: /data
+      SSP_PUBLIC_URL: http://ssp:5000
+      SPARK_MNEMONIC_FILE: /data/spark.mnemonic
+      SO_HOSTS: ${SO_HOSTS:-spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535}
+      SO_IDENTITY_PUBKEYS: ${SO_IDENTITY_PUBKEYS:-0322ca18fc489ae25418a0e768273c2c61cabb823edfb14feb891e9bec62016510,0341727a6c41b168f07eb50865ab8c397a53c7eef628ac1020956b705e43b6cb27,0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6}
+      SO_CERT_FILES: /tls/server_0.crt,/tls/server_1.crt,/tls/server_2.crt
+      SPARK_ADMIN_TOKEN: ${SPARK_ADMIN_TOKEN:?set SPARK_ADMIN_TOKEN}
       # Live LDK backend (decision 5): bitcoind-backed ldk-server above.
       LDK_GRPC_ADDR: ${LDK_GRPC_ADDR:-ldk-server:3536}
       LDK_API_KEY: ${LDK_API_KEY:-}
       LDK_API_KEY_FILE: ${LDK_API_KEY_FILE:-/ldk-data/regtest/api_key}
       LDK_TLS_CERT_FILE: ${LDK_TLS_CERT_FILE:-/ldk-data/tls.crt}
       SSP_SWAP_FEE_SATS: 0
-      SIDECAR_URL: http://swap-sidecar:5001
-      SIDECAR_TOKEN: ${SIDECAR_TOKEN:?set SIDECAR_TOKEN}
       SSP_FROST_THRESHOLD: 2
       SSP_FROST_OPERATORS: '[{"id":0,"identifier":"0000000000000000000000000000000000000000000000000000000000000001","identityPublicKey":"0322ca18fc489ae25418a0e768273c2c61cabb823edfb14feb891e9bec62016510"},{"id":1,"identifier":"0000000000000000000000000000000000000000000000000000000000000002","identityPublicKey":"0341727a6c41b168f07eb50865ab8c397a53c7eef628ac1020956b705e43b6cb27"},{"id":2,"identifier":"0000000000000000000000000000000000000000000000000000000000000003","identityPublicKey":"0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6"}]'
       RUST_LOG: info
@@ -338,4 +289,3 @@ volumes:
   ldk-data:
   ldk-data-2:
   ssp-data:
-  sidecar-data:

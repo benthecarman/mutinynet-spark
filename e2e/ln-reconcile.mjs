@@ -32,7 +32,13 @@ try {
     expirySeconds: 300,
   });
 
+  const stopStartedAt = Date.now();
   execFileSync("docker", ["stop", "--time", "10", SSP], { timeout: 20_000 });
+  const stopElapsedMs = Date.now() - stopStartedAt;
+  if (stopElapsedMs > 5_000) {
+    throw new Error(`SSP graceful stop took ${stopElapsedMs}ms`);
+  }
+  console.log(`[ln-reconcile] SSP stopped gracefully in ${stopElapsedMs}ms`);
   sspStopped = true;
   const send = ldkJson(LDK2, "bolt11-send", request.invoice.encodedInvoice);
   if (!send.payment_id) throw new Error("counterparty did not start the held payment");

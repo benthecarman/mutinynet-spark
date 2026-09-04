@@ -14,7 +14,7 @@ use ldk_server_client::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{config::Config, db::Db};
+use crate::{config::Config, db::Db, spark::SparkService};
 
 /// What the SSP needs from Lightning. BOLT11 only (no BOLT12 hold support in
 /// ldk-server, and receives stay BOLT11 by decision).
@@ -95,8 +95,8 @@ pub enum Backend {
 impl Backend {
     /// Select live when LDK_GRPC_ADDR + credentials resolve and the node
     /// answers `get_node_info`; otherwise fake (with a loud log).
-    pub async fn select(config: &Config, db: Arc<Db>) -> Self {
-        match LdkGrpcBackend::connect(config, db.clone()).await {
+    pub async fn select(config: &Config, db: Arc<Db>, spark: Arc<SparkService>) -> Self {
+        match LdkGrpcBackend::connect(config, db.clone(), spark).await {
             Ok(live) => {
                 tracing::info!(
                     "LDK live mode: node {}",
@@ -309,12 +309,15 @@ pub struct LdkGrpcBackend {
     pub client: LdkServerClient,
     pub node_id: Option<String>,
     db: Arc<Db>,
-    config: Config,
-    http: reqwest::Client,
+    spark: Arc<SparkService>,
 }
 
 impl LdkGrpcBackend {
-    pub async fn connect(config: &Config, db: Arc<Db>) -> Result<Self, String> {
+    pub async fn connect(
+        config: &Config,
+        db: Arc<Db>,
+        spark: Arc<SparkService>,
+    ) -> Result<Self, String> {
         if config.ldk_grpc_addr.is_empty() {
             return Err("LDK_GRPC_ADDR unset".to_string());
         }
@@ -345,55 +348,13 @@ impl LdkGrpcBackend {
             client,
             node_id: Some(info.node_id.clone()),
             db,
-            config: config.clone(),
-            http: crate::http_client(),
+            spark,
         })
-    }
-
-    async fn sidecar_value(
-        &self,
-        path: &str,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        if self.config.sidecar_url.is_empty() {
-            return Err("SIDECAR_URL is required for Lightning settlement".to_string());
-        }
-        let mut request = self
-            .http
-            .post(format!("{}{path}", self.config.sidecar_url))
-            .json(&body);
-        if !self.config.sidecar_token.is_empty() {
-            request = request.bearer_auth(&self.config.sidecar_token);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| format!("sidecar {path}: {error}"))?;
-        let status = response.status();
-        let value: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|error| format!("sidecar {path} response: {error}"))?;
-        if !status.is_success() {
-            return Err(value
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("sidecar request failed")
-                .to_string());
-        }
-        if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-            return Err(format!("sidecar {path} did not confirm the operation"));
-        }
-        Ok(value)
-    }
-
-    async fn sidecar_json(&self, path: &str, body: serde_json::Value) -> Result<(), String> {
-        self.sidecar_value(path, body).await.map(|_| ())
     }
 
     async fn settle_succeeded_payment(&self, payment: &Payment) -> Result<(), String> {
         let payment_id = payment.id.clone();
-        let Some((owner, outbound_transfer_id)) =
+        let Some((_owner, outbound_transfer_id)) =
             self.db.lightning_send_for_payment(&payment_id).await?
         else {
             return Err(format!(
@@ -411,16 +372,9 @@ impl LdkGrpcBackend {
             .preimage
             .as_deref()
             .ok_or_else(|| format!("payment {payment_id} succeeded without a preimage"))?;
-        self.sidecar_json(
-            "/settle-lightning-send",
-            serde_json::json!({
-                "ownerIdentityPubkey": owner,
-                "outboundTransferId": outbound_transfer_id,
-                "paymentHash": bolt11.hash,
-                "preimage": preimage,
-            }),
-        )
-        .await?;
+        self.spark
+            .settle_lightning_send(&outbound_transfer_id, &bolt11.hash, preimage)
+            .await?;
         self.db.set_payment(&payment_id, "SUCCEEDED").await
     }
 
@@ -441,23 +395,13 @@ impl LdkGrpcBackend {
         if self.preimage_for(payment_hash).await.is_none() {
             return Ok(false);
         }
-        let response = self
-            .sidecar_value(
-                "/settle-lightning-receive",
-                serde_json::json!({
-                    "ownerIdentityPubkey": owner,
-                    "paymentHash": payment_hash,
-                    "amountSats": amount_sats,
-                }),
-            )
+        let transfer_id = self
+            .spark
+            .settle_lightning_receive(&owner, payment_hash, amount_sats)
             .await?;
-        let transfer_id = response
-            .get("transferId")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "sidecar did not return a Lightning receive transfer id".to_string())?;
         self.db
             .insert_transfer(
-                transfer_id,
+                &transfer_id,
                 &request_id,
                 "LIGHTNING_RECEIVE",
                 "TRANSFER_COMPLETED",
@@ -651,16 +595,14 @@ impl LdkBackend for LdkGrpcBackend {
         if total_sats == 0 {
             return Err("Lightning send amount must be positive".to_string());
         }
-        self.sidecar_json(
-            "/verify-lightning-send",
-            serde_json::json!({
-                "ownerIdentityPubkey": owner,
-                "outboundTransferId": outbound_transfer_id,
-                "paymentHash": decoded.payment_hash.to_lowercase(),
-                "totalAmountSats": total_sats,
-            }),
-        )
-        .await
+        self.spark
+            .verify_lightning_send(
+                owner,
+                outbound_transfer_id,
+                &decoded.payment_hash.to_lowercase(),
+                total_sats,
+            )
+            .await
     }
 
     // Send only inits; finality via SubscribeEvents.

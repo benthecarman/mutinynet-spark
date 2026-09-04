@@ -12,8 +12,7 @@ import { sendToAddress, mineAndWait } from "./faucet.mjs";
 const health = await (await fetch("http://127.0.0.1:5000/health")).json();
 if (health.status !== "ok") throw new Error("SSP unhealthy");
 console.log(`[e2e 0] SSP health: network=${health.network} ldk_mode=${health.ldk_mode} identity=${health.ssp_identity_pubkey}`);
-const sidecarHealth = await (await fetch("http://127.0.0.1:5001/health")).json();
-const sidecarBalanceBefore = BigInt(sidecarHealth.breakdown?.available ?? sidecarHealth.balance);
+const sparkBalanceBefore = BigInt(health.spark.available_sats);
 const SSP = {
   baseUrl: process.env.SSP_BASE_URL ?? "http://127.0.0.1:5000",
   identityPublicKey: process.env.SSP_IDENTITY_PUBKEY ?? health.ssp_identity_pubkey,
@@ -31,14 +30,6 @@ const step = (n, msg) => console.log(`[e2e ${n}] ${msg}`);
 
 const a = await SparkWallet.initialize({ options: opts() });
 step(1, `wallet A ready: ${await a.wallet.getSparkAddress()}`);
-
-// Sidecar address derivation must match the SDK exactly.
-const { sparkAddressFromIdentityPubkey } = await import("../swap-sidecar/address.mjs");
-const derived = sparkAddressFromIdentityPubkey(await a.wallet.getIdentityPublicKey(), "LOCAL");
-if (derived !== (await a.wallet.getSparkAddress())) {
-  throw new Error(`address derivation drift: ${derived}`);
-}
-step(1.1, "sidecar address derivation matches SDK");
 
 const depositAddr = await a.wallet.getSingleUseDepositAddress();
 step(2, `deposit address: ${depositAddr}`);
@@ -58,7 +49,7 @@ const addrB = await b.wallet.getSparkAddress();
 step(6, `wallet B ready: ${addrB}`);
 
 // A partial spend of a single 100,000-sat leaf must use RequestSwap and the
-// funded sidecar. A full-leaf transfer would bypass the path under test.
+// funded SSP wallet. A full-leaf transfer would bypass the path under test.
 await a.wallet.transfer({ amountSats: 50_000, receiverSparkAddress: addrB });
 step(7, "transferred 50000 A -> B through a leaf swap");
 
@@ -79,13 +70,13 @@ await pollBalance(b.wallet, 50_000n, 8.1);
 await pollBalance(a.wallet, 50_000n, 8.2);
 
 for (let i = 0; i < 30; i++) {
-  const current = await (await fetch("http://127.0.0.1:5001/health")).json();
-  const available = BigInt(current.breakdown?.available ?? current.balance);
-  step(8.3, `sidecar balance poll ${i}: ${available} sats`);
-  if (available === sidecarBalanceBefore) break;
+  const current = await (await fetch("http://127.0.0.1:5000/health")).json();
+  const available = BigInt(current.spark.available_sats);
+  step(8.3, `SSP Spark balance poll ${i}: ${available} sats`);
+  if (available === sparkBalanceBefore) break;
   if (i === 29) {
     throw new Error(
-      `sidecar did not reclaim swap input: ${available}; expected ${sidecarBalanceBefore}`,
+      `SSP did not reclaim swap input: ${available}; expected ${sparkBalanceBefore}`,
     );
   }
   await new Promise((resolve) => setTimeout(resolve, 2000));

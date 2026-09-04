@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bring up the regtest stack, fund the swap sidecar, run the SDK e2e.
+# Bring up the regtest stack, fund the embedded Spark wallet, run the SDK e2e.
 # Stack stays up on success.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -13,16 +13,17 @@ failure_logs() {
     "${COMPOSE[@]}" ps -a >&2 || true
     "${COMPOSE[@]}" logs --tail=150 \
       bitcoind bitcoin-init spark-operator-0 spark-operator-1 \
-      spark-operator-2 ldk-server ldk-server-2 ssp swap-sidecar >&2 || true
+      spark-operator-2 ldk-server ldk-server-2 ssp >&2 || true
   fi
   exit "$status"
 }
 trap failure_logs EXIT
 
 export SPARK_REF="${SPARK_REF:-/tmp/opencode/spark-ref}"
+export SDK_REF="${SDK_REF:-$SPARK_REF}"
 export SPARK_DANGEROUSLY_DISABLE_TLS_VERIFICATION=1
 export MINING=1
-export SIDECAR_TOKEN="${SIDECAR_TOKEN:-regtest-sidecar-token}"
+export SPARK_ADMIN_TOKEN="${SPARK_ADMIN_TOKEN:-regtest-spark-admin-token}"
 if [ -z "${BITCOIN_RPC_PORT:-}" ]; then
   BITCOIN_RPC_PORT=$(node -e 'const net=require("net");const s=net.createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
 fi
@@ -79,49 +80,29 @@ for i in $(seq 1 90); do
 done
 curl -s http://127.0.0.1:5000/health; echo
 
-echo "=== swap sidecar up + funded ==="
-"${COMPOSE[@]}" up -d swap-sidecar
-SIDECAR_JSON=""
-for i in $(seq 1 60); do
-  if SIDECAR_JSON=$(curl --fail --silent --show-error --max-time 15 \
-    http://127.0.0.1:5001/health); then
-    break
-  fi
-  if [ "$i" = 60 ]; then echo "swap sidecar not healthy"; exit 1; fi
-  sleep 5
-done
-SIDECAR_BAL=$(echo "$SIDECAR_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{const j=JSON.parse(s);console.log(j.breakdown?.available ?? j.balance ?? 0)}catch{console.log(0)}})") || SIDECAR_BAL=0
-SIDECAR_TOPUP=$(echo "$SIDECAR_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).needsTopup===true?'yes':'no')}catch{console.log('no')}})") || SIDECAR_TOPUP=no
-case "$SIDECAR_BAL" in
-  ''|*[!0-9]*) SIDECAR_BAL=0 ;;
+echo "=== embedded Spark wallet funded ==="
+SPARK_JSON=$(curl --fail --silent --show-error --max-time 15 \
+  http://127.0.0.1:5000/health)
+SPARK_BAL=$(echo "$SPARK_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).spark?.available_sats??0)}catch{console.log(0)}})") || SPARK_BAL=0
+SPARK_TOPUP=$(echo "$SPARK_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).spark?.needs_topup===true?'yes':'no')}catch{console.log('no')}})") || SPARK_TOPUP=no
+case "$SPARK_BAL" in
+  ''|*[!0-9]*) SPARK_BAL=0 ;;
 esac
-echo "sidecar available: $SIDECAR_BAL topup_flag: $SIDECAR_TOPUP"
+echo "Spark available: $SPARK_BAL topup_flag: $SPARK_TOPUP"
 # Ladder denoms deplete as fills consume exact matches; top up well before
 # empty (failed fills lock leaves SO-side and strand liquidity).
-if [ "${SIDECAR_BAL:-0}" = "0" ] || [ "${SIDECAR_BAL:-0}" = "null" ] || [ "${SIDECAR_BAL:-0}" -lt 10000000 ] || [ "$SIDECAR_TOPUP" = "yes" ]; then
-  echo "funding/topping up sidecar liquidity wallet..."
-  "${COMPOSE[@]}" run --rm sidecar-fund
+if [ "${SPARK_BAL:-0}" = "0" ] || [ "${SPARK_BAL:-0}" = "null" ] || [ "${SPARK_BAL:-0}" -lt 10000000 ] || [ "$SPARK_TOPUP" = "yes" ]; then
+  echo "funding/topping up embedded Spark wallet..."
+  node e2e/fund-ssp.mjs
 fi
 
-# SSP resolves the sidecar identity in the background. Verify alignment.
-SIDECAR_ID=$(curl -s http://127.0.0.1:5001/health | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).identityPubkey??'')}catch{console.log('')}})")
-echo "sidecar identity: $SIDECAR_ID"
-for i in $(seq 1 30); do
-  SSP_ID=$(curl -s http://127.0.0.1:5000/health | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).ssp_identity_pubkey??'')}catch{console.log('')}})")
-  if [ -n "$SSP_ID" ] && [ "$SSP_ID" = "$SIDECAR_ID" ]; then echo "SSP identity aligned: $SSP_ID"; break; fi
-  if [ "$i" = 30 ]; then echo "SSP identity mismatch: ssp=$SSP_ID sidecar=$SIDECAR_ID"; exit 1; fi
-  sleep 4
-done
+SSP_ID=$(curl -s http://127.0.0.1:5000/health | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);if(j.ssp_identity_pubkey!==j.spark?.identity_pubkey)process.exit(1);console.log(j.ssp_identity_pubkey)})")
+echo "SSP and embedded wallet identity aligned: $SSP_ID"
 
-SDK_DIST="$SPARK_REF/sdks/js/packages/spark-sdk/dist/index.node.js"
+SDK_DIST="$SDK_REF/sdks/js/packages/spark-sdk/dist/index.node.js"
 if [ ! -f "$SDK_DIST" ]; then
   echo "SDK not built at $SDK_DIST (run yarn build:sdk in sdks/js first)"; exit 1
 fi
-npm ci --prefix swap-sidecar --omit=dev --no-audit --no-fund
-
-echo "=== verify SDK network mapping ==="
-SPARK_SDK_DIST="$SDK_DIST" node e2e/sdk-network.mjs
-
 echo "=== run e2e ==="
 SPARK_SDK_DIST="$SDK_DIST" node e2e/e2e.mjs
 

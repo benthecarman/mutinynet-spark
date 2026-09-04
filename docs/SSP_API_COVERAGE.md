@@ -11,12 +11,12 @@ SDK's generated fragments read aliased keys.
 |---|---|---|
 | get_challenge / verify_challenge | live (secp256k1 verify, DER or compact, base64 or hex) | in-memory sessions, 24h |
 | lightning_receive_quote | shape-exact, real ECDSA issuer_signature | manifest is JSON (SDK proto-decodes it: LN-receive needs real TransferManifest proto, see LDK_GAPS) |
-| request_lightning_receive | live (hodl, SSP-owned preimage, Spark payout) | idempotent sidecar transfer before LDK claim; FROST split + ECIES per operator; needs SSP_FROST_OPERATORS |
+| request_lightning_receive | live (hodl, SSP-owned preimage, Spark payout) | idempotent embedded-wallet transfer before LDK claim; FROST split + ECIES per operator; needs SSP_FROST_OPERATORS |
 | mint_invoice_preimage | live (SSP extension) | wallets mint the hash first, then createLightningHodlInvoice with it |
 | reveal_preimage | live (SSP extension) | cooperative wallets reveal; stock wallets never call it |
 | request_lightning_send | shape-exact | FakeLdkBackend; live: Bolt11Send |
 | lightning_send_fee_estimate | fixed at zero by policy | both backends |
-| request_swap | live via funded sidecar (real SO inbound + change, exact SDK shape) | sidecar wallet; needs ladder liquidity (see DEPLOY.md) |
+| request_swap | live via funded Rust wallet (atomic Swap V3 counter transfer, exact SDK shape) | embedded Breez wallet; needs exact ladder liquidity (see DEPLOY.md) |
 | leaves_swap_fee_estimate | live (flat config) | SSP_SWAP_FEE_SATS |
 | static_deposit_quote | live, real ECDSA signature verifiable vs identity pubkey | fixed 100k credit (must stay <= UTXO; TODO UTXO lookup) |
 | claim_static_deposit | shape-exact (`transfer_id` only, per fragment) | stored; SO is source of truth |
