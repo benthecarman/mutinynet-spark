@@ -1,6 +1,9 @@
 use axum::http::HeaderMap;
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use secp256k1::{Message, Secp256k1};
+use base64::{
+    engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD},
+    Engine,
+};
+use secp256k1::{ecdsa::Signature, Message, Secp256k1};
 use sha2::{Digest, Sha256};
 
 use crate::AppState;
@@ -17,7 +20,7 @@ pub async fn get_challenge(state: &AppState, identity_pubkey: &str) -> Result<St
         identity_pubkey,
         uuid::Uuid::new_v4()
     );
-    let protected = B64.encode(raw.as_bytes());
+    let protected = URL_SAFE_NO_PAD.encode(raw.as_bytes());
     state
         .db
         .save_challenge(
@@ -55,16 +58,11 @@ pub async fn verify_challenge(
     if !fresh {
         return Err("unknown, reused, or expired challenge".to_string());
     }
-    let sig_bytes = B64
-        .decode(signature_hex.trim())
-        .or_else(|_| hex::decode(signature_hex.trim()))
-        .map_err(|_| "malformed signature".to_string())?;
-    let sig = secp256k1::ecdsa::Signature::from_der(&sig_bytes)
-        .or_else(|_| secp256k1::ecdsa::Signature::from_compact(&sig_bytes))
-        .map_err(|_| "malformed signature".to_string())?;
+    let sig = decode_signature(signature_hex)?;
     // SDK signs sha256 of the DECODED challenge bytes (client.ts authenticate()).
-    let challenge_bytes = B64
+    let challenge_bytes = URL_SAFE_NO_PAD
         .decode(protected_challenge.trim())
+        .or_else(|_| B64.decode(protected_challenge.trim()))
         .map_err(|_| "malformed challenge".to_string())?;
     // Domain separation: challenges we issue start with this prefix.
     if !challenge_bytes.starts_with(b"spark-ssp-challenge:") {
@@ -82,6 +80,23 @@ pub async fn verify_challenge(
         .save_session(&token, identity_pubkey, &valid_until.to_rfc3339())
         .await?;
     Ok((token, valid_until))
+}
+
+fn decode_signature(encoded: &str) -> Result<Signature, String> {
+    let encoded = encoded.trim();
+    let parse = |bytes: Vec<u8>| {
+        Signature::from_der(&bytes)
+            .or_else(|_| Signature::from_compact(&bytes))
+            .ok()
+    };
+
+    URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()
+        .and_then(&parse)
+        .or_else(|| B64.decode(encoded).ok().and_then(&parse))
+        .or_else(|| hex::decode(encoded).ok().and_then(parse))
+        .ok_or_else(|| "malformed signature".to_string())
 }
 
 /// Extract bearer session. `get_challenge` allows unauthenticated access;
@@ -102,5 +117,34 @@ pub async fn require_session(state: &AppState, headers: &HeaderMap) -> Result<St
     {
         Some(owner) => Ok(owner),
         None => Err("UNAUTHORIZED: bad or expired session".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_signature() -> Signature {
+        let secp = Secp256k1::new();
+        let secret_key = secp256k1::SecretKey::from_slice(&[1; 32]).unwrap();
+        let message = Message::from_digest([2; 32]);
+        secp.sign_ecdsa(&message, &secret_key)
+    }
+
+    #[test]
+    fn decodes_sdk_url_safe_signature() {
+        let signature = test_signature();
+        let encoded = URL_SAFE_NO_PAD.encode(signature.serialize_der());
+
+        assert_eq!(decode_signature(&encoded).unwrap(), signature);
+    }
+
+    #[test]
+    fn keeps_standard_base64_and_hex_compatibility() {
+        let signature = test_signature();
+        let der = signature.serialize_der();
+
+        assert_eq!(decode_signature(&B64.encode(der)).unwrap(), signature);
+        assert_eq!(decode_signature(&hex::encode(der)).unwrap(), signature);
     }
 }
