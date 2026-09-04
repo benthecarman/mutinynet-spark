@@ -618,15 +618,24 @@ impl Db {
         .await
     }
 
-    pub async fn request_id_for_transfer(
+    /// Latest request of `kind` whose payload references `ext_id` as its
+    /// `user_outbound_transfer_external_id`. Compatibility operations
+    /// correlate through their stored request: an unverified client-supplied
+    /// Spark id must never reserve a row in the global transfers namespace,
+    /// where it could collide with SSP-derived receive transfer ids.
+    pub async fn request_id_for_ext_id(
         &self,
-        spark_id: &str,
+        kind: &str,
+        ext_id: &str,
         owner: &str,
     ) -> Result<Option<String>, String> {
         self.with(|c| {
             c.query_row(
-                "SELECT request_id FROM transfers WHERE spark_id=?1 AND owner=?2",
-                (spark_id, owner),
+                "SELECT id FROM requests
+                 WHERE kind=?1 AND owner=?2
+                   AND json_extract(payload, '$.user_outbound_transfer_external_id')=?3
+                 ORDER BY created_at DESC LIMIT 1",
+                (kind, owner, ext_id),
                 |r| r.get(0),
             )
             .map(Some)
@@ -636,6 +645,30 @@ impl Db {
             })
         })
         .await
+    }
+
+    /// Record a terminal status inside a request payload. Compatibility
+    /// requests keep their status in the payload (no status column).
+    pub async fn set_request_status(
+        &self,
+        id: &str,
+        owner: &str,
+        status: &str,
+    ) -> Result<(), String> {
+        let changed = self
+            .with(|c| {
+                c.execute(
+                    "UPDATE requests SET payload=json_set(payload, '$.status', ?3)
+                     WHERE id=?1 AND owner=?2",
+                    (id, owner, status),
+                )
+            })
+            .await?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err("request was not found".to_string())
+        }
     }
 
     // ---- static deposit quotes (one row per UTXO) ----
@@ -1118,6 +1151,77 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coop_exit_request_cannot_poison_receive_transfer_ids() {
+        let (db, dir) = test_db();
+        let owner = "owner";
+        // Deterministic receive transfer id a wallet can derive in advance
+        // from its own payment hash.
+        let spark_id = "00000000-0000-4000-8000-000000000001";
+        db.insert_request(
+            "coop-request",
+            "COOP_EXIT",
+            owner,
+            "now",
+            &serde_json::json!({
+                "user_outbound_transfer_external_id": spark_id,
+                "exit_speed": "MEDIUM",
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        db.insert_request(
+            "receive-request",
+            "LIGHTNING_RECEIVE",
+            owner,
+            "now",
+            &serde_json::json!({
+                "payment_hash": "hash",
+                "amount_sats": 1000,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // CompleteCoopExit still correlates through the request payload...
+        assert_eq!(
+            db.request_id_for_ext_id("COOP_EXIT", spark_id, owner)
+                .await
+                .unwrap(),
+            Some("coop-request".to_string())
+        );
+        db.set_request_status("coop-request", owner, "COMPLETED")
+            .await
+            .unwrap();
+        let request = db
+            .get_request("coop-request", owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request["payload"]["status"], "COMPLETED");
+
+        // ...and the receive checkpoint for the same Spark id commits cleanly
+        // because the compatibility request reserved no transfers row.
+        db.commit_lightning_receive_swap(
+            "hash",
+            spark_id,
+            &"01".repeat(32),
+            "receive-request",
+            owner,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.transfer_for_request("receive-request", owner)
+                .await
+                .unwrap(),
+            Some(spark_id.to_string())
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

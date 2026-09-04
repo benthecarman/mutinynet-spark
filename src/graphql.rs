@@ -631,13 +631,12 @@ pub async fn dispatch(
             }
             let rec = store_request(&state, "COOP_EXIT", &owner, &now, payload, None).await?;
             let req_id = rec["id"].as_str().unwrap_or("").to_string();
-            let ext_id = str_of(&input, "user_outbound_transfer_external_id");
-            if !ext_id.is_empty() {
-                state
-                    .db
-                    .insert_transfer(&ext_id, &req_id, "COOP_EXIT", "CREATED", &owner)
-                    .await?;
-            }
+            // Compatibility stub: never insert the client-supplied
+            // `user_outbound_transfer_external_id` into the global transfers
+            // namespace. The id is unverified, yet receive settlement derives
+            // deterministic transfer ids a caller can compute in advance; a
+            // poisoned row would break the post-commit receive checkpoint
+            // after the Spark transfer is already irreversible.
             Ok(json!({ "request_coop_exit": {
                 "request": {
                     "__typename": "CoopExitRequest",
@@ -660,14 +659,20 @@ pub async fn dispatch(
         "CompleteCoopExit" | "complete_coop_exit" => {
             let owner = auth::require_session(&state, headers).await?;
             let transfer_id = str_of(&input, "user_outbound_transfer_external_id");
+            if transfer_id.is_empty() {
+                return Err("user_outbound_transfer_external_id is required".to_string());
+            }
+            // Correlate through the stored compatibility request only. The
+            // client-supplied Spark id stays out of the transfers namespace,
+            // where it could collide with SSP-derived receive transfer ids.
             let request_id = state
                 .db
-                .request_id_for_transfer(&transfer_id, &owner)
+                .request_id_for_ext_id("COOP_EXIT", &transfer_id, &owner)
                 .await?
                 .ok_or_else(|| "cooperative exit request not found".to_string())?;
             state
                 .db
-                .insert_transfer(&transfer_id, &request_id, "COOP_EXIT", "COMPLETED", &owner)
+                .set_request_status(&request_id, &owner, "COMPLETED")
                 .await?;
             Ok(json!({ "complete_coop_exit": {
                 "request": {"id": request_id,
@@ -1019,7 +1024,7 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
             "fee": sats(1000), "l1_broadcast_fee": sats(500),
             "fee_quote": null,
             "exit_speed": p.get("exit_speed").and_then(Value::as_str).unwrap_or("MEDIUM"),
-            "status": "CREATED",
+            "status": p.get("status").and_then(Value::as_str).unwrap_or("CREATED"),
             "expires_at": null,
             "raw_connector_transaction": "", "raw_coop_exit_transaction": "",
             "coop_exit_txid": p.get("coop_exit_txid").cloned().unwrap_or(Value::Null),
