@@ -21,7 +21,10 @@ use ::spark::{
     services::{LeafKeyTweak, Transfer as SparkTransfer, TransferService, TransferType},
     session_store::InMemorySessionStore,
     signer::SparkSigner as CoreSparkSigner,
-    tree::{select_leaves_by_exact_amounts, TreeNode, TreeNodeStatus},
+    tree::{
+        select_leaves_by_exact_amounts, select_leaves_by_minimum_amount, LeafLike, TreeNode,
+        TreeNodeStatus, TreeServiceError,
+    },
 };
 use bip39::{Language, Mnemonic};
 use bitcoin::{
@@ -374,13 +377,25 @@ impl SparkService {
             return Ok(recovered);
         }
         let leaves = self.wallet.list_leaves().await.map_err(|e| e.to_string())?;
-        let available = leaves
+        let mut available = leaves
             .available
             .into_iter()
             .map(wallet_leaf_to_tree_node)
             .collect::<Result<Vec<_>, _>>()?;
-        let selected = select_leaves_by_exact_amounts(&available, &[amount_sats])
+        available.sort_by(|a, b| a.value.cmp(&b.value).then_with(|| a.id.cmp(&b.id)));
+        let selected = select_receive_leaves(&available, amount_sats)
             .map_err(|e| self.liquidity_error(e.to_string()))?;
+        let selected_total_sats = selected.iter().try_fold(0u64, |sum, leaf| {
+            sum.checked_add(leaf.value)
+                .ok_or_else(|| "selected receive leaf total overflow".to_string())
+        })?;
+        tracing::info!(
+            payment_hash = %payment_hash,
+            invoice_amount_sats = amount_sats,
+            transfer_total_sats = selected_total_sats,
+            leaf_count = selected.len(),
+            "selected Spark liquidity for Lightning receive"
+        );
         let leaf_tweaks = selected
             .into_iter()
             .map(|node| LeafKeyTweak {
@@ -672,7 +687,7 @@ fn validate_lightning_receive_swap(
     transfer_id: &TransferId,
     sender: spark_wallet::PublicKey,
     receiver: spark_wallet::PublicKey,
-    amount_sats: u64,
+    invoice_amount_sats: u64,
 ) -> Result<LightningReceiveSwap, String> {
     if preimage.compute_hash() != *payment_hash {
         return Err("operator preimage does not match the Lightning payment hash".to_string());
@@ -680,15 +695,34 @@ fn validate_lightning_receive_swap(
     if transfer.id != *transfer_id
         || transfer.sender_identity_public_key != sender
         || transfer.receiver_identity_public_key != receiver
-        || transfer.total_value != amount_sats
         || transfer.transfer_type != TransferType::PreimageSwap
     {
         return Err("operator receive swap returned a mismatched transfer".to_string());
+    }
+    if transfer.total_value < invoice_amount_sats {
+        return Err(format!(
+            "operator receive swap transferred {} sats; invoice requires at least {invoice_amount_sats}",
+            transfer.total_value
+        ));
     }
     Ok(LightningReceiveSwap {
         transfer_id: transfer.id.to_string(),
         preimage: preimage.encode_hex(),
     })
+}
+
+fn select_receive_leaves<L: LeafLike>(
+    leaves: &[L],
+    amount_sats: u64,
+) -> Result<Vec<L>, TreeServiceError> {
+    match select_leaves_by_exact_amounts(leaves, &[amount_sats]) {
+        Ok(selected) => Ok(selected),
+        Err(TreeServiceError::UnselectableAmount) => {
+            select_leaves_by_minimum_amount(leaves, amount_sats)?
+                .ok_or(TreeServiceError::UnselectableAmount)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn wallet_leaf_to_tree_node(leaf: WalletLeaf) -> Result<TreeNode, String> {
@@ -810,6 +844,24 @@ fn deterministic_transfer_id(source: &[u8]) -> Result<TransferId, String> {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TestLeaf {
+        id: u8,
+        value: u64,
+    }
+
+    impl LeafLike for TestLeaf {
+        type Id = u8;
+
+        fn leaf_id(&self) -> &Self::Id {
+            &self.id
+        }
+
+        fn leaf_value(&self) -> u64 {
+            self.value
+        }
+    }
+
     #[test]
     fn maps_all_supported_networks() {
         assert_eq!(parse_network("MAINNET").unwrap(), Network::Mainnet);
@@ -859,6 +911,111 @@ mod tests {
             "ln-invoice"
         );
         assert_eq!(request.transfer_request.unwrap().transfer_id, "transfer");
+    }
+
+    #[test]
+    fn receive_leaf_selection_accepts_more_than_invoice() {
+        let leaves = [
+            TestLeaf {
+                id: 1,
+                value: 1_000,
+            },
+            TestLeaf {
+                id: 2,
+                value: 2_000,
+            },
+            TestLeaf {
+                id: 3,
+                value: 4_000,
+            },
+        ];
+
+        let selected = select_receive_leaves(&leaves, 68).unwrap();
+        assert_eq!(selected, vec![leaves[0].clone()]);
+    }
+
+    #[test]
+    fn receive_leaf_selection_prefers_an_exact_set() {
+        let leaves = [
+            TestLeaf {
+                id: 1,
+                value: 1_000,
+            },
+            TestLeaf {
+                id: 2,
+                value: 2_000,
+            },
+            TestLeaf {
+                id: 3,
+                value: 4_000,
+            },
+        ];
+
+        let exact = select_receive_leaves(&leaves, 3_000).unwrap();
+        assert_eq!(exact.iter().map(|leaf| leaf.value).sum::<u64>(), 3_000);
+    }
+
+    #[test]
+    fn receive_leaf_selection_combines_two_leaves() {
+        let equal_leaves = [
+            TestLeaf {
+                id: 4,
+                value: 1_000,
+            },
+            TestLeaf {
+                id: 5,
+                value: 1_000,
+            },
+        ];
+        let combined = select_receive_leaves(&equal_leaves, 1_500).unwrap();
+        assert_eq!(combined, equal_leaves);
+    }
+
+    #[test]
+    fn receive_swap_validation_accepts_operator_overfunding() {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let sender_secret = bitcoin::secp256k1::SecretKey::from_slice(&[2; 32]).unwrap();
+        let receiver_secret = bitcoin::secp256k1::SecretKey::from_slice(&[3; 32]).unwrap();
+        let sender = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sender_secret);
+        let receiver = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &receiver_secret);
+        let preimage = Preimage::from_hex(&"01".repeat(32)).unwrap();
+        let payment_hash = preimage.compute_hash();
+        let transfer_id = payment_transfer_id(&payment_hash.to_string()).unwrap();
+        let transfer = SparkTransfer {
+            id: transfer_id.clone(),
+            sender_identity_public_key: sender,
+            receiver_identity_public_key: receiver,
+            status: ::spark::services::TransferStatus::SenderKeyTweaked,
+            total_value: 12_345,
+            expiry_time: None,
+            leaves: Vec::new(),
+            created_time: None,
+            updated_time: None,
+            transfer_type: TransferType::PreimageSwap,
+            spark_invoice: None,
+        };
+
+        assert!(validate_lightning_receive_swap(
+            transfer.clone(),
+            preimage.clone(),
+            &payment_hash,
+            &transfer_id,
+            sender,
+            receiver,
+            100,
+        )
+        .is_ok());
+        assert!(validate_lightning_receive_swap(
+            transfer,
+            preimage,
+            &payment_hash,
+            &transfer_id,
+            sender,
+            receiver,
+            12_346,
+        )
+        .unwrap_err()
+        .contains("invoice requires at least"));
     }
 
     #[test]

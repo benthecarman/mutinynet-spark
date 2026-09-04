@@ -90,8 +90,8 @@ case "$SPARK_BAL" in
   ''|*[!0-9]*) SPARK_BAL=0 ;;
 esac
 echo "Spark available: $SPARK_BAL topup_flag: $SPARK_TOPUP"
-# Ladder denoms deplete as fills consume exact matches; top up well before
-# empty (failed fills lock leaves SO-side and strand liquidity).
+# Swap ladder denominations deplete as fills consume exact matches; top up
+# before the wallet is empty (failed fills can lock leaves operator-side).
 if [ "${SPARK_BAL:-0}" = "0" ] || [ "${SPARK_BAL:-0}" = "null" ] || [ "${SPARK_BAL:-0}" -lt 10000000 ] || [ "$SPARK_TOPUP" = "yes" ]; then
   echo "funding/topping up embedded Spark wallet..."
   node e2e/fund-ssp.mjs

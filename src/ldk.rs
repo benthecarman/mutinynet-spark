@@ -424,7 +424,6 @@ fn is_definitive_swap_failure(error: &str) -> bool {
         "Unselectable",
         "unselectable",
         "NEEDS_TOPUP",
-        "exact receive amount is unavailable",
     ]
     .iter()
     .any(|needle| error.contains(needle))

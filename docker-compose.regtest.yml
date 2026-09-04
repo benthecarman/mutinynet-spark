@@ -81,7 +81,8 @@ services:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 2s
       timeout: 5s
-      retries: 10
+      retries: 30
+      start_period: 30s
 
   bitcoind:
     image: lncm/bitcoind:v28.0

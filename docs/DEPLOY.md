@@ -93,20 +93,21 @@ that belong to the currently running operator instances.
 6. Verify that `/identity`'s `identityPublicKey` equals `/status`'s
    `ssp_identity_pubkey`, `spark.identity_pubkey`, and the configured client
    identity.
-7. Fund the exact Spark leaf denominations needed by the service.
+7. Fund enough Spark leaves for the service.
 
 Start or recreate the SSP only after operator certificates are ready. This
 prevents the wallet from keeping connections to replaced certificates.
 
 ## Liquidity
 
-Swap fills and Lightning receives need exact SSP-owned Spark leaves. Monitor
-these authenticated `/status` fields:
+Swap fills need exact SSP-owned Spark leaves. Lightning receives can use one or
+more whole leaves whose total is at least the invoice amount. Monitor these
+authenticated `/status` fields:
 
 - `spark.available_sats`: spendable leaves visible on the operators.
 - `spark.owned_sats`: all wallet-owned leaves, including temporarily missing
   leaves.
-- `spark.needs_topup`: `true` after an exact-match or balance failure.
+- `spark.needs_topup`: `true` after a leaf-selection or balance failure.
 
 The funding helper obtains deposit addresses from the authenticated admin API,
 funds them through Bitcoin RPC, waits for confirmation, and submits each raw
@@ -123,12 +124,12 @@ Use `SSP_BASE_URL`, `BITCOIN_RPC_URL`, `BITCOIN_RPC_USER`, and
 `BITCOIN_RPC_PASSWORD` when the services are not at the local defaults. Do not
 put quotes inside values passed through Docker's `--env-file` option.
 
-The funding ladder must be able to make each supported receive amount exactly.
-A ladder that starts at 1,000 sats cannot settle a 68-sat receive. Standard
-Bitcoin relay policy also rejects on-chain deposit outputs below the dust
-limit. Obtain small denominations from an off-chain Spark liquidity source, or
-use a private mining path that explicitly accepts these nonstandard outputs.
-The local Lightning E2E uses the private regtest mining path for this reason.
+The SSP first selects an exact combination when one exists. Otherwise, it
+selects a deterministic set of whole leaves whose total covers the invoice.
+The receiving wallet gets the full value of those leaves. Keep the smallest
+leaf reasonably close to the smallest supported invoice to limit SSP
+overpayment. A ladder that starts at 1,000 sats can settle a 68-sat receive, but
+the wallet receives the full 1,000-sat leaf.
 
 Keep `MAX_SWAP_TOTAL_SATS` below the amount of liquidity that the operator can
 safely expose. Add small denominations before `needs_topup` becomes true.
