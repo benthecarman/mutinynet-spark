@@ -387,6 +387,29 @@ impl ReceiveSpark for SparkService {
 }
 
 #[async_trait::async_trait]
+trait SettleSpark: Send + Sync {
+    async fn settle_receive(
+        &self,
+        owner: &str,
+        payment_hash: &str,
+        amount_sats: u64,
+    ) -> Result<String, String>;
+}
+
+#[async_trait::async_trait]
+impl SettleSpark for SparkService {
+    async fn settle_receive(
+        &self,
+        owner: &str,
+        payment_hash: &str,
+        amount_sats: u64,
+    ) -> Result<String, String> {
+        self.settle_lightning_receive(owner, payment_hash, amount_sats)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
 trait ReceiveLdk: Send + Sync {
     async fn claim_receive(
         &self,
@@ -591,6 +614,65 @@ where
     Ok(true)
 }
 
+/// SSP-owned HODL receive: the SSP minted the preimage, so it pays Spark
+/// from its own wallet and claims Lightning with the held preimage. The
+/// claimable Lightning amount is validated before any Spark value moves —
+/// the payout is irreversible, so a mismatched amount fails the hold (the
+/// payer is refunded) instead of funding first and erroring later.
+async fn process_ssp_owned_receive<S, L>(
+    db: &Db,
+    spark: &S,
+    ldk: &L,
+    payment_hash: &str,
+    amount_msat: Option<u64>,
+    delays: &[Duration],
+    preimage: Option<&str>,
+) -> Result<bool, String>
+where
+    S: SettleSpark + ?Sized,
+    L: ReceiveLdk + ?Sized,
+{
+    let Some(receive) = db.lightning_receive_for_hash(payment_hash).await? else {
+        return Ok(false);
+    };
+    if receive.status == "TRANSFER_COMPLETED" || receive.status == "HTLC_FAILED" {
+        return Ok(true);
+    }
+    let expected_msat = receive
+        .amount_sats
+        .checked_mul(1000)
+        .ok_or_else(|| "Lightning receive amount is too large".to_string())?;
+    let actual_msat =
+        amount_msat.ok_or_else(|| "claimable Lightning payment has no amount".to_string())?;
+    if actual_msat != expected_msat {
+        fail_unfunded_receive(db, ldk, payment_hash, delays).await;
+        return Err(format!(
+            "claimable amount is {actual_msat} msat; expected {expected_msat} msat"
+        ));
+    }
+    let preimage = preimage
+        .ok_or_else(|| format!("preimage disappeared for Lightning receive {payment_hash}"))?;
+    validate_preimage(payment_hash, preimage)?;
+
+    let transfer_id = spark
+        .settle_receive(&receive.receiver, payment_hash, receive.amount_sats)
+        .await?;
+    db.insert_transfer(
+        &transfer_id,
+        &receive.request_id,
+        "LIGHTNING_RECEIVE",
+        "TRANSFER_COMPLETED",
+        &receive.owner,
+    )
+    .await?;
+    retry_bounded(
+        || ldk.claim_receive(payment_hash, expected_msat, preimage),
+        delays,
+    )
+    .await?;
+    Ok(true)
+}
+
 #[derive(Clone)]
 pub struct LdkGrpcBackend {
     pub client: LdkServerClient,
@@ -742,60 +824,22 @@ impl LdkGrpcBackend {
             .is_some())
     }
 
-    async fn fund_ssp_owned_receive(&self, payment_hash: &str) -> Result<bool, String> {
-        let Some(receive) = self.db.lightning_receive_for_hash(payment_hash).await? else {
-            return Ok(false);
-        };
-        let transfer_id = self
-            .spark
-            .settle_lightning_receive(&receive.receiver, payment_hash, receive.amount_sats)
-            .await?;
-        self.db
-            .insert_transfer(
-                &transfer_id,
-                &receive.request_id,
-                "LIGHTNING_RECEIVE",
-                "TRANSFER_COMPLETED",
-                &receive.owner,
-            )
-            .await?;
-        Ok(true)
-    }
-
     async fn claim_ssp_owned_receive(
         &self,
         payment_hash: &str,
         amount_msat: Option<u64>,
     ) -> Result<bool, String> {
-        if !self.fund_ssp_owned_receive(payment_hash).await? {
-            return Ok(false);
-        }
-        let receive = self
-            .db
-            .lightning_receive_for_hash(payment_hash)
-            .await?
-            .ok_or_else(|| format!("missing Lightning receive {payment_hash}"))?;
-        let expected_msat = receive
-            .amount_sats
-            .checked_mul(1000)
-            .ok_or_else(|| "Lightning receive amount is too large".to_string())?;
-        if amount_msat != Some(expected_msat) {
-            return Err("claimable amount does not match the SSP-owned invoice".to_string());
-        }
-        let preimage = self
-            .preimage_for(payment_hash)
-            .await
-            .ok_or_else(|| format!("preimage disappeared for Lightning receive {payment_hash}"))?;
-        validate_preimage(payment_hash, &preimage)?;
-        self.client
-            .bolt11_claim_for_hash(Bolt11ClaimForHashRequest {
-                payment_hash: Some(payment_hash.to_string()),
-                claimable_amount_msat: Some(expected_msat),
-                preimage,
-            })
-            .await
-            .map_err(|error| format!("claim Lightning receive {payment_hash}: {error}"))?;
-        Ok(true)
+        let preimage = self.preimage_for(payment_hash).await;
+        process_ssp_owned_receive(
+            self.db.as_ref(),
+            self.spark.as_ref(),
+            &self.client,
+            payment_hash,
+            amount_msat,
+            &RECEIVE_RETRY_DELAYS,
+            preimage.as_deref(),
+        )
+        .await
     }
 
     async fn finish_received_payment(&self, payment_hash: &str) -> Result<bool, String> {
@@ -1552,6 +1596,24 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct MockSettle {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SettleSpark for MockSettle {
+        async fn settle_receive(
+            &self,
+            _owner: &str,
+            _payment_hash: &str,
+            _amount_sats: u64,
+        ) -> Result<String, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("00000000-0000-4000-8000-000000000009".to_string())
+        }
+    }
+
+    #[derive(Default)]
     struct MockLdk {
         claims: AtomicUsize,
         failures: AtomicUsize,
@@ -1859,5 +1921,81 @@ mod tests {
         assert_eq!(invoice_network("SIGNET").unwrap(), bitcoin::Network::Signet);
         assert_eq!(invoice_network("LOCAL").unwrap(), bitcoin::Network::Regtest);
         assert!(invoice_network("unknown").is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ssp_owned_receive_rejects_amount_mismatch_before_funding() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        let spark = MockSettle::default();
+        let ldk = MockLdk::default();
+
+        let error = process_ssp_owned_receive(
+            &db,
+            &spark,
+            &ldk,
+            &hash,
+            Some(4_999_000),
+            &[],
+            Some(&preimage),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("expected"));
+        // No Spark value moved and the hold is failed so the payer refunds.
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.claims.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.failed_holds.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            db.transfer_for_request("request", "request-owner")
+                .await
+                .unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ssp_owned_receive_funds_and_claims_exact_amount() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        let spark = MockSettle::default();
+        let ldk = MockLdk::default();
+
+        assert!(process_ssp_owned_receive(
+            &db,
+            &spark,
+            &ldk,
+            &hash,
+            Some(5_000_000),
+            &[],
+            Some(&preimage),
+        )
+        .await
+        .unwrap());
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ldk.claims.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            db.transfer_for_request("request", "request-owner")
+                .await
+                .unwrap(),
+            Some("00000000-0000-4000-8000-000000000009".to_string())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ssp_owned_receive_requires_its_preimage_before_funding() {
+        let (db, dir, hash, _) = receive_fixture().await;
+        let spark = MockSettle::default();
+        let ldk = MockLdk::default();
+
+        assert!(
+            process_ssp_owned_receive(&db, &spark, &ldk, &hash, Some(5_000_000), &[], None,)
+                .await
+                .is_err()
+        );
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.claims.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.failed_holds.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
