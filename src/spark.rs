@@ -575,6 +575,7 @@ impl SparkService {
         let primary = self.wait_for_transfer(&primary_id).await?;
         let owner_key = spark_wallet::PublicKey::from_str(owner).map_err(|e| e.to_string())?;
         validate_transfer(&primary, owner_key, self.identity, received_total_sats)?;
+        validate_swap_primary_claimable(&primary.status)?;
 
         let _guard = self.liquidity_lock.lock().await;
         let primary = self
@@ -583,29 +584,26 @@ impl SparkService {
             .ok_or_else(|| "outbound swap transfer was not found for the SSP".to_string())?;
         validate_transfer(&primary, owner_key, self.identity, received_total_sats)?;
 
+        // Dead primaries are rejected on the creation path only: an
+        // idempotent retry whose counter transfer already exists keeps
+        // working regardless of the primary's final state. Rejecting before
+        // the wallet sync and counter RPC keeps expired or returned
+        // caller-supplied ids from occupying the liquidity lock.
         let counter_id = counter_transfer_id(outbound_transfer_id);
         let counter = match self.find_transfer(&counter_id).await? {
-            Some(transfer) => transfer,
+            Some(counter) => counter,
             None => {
-                self.wallet.sync().await.map_err(|e| e.to_string())?;
-                let adaptor =
-                    spark_wallet::PublicKey::from_str(adaptor_pubkey).map_err(|e| e.to_string())?;
-                let receiver = SparkAddress::new(owner_key, self.network, None);
-                let mut amounts = targets.to_vec();
-                let change = received_total_sats - target_total;
-                if change > 0 {
-                    amounts.push(change);
-                }
-                self.wallet
-                    .transfer_swap_counter(
-                        amounts,
-                        &receiver,
-                        primary_id.clone(),
-                        adaptor,
-                        counter_id,
-                    )
-                    .await
-                    .map_err(|e| self.liquidity_error(e.to_string()))?
+                validate_swap_primary_claimable(&primary.status)?;
+                self.create_counter_transfer(
+                    &primary_id,
+                    owner_key,
+                    adaptor_pubkey,
+                    targets,
+                    received_total_sats,
+                    target_total,
+                    counter_id,
+                )
+                .await?
             }
         };
         validate_transfer(&counter, self.identity, owner_key, received_total_sats)?;
@@ -624,6 +622,32 @@ impl SparkService {
             transfer_id: counter.id.to_string(),
             leaf_ids,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_counter_transfer(
+        &self,
+        primary_id: &TransferId,
+        owner_key: spark_wallet::PublicKey,
+        adaptor_pubkey: &str,
+        targets: &[u64],
+        received_total_sats: u64,
+        target_total: u64,
+        counter_id: TransferId,
+    ) -> Result<WalletTransfer, String> {
+        self.wallet.sync().await.map_err(|e| e.to_string())?;
+        let adaptor =
+            spark_wallet::PublicKey::from_str(adaptor_pubkey).map_err(|e| e.to_string())?;
+        let receiver = SparkAddress::new(owner_key, self.network, None);
+        let mut amounts = targets.to_vec();
+        let change = received_total_sats - target_total;
+        if change > 0 {
+            amounts.push(change);
+        }
+        self.wallet
+            .transfer_swap_counter(amounts, &receiver, primary_id.clone(), adaptor, counter_id)
+            .await
+            .map_err(|e| self.liquidity_error(e.to_string()))
     }
 
     async fn find_htlc(
@@ -852,6 +876,20 @@ fn csv(value: &str) -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
+/// A swap primary must still be able to fund the counter transfer. Expired
+/// and returned transfers have already sent their value back to the sender,
+/// so they can never fund a swap; rejecting them locally (before the wallet
+/// sync and counter-transfer RPC) keeps dead caller-supplied ids out of the
+/// liquidity lock. The coordinator's atomic validation remains the final
+/// authority for every other state.
+fn validate_swap_primary_claimable(status: &TransferStatus) -> Result<(), String> {
+    match status {
+        TransferStatus::Expired | TransferStatus::Returned => Err(format!(
+            "outbound swap transfer is {status} and can no longer fund a swap"
+        )),
+        _ => Ok(()),
+    }
+}
 
 fn parse_network(value: &str) -> Result<Network, String> {
     match value.to_ascii_uppercase().as_str() {
@@ -1015,6 +1053,17 @@ mod tests {
         assert!(select_receive_leaves(&leaves, 68).is_err());
         // 1,500 sats cannot be composed from whole 1,000-sat leaves either.
         assert!(select_receive_leaves(&leaves, 1_500).is_err());
+    }
+
+    #[test]
+    fn dead_swap_primaries_are_rejected() {
+        assert!(validate_swap_primary_claimable(&TransferStatus::SenderInitiated).is_ok());
+        assert!(validate_swap_primary_claimable(&TransferStatus::SenderKeyTweaked).is_ok());
+        assert!(validate_swap_primary_claimable(&TransferStatus::Completed).is_ok());
+        for dead in [TransferStatus::Expired, TransferStatus::Returned] {
+            let error = validate_swap_primary_claimable(&dead).unwrap_err();
+            assert!(error.contains("can no longer fund a swap"));
+        }
     }
 
     #[test]
