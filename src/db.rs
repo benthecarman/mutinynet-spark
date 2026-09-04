@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::Path, path::PathBuf, sync::Arc};
 
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -51,7 +51,18 @@ impl Db {
     pub fn open(data_dir: &str) -> Result<Self, String> {
         std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
         let path: PathBuf = [data_dir, "ssp.sqlite"].iter().collect();
-        let conn = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
+        let conn = rusqlite::Connection::open(&path).map_err(|e| e.to_string())?;
+        // The database holds session tokens and preimages. Secure it before
+        // the WAL pragma: SQLite creates -wal/-journal/-shm sidecars with
+        // exactly the database file's mode, and pre-existing sidecars from a
+        // restored backup are tightened here too. Startup fails if a
+        // group- or world-readable file cannot be secured.
+        crate::fs::restrict_to_owner(&path)?;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = path.clone().into_os_string();
+            sidecar.push(suffix);
+            crate::fs::restrict_to_owner(Path::new(&sidecar))?;
+        }
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
         )
@@ -1346,5 +1357,27 @@ mod tests {
             .unwrap()
             .is_none());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn database_and_sidecars_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("open-ssp-db-mode-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("ssp.sqlite");
+        // A restored or copied database can arrive world-readable.
+        std::fs::write(&db_path, b"").unwrap();
+        let mut permissions = std::fs::metadata(&db_path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        std::fs::set_permissions(&db_path, permissions).unwrap();
+
+        let db = Db::open(dir.to_str().unwrap()).unwrap();
+
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

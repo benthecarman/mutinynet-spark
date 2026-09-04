@@ -866,6 +866,10 @@ fn parse_network(value: &str) -> Result<Network, String> {
 fn load_or_create_mnemonic(path: &str, required: bool) -> Result<Mnemonic, String> {
     match std::fs::read_to_string(path) {
         Ok(value) => {
+            // An existing mnemonic may have arrived through a copy or a
+            // restore with wider permissions than creation used. Refuse to
+            // continue if it cannot be secured.
+            crate::fs::restrict_to_owner(Path::new(path))?;
             return Mnemonic::parse_in_normalized(Language::English, value.trim())
                 .map_err(|e| format!("parse Spark mnemonic: {e}"));
         }
@@ -1107,5 +1111,25 @@ mod tests {
         let error = load_or_create_mnemonic(path.to_str().unwrap(), true).unwrap_err();
         assert!(error.contains("is required"));
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_mnemonic_permissions_are_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path =
+            std::env::temp_dir().join(format!("open-ssp-mnemonic-mode-{}", uuid::Uuid::new_v4()));
+        let mnemonic = Mnemonic::generate_in(Language::English, 12).unwrap();
+        std::fs::write(&path, mnemonic.to_string()).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        load_or_create_mnemonic(path.to_str().unwrap(), true).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_file(&path).unwrap();
     }
 }

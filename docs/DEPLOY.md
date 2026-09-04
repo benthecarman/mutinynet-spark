@@ -64,7 +64,11 @@ least the threshold, and every identity key must match its operator.
 
 For a new empty volume, start one SSP instance with
 `SPARK_MNEMONIC_REQUIRED=0`. The process creates the mnemonic with mode `0600`.
-Back up the file, stop the process, set `SPARK_MNEMONIC_REQUIRED=1`, and start
+At every start it also tightens the mnemonic, the SQLite database, and any
+WAL/journal sidecars back to `0600` (Unix), and refuses to start when a
+group- or world-readable secret file cannot be secured. Volume-level access
+control and backup permissions remain the operator's responsibility. Back up
+the file, stop the process, set `SPARK_MNEMONIC_REQUIRED=1`, and start
 the service normally.
 
 Never start two SSP instances against an empty shared mnemonic path. The

@@ -16,6 +16,7 @@ mod auth;
 mod config;
 mod db;
 mod frost;
+mod fs;
 mod graphql;
 mod ldk;
 mod spark;
