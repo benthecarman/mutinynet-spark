@@ -32,6 +32,27 @@ Retries and process restarts therefore do not create a second Spark transfer.
 The SSP calls `Bolt11FailForHash` when an unfunded swap cannot complete or the
 hold invoice expires.
 
+### BOLT12 send
+
+The SSP verifies a completed standard Spark transfer from the wallet and then
+calls `Bolt12Send`. It verifies the final payment hash and preimage. A final
+Lightning failure starts a deterministic Spark refund. Reconciliation can
+repeat the refund without creating a second transfer.
+
+This is a prepaid flow, not an atomic swap. BOLT12 offers do not expose the
+payment hash before the invoice-request exchange, so the wallet cannot create
+the BOLT11 hash-locked funding transfer.
+
+### BOLT12 receive
+
+The SSP calls `Bolt12Receive` to create a fixed-value offer. After
+`PaymentReceived`, it sends the offer amount to the wallet with a deterministic
+transfer ID. Reconciliation can repeat the payout safely after a restart.
+
+`ldk-server` claims the payment before the SSP makes the Spark transfer. This
+is not an atomic receive. The limitation comes from the missing BOLT12 hold
+API described below.
+
 ### Event recovery
 
 The `SubscribeEvents` server stream has no per-request deadline. Only stream
@@ -55,7 +76,8 @@ as the payment call.
 
 `ldk-server` does not expose a BOLT12 equivalent of
 `Bolt11ReceiveForHash`, `Bolt11ClaimForHash`, and `Bolt11FailForHash`.
-Lightning receive is therefore BOLT11-only.
+The SSP can receive BOLT12 payments, but it cannot hold them until the Spark
+payout completes.
 
 Needed capability: create, claim, and fail APIs for a BOLT12 payment that uses
 a caller-supplied hash.
@@ -84,10 +106,6 @@ These limitations are in the SSP and must not be attributed to `ldk-server`:
 
 - `lightning_receive_quote` does not emit the protobuf `TransferManifest`
   required by the SDK quote flow.
-- BOLT12 send is not wired into the SSP. Funding verification calls the
-  BOLT11-only `DecodeInvoice`, and final Spark settlement matches only BOLT11
-  payment records. `ldk-server` already provides `Bolt12Send` and exposes the
-  BOLT12 hash and preimage in payment state.
 - Wallet webhook handlers do not persist subscriptions or deliver events.
 - Cooperative exits and instant static deposits return compatibility data but
   do not complete their financial operations.

@@ -24,6 +24,14 @@ pub struct LightningReceive {
     pub claim_submitted: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LightningSend {
+    pub owner: String,
+    pub outbound_transfer_id: String,
+    pub payment_kind: String,
+    pub amount_sats: u64,
+}
+
 fn ensure_column(
     conn: &rusqlite::Connection,
     table: &str,
@@ -324,23 +332,67 @@ impl Db {
     pub async fn lightning_send_for_payment(
         &self,
         payment_id: &str,
-    ) -> Result<Option<(String, String)>, String> {
+    ) -> Result<Option<LightningSend>, String> {
         self.with(|c| {
             c.query_row(
                 "SELECT owner,
-                        json_extract(payload, '$.user_outbound_transfer_external_id')
+                        json_extract(payload, '$.user_outbound_transfer_external_id'),
+                        COALESCE(json_extract(payload, '$.payment_kind'), 'BOLT11'),
+                        COALESCE(json_extract(payload, '$.amount_sats'), 0)
                  FROM requests
                  WHERE kind='LIGHTNING_SEND'
                    AND json_extract(payload, '$.payment_id')=?1
                  LIMIT 1",
                 (payment_id,),
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok(LightningSend {
+                        owner: row.get(0)?,
+                        outbound_transfer_id: row.get(1)?,
+                        payment_kind: row.get(2)?,
+                        amount_sats: row.get(3)?,
+                    })
+                },
             )
             .map(Some)
             .or_else(|error| match error {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 error => Err(error),
             })
+        })
+        .await
+    }
+
+    pub async fn commit_bolt12_receive(
+        &self,
+        offer_id: &str,
+        payment_hash: &str,
+        transfer_id: &str,
+        request_id: &str,
+        owner: &str,
+    ) -> Result<(), String> {
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO transfers(spark_id,request_id,kind,status,owner)
+                 VALUES(?1,?2,'LIGHTNING_RECEIVE','TRANSFER_COMPLETED',?3)
+                 ON CONFLICT(spark_id) DO UPDATE SET status='TRANSFER_COMPLETED'",
+                (transfer_id, request_id, owner),
+            )?;
+            tx.execute(
+                "INSERT INTO receive_payments(hash,status,transfer_id,claim_submitted)
+                 VALUES(?1,'TRANSFER_COMPLETED',?2,1)
+                 ON CONFLICT(hash) DO UPDATE SET
+                   status='TRANSFER_COMPLETED', transfer_id=excluded.transfer_id,
+                   claim_submitted=1",
+                (offer_id, transfer_id),
+            )?;
+            tx.execute(
+                "UPDATE requests SET payload=json_set(payload, '$.settled_payment_hash', ?1)
+                 WHERE id=?2 AND owner=?3
+                   AND json_extract(payload, '$.offer_id')=?4",
+                (payment_hash, request_id, owner, offer_id),
+            )?;
+            tx.commit()
         })
         .await
     }
@@ -967,6 +1019,79 @@ mod tests {
             db.transfer_for_request("request", "owner").await.unwrap(),
             Some("transfer".to_string())
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bolt12_send_restores_funding_metadata() {
+        let (db, dir) = test_db();
+        db.insert_request(
+            "request",
+            "LIGHTNING_SEND",
+            "owner",
+            "now",
+            &serde_json::json!({
+                "payment_id": "payment",
+                "payment_kind": "BOLT12",
+                "amount_sats": 1234,
+                "user_outbound_transfer_external_id": "funding",
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.lightning_send_for_payment("payment").await.unwrap(),
+            Some(LightningSend {
+                owner: "owner".to_string(),
+                outbound_transfer_id: "funding".to_string(),
+                payment_kind: "BOLT12".to_string(),
+                amount_sats: 1234,
+            })
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bolt12_receive_commit_is_idempotent() {
+        let (db, dir) = test_db();
+        db.insert_request(
+            "request",
+            "LIGHTNING_RECEIVE",
+            "owner",
+            "now",
+            &serde_json::json!({
+                "payment_hash": "offer",
+                "offer_id": "offer",
+                "payment_kind": "BOLT12",
+                "amount_sats": 1234,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        db.set_receive_status("offer", "INVOICE_CREATED")
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            db.commit_bolt12_receive("offer", "hash", "transfer", "request", "owner")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            db.receive_status("offer").await.unwrap(),
+            "TRANSFER_COMPLETED"
+        );
+        assert_eq!(
+            db.transfer_for_request("request", "owner").await.unwrap(),
+            Some("transfer".to_string())
+        );
+        let request = db.get_request("request", "owner").await.unwrap().unwrap();
+        assert_eq!(request["payload"]["payment_hash"], "offer");
+        assert_eq!(request["payload"]["settled_payment_hash"], "hash");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

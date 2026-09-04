@@ -22,7 +22,8 @@ The Lightning acceptance test runs `e2e/ln-e2e.sh`. It uses the Spark checkout
 only to build three local operators and uses the Rust Breez SDK at revision
 `c7eecfe` as the wallet client. It does not patch the operator checkout.
 The test also starts a pinned Electrs image and uses its local Esplora API for
-Breez chain data. The runner builds the operators from a clean detached
+Breez chain data. It tests BOLT11 in both directions and separate BOLT12 send
+and receive flows. The runner builds the operators from a clean detached
 worktree at `SPARK_REF`'s `HEAD`. Set `SPARK_OPERATOR_COMMIT` to test another
 commit. Set `SPARK_REF` and `LDK_SERVER_REF` when the source checkouts are not
 at their default paths.

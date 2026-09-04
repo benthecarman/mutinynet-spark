@@ -156,6 +156,77 @@ pub async fn dispatch(
                 "attribution_status": "NO_PARTNER_JWT",
             }}))
         }
+        "RequestBolt12Receive" | "request_bolt12_receive" => {
+            let owner = auth::require_session(&state, headers).await?;
+            let amount = num_of(&input, "amount_sats");
+            validate_sats(amount)?;
+            let requested_network = str_of(&input, "network");
+            if !requested_network.is_empty() {
+                validate_network(&state, &requested_network)?;
+            }
+            let requested_receiver = str_of(&input, "receiver_identity_pubkey");
+            let receiver = if requested_receiver.is_empty() {
+                owner.clone()
+            } else {
+                secp256k1::PublicKey::from_str(&requested_receiver)
+                    .map_err(|_| {
+                        "receiver_identity_pubkey must be a compressed public key".to_string()
+                    })?
+                    .to_string()
+            };
+            let memo = str_of(&input, "memo");
+            let expiry = u32::try_from(opt_num(&input, "expiry_secs").unwrap_or(86_400))
+                .map_err(|_| "expiry_secs is out of range".to_string())?;
+            if expiry == 0 {
+                return Err("expiry_secs must be positive".to_string());
+            }
+            let invoice_expires_at =
+                (chrono::Utc::now() + chrono::Duration::seconds(expiry as i64)).to_rfc3339();
+            let offer = crate::backend(&state)
+                .await
+                .create_bolt12_offer(amount, &memo, expiry)
+                .await?;
+            let rec = store_request(
+                &state,
+                "LIGHTNING_RECEIVE",
+                &owner,
+                &now,
+                json!({"amount_sats": amount, "payment_hash": offer.offer_id,
+                       "offer_id": offer.offer_id, "payment_kind": "BOLT12",
+                       "invoice": offer.offer, "network": state.config.network,
+                       "expiry_secs": expiry,
+                       "receiver_identity_pubkey": receiver.clone(),
+                       "invoice_expires_at": invoice_expires_at}),
+                None,
+            )
+            .await?;
+            state
+                .db
+                .set_receive_status(&offer.offer_id, "INVOICE_CREATED")
+                .await?;
+            Ok(json!({ "request_lightning_receive": {
+                "request": {
+                    "__typename": "LightningReceiveRequest",
+                    "id": rec["id"],
+                    "created_at": now,
+                    "updated_at": now,
+                    "network": state.config.network,
+                    "invoice": {
+                        "__typename": "Invoice",
+                        "encoded_invoice": offer.offer,
+                        "bitcoin_network": state.config.network,
+                        "payment_hash": offer.offer_id,
+                        "amount": currency_amount(amount),
+                        "created_at": now,
+                        "expires_at": invoice_expires_at,
+                        "memo": memo,
+                    },
+                    "status": "INVOICE_CREATED",
+                    "transfer": null,
+                    "receiver_identity_public_key": receiver,
+                }
+            }}))
+        }
         "RequestLightningReceive" | "request_lightning_receive" => {
             let owner = auth::require_session(&state, headers).await?;
             let amount = num_of(&input, "amount_sats");
@@ -285,6 +356,11 @@ pub async fn dispatch(
                 .await
                 .verify_lightning_send_funding(&owner, &ext_id, &inv, amt)
                 .await?;
+            let payment_kind = if inv.to_ascii_lowercase().starts_with("lno1") {
+                "BOLT12"
+            } else {
+                "BOLT11"
+            };
             let pay = crate::backend(&state).await.pay_invoice(&inv, amt).await;
             let rec = store_request(
                 &state,
@@ -294,6 +370,7 @@ pub async fn dispatch(
                 json!({"encoded_invoice": inv, "amount_sats": amt,
                        "idempotency_key": idem,
                        "payment_id": pay.payment_id, "status": pay.status,
+                       "payment_kind": payment_kind,
                        "network": state.config.network,
                        "user_outbound_transfer_external_id": ext_id}),
                 Some(idem.as_str()),
@@ -304,7 +381,11 @@ pub async fn dispatch(
                 .insert_transfer(
                     &ext_id_or_new(&ext_id),
                     rec["id"].as_str().unwrap_or(""),
-                    "PREIMAGE_SWAP",
+                    if payment_kind == "BOLT12" {
+                        "BOLT12_FUNDING"
+                    } else {
+                        "PREIMAGE_SWAP"
+                    },
                     &pay.status,
                     &owner,
                 )

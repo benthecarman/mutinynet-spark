@@ -293,6 +293,51 @@ impl SparkService {
         Ok(())
     }
 
+    /// Verify an unconditional Spark transfer that prepays a BOLT12 send.
+    /// BOLT12 offers do not expose a payment hash before the invoice-request
+    /// exchange, so they cannot use the hash-locked BOLT11 funding path.
+    pub async fn verify_bolt12_send(
+        &self,
+        owner: &str,
+        outbound_transfer_id: &str,
+        amount_sats: u64,
+    ) -> Result<(), String> {
+        let transfer_id = TransferId::from_str(outbound_transfer_id)?;
+        let transfer = self.wait_for_completed_transfer(&transfer_id).await?;
+        let owner_key = spark_wallet::PublicKey::from_str(owner).map_err(|e| e.to_string())?;
+        validate_transfer(&transfer, owner_key, self.identity, amount_sats)?;
+        if transfer.transfer_type != TransferType::Transfer {
+            return Err("BOLT12 funding must be a standard Spark transfer".to_string());
+        }
+        Ok(())
+    }
+
+    /// Return prepaid BOLT12 funding after a terminal Lightning failure.
+    /// The deterministic ID makes retries and reconciliation idempotent.
+    pub async fn refund_bolt12_send(
+        &self,
+        owner: &str,
+        outbound_transfer_id: &str,
+        amount_sats: u64,
+    ) -> Result<String, String> {
+        let _guard = self.liquidity_lock.lock().await;
+        self.wallet.sync().await.map_err(|e| e.to_string())?;
+        let owner_key = spark_wallet::PublicKey::from_str(owner).map_err(|e| e.to_string())?;
+        let receiver = SparkAddress::new(owner_key, self.network, None);
+        let refund_id = counter_transfer_id(&format!("bolt12-refund:{outbound_transfer_id}"));
+        let transfer = match self.find_transfer(&refund_id).await? {
+            Some(transfer) => transfer,
+            None => self
+                .wallet
+                .transfer(amount_sats, &receiver, Some(refund_id.clone()))
+                .await
+                .map_err(|e| self.liquidity_error(e.to_string()))?,
+        };
+        validate_transfer(&transfer, self.identity, owner_key, amount_sats)?;
+        self.needs_topup.store(false, Ordering::Relaxed);
+        Ok(transfer.id.to_string())
+    }
+
     pub async fn settle_lightning_send(
         &self,
         outbound_transfer_id: &str,
@@ -603,6 +648,26 @@ impl SparkService {
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err("outbound swap transfer was not found for the SSP".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn wait_for_completed_transfer(&self, id: &TransferId) -> Result<WalletTransfer, String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Err(error) = self.wallet.sync().await {
+                tracing::debug!(%error, %id, "Spark wallet sync retry");
+            }
+            match self.find_transfer(id).await {
+                Ok(Some(transfer)) if transfer.status == TransferStatus::Completed => {
+                    return Ok(transfer);
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(error) => tracing::debug!(%error, %id, "Spark transfer lookup retry"),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("BOLT12 funding transfer is not complete".to_string());
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }

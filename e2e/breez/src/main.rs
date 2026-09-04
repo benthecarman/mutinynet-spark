@@ -1,11 +1,13 @@
 use std::{env, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use breez_sdk_spark::{
     BreezSdk, ChainApiType, GetInfoRequest, GetPaymentRequest, ListPaymentsRequest, Network,
     Payment, PaymentDetails, PaymentRequest, PaymentStatus, PaymentType, PrepareSendPaymentRequest,
-    ReceivePaymentMethod, ReceivePaymentRequest, SdkBuilder, Seed, SendPaymentRequest, SparkConfig,
-    SparkSigningOperator, SparkSspConfig, SyncWalletRequest, default_config,
+    ReceivePaymentMethod, ReceivePaymentRequest, SdkBuilder, Seed, SendPaymentRequest,
+    SignMessageRequest, SparkConfig, SparkSigningOperator, SparkSspConfig, SyncWalletRequest,
+    default_config,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -213,6 +215,85 @@ async fn admin_json(
         Some(&config.admin_token),
     )
     .await
+}
+
+async fn graphql_json(
+    client: &Client,
+    wallet: &Wallet,
+    session: Option<&str>,
+    operation: &str,
+    variables: Value,
+) -> Result<Value> {
+    let url = format!("{}/graphql/spark/rc", wallet.ssp_url);
+    let mut request = client.post(&url).json(&json!({
+        "operationName": operation,
+        "query": format!("mutation {operation} {{ result }}"),
+        "variables": variables,
+    }));
+    if let Some(session) = session {
+        request = request.bearer_auth(session);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("{operation} request failed"))?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .with_context(|| format!("{operation} returned invalid JSON"))?;
+    ensure!(
+        status.is_success() && body.get("errors").is_none(),
+        "{operation} failed with HTTP {status}: {body}"
+    );
+    Ok(body["data"].clone())
+}
+
+async fn authenticate_wallet(client: &Client, wallet: &Wallet) -> Result<String> {
+    let identity = wallet
+        .sdk
+        .sign_message(SignMessageRequest {
+            message: "identity-probe".to_string(),
+            compact: false,
+        })
+        .await?;
+    let challenge = graphql_json(
+        client,
+        wallet,
+        None,
+        "GetChallenge",
+        json!({ "public_key": identity.pubkey }),
+    )
+    .await?["get_challenge"]["protected_challenge"]
+        .as_str()
+        .context("GetChallenge returned no protected challenge")?
+        .to_string();
+    let decoded = URL_SAFE_NO_PAD
+        .decode(&challenge)
+        .context("SSP challenge is not base64url")?;
+    let signed = wallet
+        .sdk
+        .sign_message(SignMessageRequest {
+            message: String::from_utf8(decoded).context("SSP challenge is not UTF-8")?,
+            compact: false,
+        })
+        .await?;
+    let verified = graphql_json(
+        client,
+        wallet,
+        None,
+        "VerifyChallenge",
+        json!({ "input": {
+            "identity_public_key": signed.pubkey,
+            "protected_challenge": challenge,
+            "signature": signed.signature,
+        }}),
+    )
+    .await?;
+    verified["verify_challenge"]["session_token"]
+        .as_str()
+        .context("VerifyChallenge returned no session token")
+        .map(str::to_string)
 }
 
 async fn bitcoin_rpc(
@@ -521,6 +602,64 @@ fn bolt11_hash(payment: &Value) -> Option<String> {
         .as_str()
         .or_else(|| payment["kind"]["bolt11"]["hash"].as_str())
         .map(str::to_lowercase)
+}
+
+fn bolt12_offer(payment: &Value) -> Option<&Value> {
+    payment["kind"]["kind"]["bolt12_offer"]
+        .as_object()
+        .map(|_| &payment["kind"]["kind"]["bolt12_offer"])
+        .or_else(|| {
+            payment["kind"]["bolt12_offer"]
+                .as_object()
+                .map(|_| &payment["kind"]["bolt12_offer"])
+        })
+}
+
+async fn succeeded_bolt12_payment(
+    ldk: &LdkClient,
+    offer_id: &str,
+    direction: &str,
+    amount_sats: u64,
+) -> Result<Value> {
+    let payments = ldk.json(&["list-payments"]).await?;
+    let matches: Vec<&Value> = payments["list"]
+        .as_array()
+        .context("LDK list-payments response has no list")?
+        .iter()
+        .filter(|payment| {
+            bolt12_offer(payment).and_then(|offer| offer["offer_id"].as_str()) == Some(offer_id)
+                && payment["direction"].as_str() == Some(direction)
+        })
+        .collect();
+    ensure!(
+        matches.len() == 1,
+        "expected one {direction} BOLT12 payment for offer {offer_id}; found {}",
+        matches.len()
+    );
+    let payment = matches[0];
+    let expected_msat = amount_sats * 1000;
+    let amount_matches = match direction {
+        "INBOUND" => payment["amount_msat"]
+            .as_u64()
+            .is_some_and(|amount| amount >= expected_msat),
+        _ => payment["amount_msat"].as_u64() == Some(expected_msat),
+    };
+    ensure!(
+        payment["status"] == "SUCCEEDED" && amount_matches,
+        "BOLT12 payment is not complete: {payment}"
+    );
+    let details = bolt12_offer(payment).context("BOLT12 payment has no offer details")?;
+    let hash = details["hash"]
+        .as_str()
+        .context("BOLT12 payment has no hash")?;
+    let preimage = details["preimage"]
+        .as_str()
+        .context("BOLT12 payment has no preimage")?;
+    ensure!(
+        hex::encode(Sha256::digest(hex::decode(preimage)?)) == hash,
+        "BOLT12 payment preimage does not match its hash"
+    );
+    Ok(payment.clone())
 }
 
 async fn succeeded_ldk_payment(
@@ -937,6 +1076,194 @@ async fn pay_between(
     Ok(payment_hash)
 }
 
+async fn send_bolt12(
+    client: &Client,
+    config: &TestConfig,
+    sender: &Wallet,
+    recipient_ldk: &LdkClient,
+    amount_sats: u64,
+) -> Result<()> {
+    let sender_before = wallet_balance(sender).await?;
+    let status = admin_json(client, config, sender.ssp_url, "/status", None).await?;
+    let ssp_address = status["spark"]["address"]
+        .as_str()
+        .context("SSP status has no Spark address")?;
+    let offer_response = recipient_ldk
+        .json(&[
+            "bolt12-receive",
+            "breez-bolt12-send",
+            &format!("{amount_sats}sat"),
+            "--expiry-secs",
+            "300",
+        ])
+        .await?;
+    let offer = offer_response["offer"]
+        .as_str()
+        .context("LDK BOLT12 receive response has no offer")?;
+    let offer_id = offer_response["offer_id"]
+        .as_str()
+        .context("LDK BOLT12 receive response has no offer ID")?;
+
+    let prepared = sender
+        .sdk
+        .prepare_send_payment(PrepareSendPaymentRequest {
+            payment_request: PaymentRequest::Input {
+                input: ssp_address.to_string(),
+            },
+            amount: Some(u128::from(amount_sats)),
+            token_identifier: None,
+            conversion_options: None,
+            fee_policy: None,
+        })
+        .await?;
+    let funding = sender
+        .sdk
+        .send_payment(SendPaymentRequest {
+            prepare_response: prepared,
+            options: None,
+            idempotency_key: None,
+        })
+        .await?
+        .payment;
+    ensure!(
+        funding.status == PaymentStatus::Completed,
+        "BOLT12 funding transfer is {}",
+        funding.status
+    );
+
+    let session = authenticate_wallet(client, sender).await?;
+    let response = graphql_json(
+        client,
+        sender,
+        Some(&session),
+        "RequestLightningSend",
+        json!({ "input": {
+            "encoded_invoice": offer,
+            "amount_sats": amount_sats,
+            "user_outbound_transfer_external_id": funding.id,
+        }}),
+    )
+    .await?;
+    let request = &response["request_lightning_send"]["request"];
+    let request_id = request["id"]
+        .as_str()
+        .context("BOLT12 send response has no request ID")?
+        .to_string();
+    ensure!(
+        request["status"] == "LIGHTNING_PAYMENT_INITIATED",
+        "unexpected BOLT12 send status: {request}"
+    );
+
+    poll("BOLT12 SSP send", config.timeout, || async {
+        let response = graphql_json(
+            client,
+            sender,
+            Some(&session),
+            "UserRequest",
+            json!({ "request_id": request_id }),
+        )
+        .await?;
+        ensure!(
+            response["user_request"]["status"] != "LIGHTNING_PAYMENT_FAILED",
+            "BOLT12 send failed"
+        );
+        ensure!(
+            response["user_request"]["status"] == "LIGHTNING_PAYMENT_SUCCEEDED",
+            "BOLT12 send is not complete"
+        );
+        Ok(())
+    })
+    .await?;
+    poll("BOLT12 sender balance", config.timeout, || {
+        exact_balance(sender, sender_before - amount_sats)
+    })
+    .await?;
+    poll("BOLT12 outbound LDK payment", config.timeout, || {
+        succeeded_bolt12_payment(&sender.ldk, offer_id, "OUTBOUND", amount_sats)
+    })
+    .await?;
+    poll("BOLT12 inbound LDK payment", config.timeout, || {
+        succeeded_bolt12_payment(recipient_ldk, offer_id, "INBOUND", amount_sats)
+    })
+    .await?;
+    println!(
+        "PASS BOLT12 send: {} prepaid and sent {amount_sats} sats for offer {offer_id}",
+        sender.name
+    );
+    Ok(())
+}
+
+async fn receive_bolt12(
+    client: &Client,
+    config: &TestConfig,
+    receiver: &Wallet,
+    payer_ldk: &LdkClient,
+    amount_sats: u64,
+) -> Result<()> {
+    let receiver_before = wallet_balance(receiver).await?;
+    let session = authenticate_wallet(client, receiver).await?;
+    let response = graphql_json(
+        client,
+        receiver,
+        Some(&session),
+        "RequestBolt12Receive",
+        json!({ "input": {
+            "amount_sats": amount_sats,
+            "network": "REGTEST",
+            "memo": "breez-bolt12-receive",
+            "expiry_secs": 300,
+        }}),
+    )
+    .await?;
+    let request = &response["request_lightning_receive"]["request"];
+    let request_id = request["id"]
+        .as_str()
+        .context("BOLT12 receive response has no request ID")?
+        .to_string();
+    let offer = request["invoice"]["encoded_invoice"]
+        .as_str()
+        .context("BOLT12 receive response has no offer")?;
+    let offer_id = request["invoice"]["payment_hash"]
+        .as_str()
+        .context("BOLT12 receive response has no offer ID")?;
+    ensure!(offer.to_ascii_lowercase().starts_with("lno1"));
+    payer_ldk.json(&["bolt12-send", offer]).await?;
+
+    poll("BOLT12 SSP receive", config.timeout, || async {
+        let response = graphql_json(
+            client,
+            receiver,
+            Some(&session),
+            "UserRequest",
+            json!({ "request_id": request_id }),
+        )
+        .await?;
+        ensure!(
+            response["user_request"]["status"] == "TRANSFER_COMPLETED",
+            "BOLT12 receive is not complete"
+        );
+        Ok(())
+    })
+    .await?;
+    poll("BOLT12 receiver balance", config.timeout, || {
+        exact_balance(receiver, receiver_before + amount_sats)
+    })
+    .await?;
+    poll("BOLT12 payer LDK payment", config.timeout, || {
+        succeeded_bolt12_payment(payer_ldk, offer_id, "OUTBOUND", amount_sats)
+    })
+    .await?;
+    poll("BOLT12 receiver LDK payment", config.timeout, || {
+        succeeded_bolt12_payment(&receiver.ldk, offer_id, "INBOUND", amount_sats)
+    })
+    .await?;
+    println!(
+        "PASS BOLT12 receive: {} received {amount_sats} Spark sats for offer {offer_id}",
+        receiver.name
+    );
+    Ok(())
+}
+
 async fn run(
     client: &Client,
     config: &TestConfig,
@@ -1001,6 +1328,26 @@ async fn run(
         first_hash != second_hash,
         "the two wallet invoices reused a payment hash"
     );
+    println!("send from wallet A through its SSP to a BOLT12 offer");
+    send_bolt12(
+        client,
+        config,
+        wallet_a,
+        &wallet_b.ldk,
+        config.send_amount_sats,
+    )
+    .await
+    .context("wallet A BOLT12 send failed")?;
+    println!("receive to wallet A through its SSP BOLT12 offer");
+    receive_bolt12(
+        client,
+        config,
+        wallet_a,
+        &wallet_b.ldk,
+        config.send_amount_sats,
+    )
+    .await
+    .context("wallet A BOLT12 receive failed")?;
     println!("BREEZ LN E2E PASS");
     Ok(())
 }

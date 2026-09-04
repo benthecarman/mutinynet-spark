@@ -15,10 +15,11 @@ complete the underlying financial action.
 | `get_challenge`, `verify_challenge` | Supported | Single-use five-minute challenge and durable 24-hour session |
 | `leaves_swap_fee_estimate` | Supported | Returns `SSP_SWAP_FEE_SATS` |
 | `request_swap` | Supported and tested | Verifies the funded outbound transfer and completes an atomic Swap V3 counter transfer from exact SSP leaves |
-| `request_lightning_send` | BOLT11 supported and tested | Verifies Spark funding, starts one payment, tracks final LDK state, and settles the preimage swap idempotently |
+| `request_lightning_send` | BOLT11 and BOLT12 supported and tested | BOLT11 uses a preimage swap. BOLT12 verifies a completed Spark prepayment, tracks the LDK payment, and returns the prepayment after a final failure. |
 | `lightning_send_fee_estimate` | Limited | Returns the current zero-fee policy; it is not a route estimate |
 | `mint_invoice_preimage` | Supported SSP extension | Creates an SSP-owned preimage for the explicit HODL extension; standard receive does not use it |
 | `request_lightning_receive` | BOLT11 supported and tested | Creates a hold invoice for the wallet hash, redeems wallet-held operator shares with `REASON_RECEIVE`, commits Spark before the LDK claim, and reconciles missed events |
+| `request_bolt12_receive` | Supported SSP extension and tested | Creates a fixed-value BOLT12 offer and credits the wallet with a deterministic Spark transfer after LDK receives the payment |
 | `reveal_preimage` | Supported SSP extension | Reveals a preimage only for an explicit HODL flow; standard receive does not require it |
 | `transfers`, `user_request` | Supported for SSP-created records | Returns owner-scoped durable swap and Lightning state |
 | `lightning_receive_quote` | Compatibility only | Returns a signed JSON manifest; the SDK quote flow requires a protobuf `TransferManifest` |
@@ -46,8 +47,25 @@ the SSP emits the required protobuf manifest.
 `e2e/ln-e2e.sh` runs this flow on a fresh local regtest network through the
 Rust Breez SDK at revision `c7eecfe`. It uses local Electrs for Breez chain
 data, two SSP instances, and two `ldk-server` nodes. Each Breez wallet sends
-and receives a BOLT11 payment, and the test checks balances, settlement, and
+and receives a BOLT11 payment. The test also has separate BOLT12 send and
+receive flows. It checks Spark balances, offer IDs, LDK payment state, and
 preimage hashes.
+
+## BOLT12 settlement model
+
+A BOLT12 offer does not give the SSP a payment hash before the invoice-request
+exchange. Therefore, BOLT12 sends cannot use the BOLT11 hash-locked Spark
+transfer. The wallet first sends a completed standard Spark transfer to the
+SSP. The SSP then pays the offer. If Lightning reports a final failure, the SSP
+returns the same amount with a deterministic transfer ID. This flow is not an
+atomic swap. It depends on the SSP refund policy.
+
+For receive, the SSP creates a fixed-value offer. `ldk-server` claims the
+Lightning payment, and the SSP then sends the offer amount to the wallet. This
+flow is also not atomic because `ldk-server` has no BOLT12 hold-payment API.
+Reconciliation repeats the Spark payout safely after a restart. A blinded
+route can report an inbound amount that is larger than the offer amount. The
+SSP credits only the fixed offer amount.
 
 ## SDK compatibility
 
@@ -56,9 +74,9 @@ correctly and treats TESTNET and SIGNET BOLT11 invoices as compatible because
 both use the `lntb` prefix. Released SDK versions without that fix cannot run
 the complete MutinyNet Lightning test.
 
-BOLT12 sends are not production-supported. The SSP rejects offers in its
-BOLT11-only funding verification and does not map BOLT12 payment state into
-Spark settlement. `ldk-server` already exposes the send call, hash, and
-preimage needed for SSP-side support.
+The pinned Breez SDK does not expose high-level BOLT12 send or receive methods.
+Clients can use `request_lightning_send` with an `lno1` offer and an explicit
+amount after they transfer the same amount to the SSP. They can use the
+`request_bolt12_receive` SSP extension to create a fixed-value offer.
 
 See [ldk-server compatibility](LDK_GAPS.md) for the complete backend boundary.

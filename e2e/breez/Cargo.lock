@@ -3239,6 +3239,7 @@ name = "open-ssp-breez-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "breez-sdk-spark",
  "hex",
  "reqwest",

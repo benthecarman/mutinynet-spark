@@ -15,6 +15,10 @@ operator build must expose the authenticated counter-swap RPC used by the SSP.
 - BOLT11 Lightning sends backed by a verified Spark preimage-swap transfer.
 - BOLT11 Lightning receives with wallet-created preimage shares, an atomic
   operator swap, and a Spark payout before the Lightning claim.
+- BOLT12 Lightning sends with a completed Spark prepayment and an idempotent
+  refund after a final Lightning failure.
+- BOLT12 Lightning receives with an SSP-created offer and a Spark payout after
+  the Lightning payment completes.
 - Durable payment state, event-stream reconnect, and payment reconciliation.
 - Authenticated Spark liquidity deposits and leaf funding.
 
@@ -110,11 +114,12 @@ With the two checkouts at their default paths, run:
 The script always creates a separate Compose project with empty volumes. It
 funds each SSP with 1,000-sat receive leaves, creates bidirectional Lightning
 liquidity, and bootstraps both Breez wallets with 1,500-sat standard BOLT11
-receives. It then makes 1,000-sat Breez payments in both directions. This
-proves that a receive can combine two leaves for the larger invoice and prefer
-an exact leaf when one is available. The test verifies each Spark balance,
-each Breez payment record, both LDK payment records, and the received
-preimages.
+receives. It then makes 1,000-sat Breez payments in both directions. Finally,
+one wallet sends to a BOLT12 offer through its SSP, and another Lightning node
+pays an SSP offer that credits the wallet. This proves that a receive can
+combine two leaves for the larger invoice and prefer an exact leaf when one is
+available. The test verifies each Spark balance, each Breez payment record,
+both LDK payment records, the BOLT12 offer IDs, and the received preimages.
 
 Run `./e2e/e2e.sh` for the supplemental API, idempotency, failure, reconnect,
 restart, concurrency, and shutdown checks.
