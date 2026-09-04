@@ -58,6 +58,8 @@ pub async fn dispatch(
                 "fee_estimate": {
                     "original_value": fee,
                     "original_unit": "SATOSHI",
+                    "preferred_currency_unit": "SATOSHI",
+                    "preferred_currency_value_rounded": fee,
                 }
             }}))
         }
@@ -72,6 +74,8 @@ pub async fn dispatch(
                 "fee_estimate": {
                     "original_value": msat / 1000,
                     "original_unit": "SATOSHI",
+                    "preferred_currency_unit": "SATOSHI",
+                    "preferred_currency_value_rounded": msat / 1000,
                 }
             }}))
         }
@@ -82,7 +86,7 @@ pub async fn dispatch(
         })),
         "CoopExitFeeQuote" | "coop_exit_fee_quote" => {
             let id = Uuid::new_v4().to_string();
-            let sats = |v: u64| json!({"original_value": v, "original_unit": "SATOSHI"});
+            let sats = currency_amount;
             Ok(json!({ "coop_exit_fee_quote": {
                 "quote": {
                     "__typename": "CoopExitFeeQuote",
@@ -169,6 +173,8 @@ pub async fn dispatch(
             if expiry == 0 {
                 return Err("expiry_secs must be positive".to_string());
             }
+            let invoice_expires_at =
+                (chrono::Utc::now() + chrono::Duration::seconds(expiry as i64)).to_rfc3339();
             let inv = crate::backend(&state)
                 .await
                 .create_invoice(amount, &hash, &memo, expiry)
@@ -196,7 +202,8 @@ pub async fn dispatch(
                 &now,
                 json!({"amount_sats": amount, "payment_hash": hash,
                        "invoice": inv.invoice, "network": state.config.network,
-                       "expiry_secs": expiry}),
+                       "expiry_secs": expiry,
+                       "invoice_expires_at": invoice_expires_at}),
                 None,
             )
             .await?;
@@ -217,9 +224,9 @@ pub async fn dispatch(
                         "encoded_invoice": inv.invoice,
                         "bitcoin_network": state.config.network,
                         "payment_hash": hash,
-                        "amount": {"original_value": amount, "original_unit": "SATOSHI"},
+                        "amount": currency_amount(amount),
                         "created_at": now,
-                        "expires_at": null,
+                        "expires_at": invoice_expires_at,
                         "memo": memo,
                     },
                     "status": "INVOICE_CREATED",
@@ -398,12 +405,12 @@ pub async fn dispatch(
                     "updated_at": now,
                     "network": network,
                     "status": "CREATED",
-                    "total_amount": {"original_value": total, "original_unit": "SATOSHI"},
-                    "target_amount": {"original_value": target, "original_unit": "SATOSHI"},
-                    "fee": {"original_value": fee, "original_unit": "SATOSHI"},
+                    "total_amount": currency_amount(total),
+                    "target_amount": currency_amount(target),
+                    "fee": currency_amount(fee),
                     "inbound_transfer": {
                         "__typename": "Transfer",
-                        "total_amount": {"original_value": total, "original_unit": "SATOSHI"},
+                        "total_amount": currency_amount(total),
                         "spark_id": inbound_id,
                         "user_request": {"id": rec["id"]},
                     },
@@ -543,8 +550,8 @@ pub async fn dispatch(
                     "created_at": now,
                     "updated_at": now,
                     "network": state.config.network,
-                    "fee": {"original_value": 1000, "original_unit": "SATOSHI"},
-                    "l1_broadcast_fee": {"original_value": 500, "original_unit": "SATOSHI"},
+                    "fee": currency_amount(1000),
+                    "l1_broadcast_fee": currency_amount(500),
                     "fee_quote": null,
                     "exit_speed": exit_speed,
                     "status": "CREATED",
@@ -622,10 +629,9 @@ pub async fn dispatch(
                 };
                 json!({
                     "__typename": "Transfer",
-                    "total_amount": {
-                        "original_value": t.get("total_amount_sats").and_then(Value::as_u64).unwrap_or(0),
-                        "original_unit": "SATOSHI"
-                    },
+                    "total_amount": currency_amount(
+                        t.get("total_amount_sats").and_then(Value::as_u64).unwrap_or(0)
+                    ),
                     "spark_id": t.get("spark_id").cloned().unwrap_or(Value::Null),
                     "user_request": {
                         "__typename": request_typename,
@@ -800,7 +806,7 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
         .and_then(|v| v.as_str())
         .unwrap_or(&state.config.network)
         .to_string();
-    let sats = |v: u64| json!({"original_value": v, "original_unit": "SATOSHI"});
+    let sats = currency_amount;
     match kind {
         "LIGHTNING_SEND" => {
             let pid = p.get("payment_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -861,7 +867,12 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
                     "bitcoin_network": net,
                     "payment_hash": p.get("payment_hash").cloned().unwrap_or(Value::Null),
                     "amount": sats(amount),
-                    "created_at": created, "expires_at": null, "memo": null,
+                    "created_at": created,
+                    "expires_at": p
+                        .get("invoice_expires_at")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(created.clone())),
+                    "memo": null,
                 },
                 "status": status,
                 "transfer": transfer,
@@ -949,7 +960,7 @@ async fn send_response_from_record(
             "updated_at": now,
             "network": state.config.network,
             "encoded_invoice": p.get("encoded_invoice").cloned().unwrap_or(Value::Null),
-            "fee": {"original_value": 0, "original_unit": "SATOSHI"},
+            "fee": currency_amount(0),
             "idempotency_key": p.get("idempotency_key").cloned().unwrap_or(Value::Null),
             "status": status,
         }
@@ -1076,6 +1087,14 @@ fn opt_num(v: &Value, k: &str) -> Option<u64> {
     v.get(k)
         .and_then(|x| x.as_u64().or_else(|| x.as_str()?.parse().ok()))
 }
+fn currency_amount(value: u64) -> Value {
+    json!({
+        "original_value": value,
+        "original_unit": "SATOSHI",
+        "preferred_currency_unit": "SATOSHI",
+        "preferred_currency_value_rounded": value,
+    })
+}
 fn ids_of(input: &Value, root: &Value) -> Vec<String> {
     for v in [input, root] {
         if let Some(a) = v.get("transfer_spark_ids").and_then(|x| x.as_array()) {
@@ -1111,7 +1130,7 @@ async fn sign_with_ssp(state: &AppState, message: &str) -> Result<String, String
 
 #[cfg(test)]
 mod tests {
-    use super::str_of;
+    use super::{currency_amount, str_of};
     use serde_json::json;
 
     #[test]
@@ -1127,5 +1146,15 @@ mod tests {
         assert_eq!(str_of(&input, "object"), "");
         assert_eq!(str_of(&input, "string"), "value");
         assert_eq!(str_of(&input, "number"), "42");
+    }
+
+    #[test]
+    fn currency_amount_includes_required_preferred_fields() {
+        let amount = currency_amount(100);
+
+        assert_eq!(amount["original_value"], 100);
+        assert_eq!(amount["original_unit"], "SATOSHI");
+        assert_eq!(amount["preferred_currency_unit"], "SATOSHI");
+        assert_eq!(amount["preferred_currency_value_rounded"], 100);
     }
 }
