@@ -100,8 +100,12 @@ export async function assertLiveHealth() {
 }
 
 export function walletOptions(health) {
+  const configuredNetwork = String(
+    process.env.SPARK_NETWORK ?? health.network ?? "LOCAL",
+  ).toUpperCase();
+  const network = configuredNetwork === "REGTEST" ? "LOCAL" : configuredNetwork;
   return {
-    network: "LOCAL",
+    network,
     sspClientOptions: {
       baseUrl: SSP_BASE_URL,
       identityPublicKey: health.ssp_identity_pubkey,

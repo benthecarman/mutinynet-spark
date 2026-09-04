@@ -13,7 +13,8 @@ operator build must expose the authenticated counter-swap RPC used by the SSP.
 - Wallet challenge authentication and durable 24-hour sessions.
 - Partial Spark transfers through atomic Swap V3 counter transfers.
 - BOLT11 Lightning sends backed by a verified Spark preimage-swap transfer.
-- BOLT11 Lightning receives with an SSP-held preimage and a Spark payout.
+- BOLT11 Lightning receives with wallet-created preimage shares, an atomic
+  operator swap, and a Spark payout before the Lightning claim.
 - Durable payment state, event-stream reconnect, and payment reconciliation.
 - Authenticated Spark liquidity deposits and exact-leaf funding.
 
@@ -56,23 +57,27 @@ network mapping and accepts the shared TESTNET/SIGNET `lntb` invoice prefix.
 
 ## Local end-to-end test
 
-The test stack contains bitcoind, PostgreSQL, three Spark Operators, two
-`ldk-server` nodes, and the SSP. It needs Docker Compose, Node.js 22, and built
-checkouts of the pinned Spark and `ldk-server` revisions. The CI workflow shows
-the complete checkout and build commands; the revisions are listed in
+The Lightning acceptance stack contains bitcoind, a local Electrs Esplora
+service, PostgreSQL, three Spark Operators, two `ldk-server` nodes, two SSP
+instances, and two Breez SDK wallets. It needs Docker Compose, Rust, and
+checkouts of the pinned Spark and `ldk-server` revisions. The
+revisions are listed in
 [the fixture README](e2e/upstream/README.md).
 
 With the two checkouts at their default paths, run:
 
 ```sh
-./e2e/e2e.sh
-curl --fail http://127.0.0.1:5000/health
+./e2e/ln-e2e.sh
 ```
 
-The suite verifies Spark deposit and transfer, atomic swap state, Lightning
-send and receive, idempotency, authorization failures, expiry, an idle event
-stream, LDK reconnect, restart reconciliation, concurrent receives, and a
-graceful SSP stop.
+The script always creates a separate Compose project with empty volumes. It
+funds exact SSP leaves, creates bidirectional Lightning liquidity, bootstraps
+both Breez wallets through standard BOLT11 receives, and then makes two Breez
+payments in opposite directions. It verifies each Spark balance, each Breez
+payment record, both LDK payment records, and the received preimages.
+
+Run `./e2e/e2e.sh` for the supplemental API, idempotency, failure, reconnect,
+restart, concurrency, and shutdown checks.
 
 ## Deployment
 

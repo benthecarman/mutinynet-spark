@@ -11,6 +11,19 @@ pub struct Db {
     inner: Arc<Mutex<rusqlite::Connection>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LightningReceive {
+    pub request_id: String,
+    pub owner: String,
+    pub receiver: String,
+    pub amount_sats: u64,
+    pub invoice: String,
+    pub status: String,
+    pub transfer_id: Option<String>,
+    pub preimage: Option<String>,
+    pub claim_submitted: bool,
+}
+
 impl Db {
     pub fn open(data_dir: &str) -> Result<Self, String> {
         std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
@@ -27,7 +40,7 @@ impl Db {
              CREATE TABLE IF NOT EXISTS transfers(spark_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS preimages(hash TEXT PRIMARY KEY, preimage TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00');
              CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, status TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS receive_payments(hash TEXT PRIMARY KEY, status TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS receive_payments(hash TEXT PRIMARY KEY, status TEXT NOT NULL, transfer_id TEXT, preimage TEXT, claimable_amount_msat INTEGER, claim_submitted INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS static_quotes(txid TEXT NOT NULL, vout INTEGER NOT NULL, credit INTEGER NOT NULL, signature TEXT NOT NULL, created_at TEXT NOT NULL, claimed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(txid, vout));",
         )
         .map_err(|e| e.to_string())?;
@@ -85,6 +98,43 @@ impl Db {
         {
             conn.execute(
                 "ALTER TABLE static_quotes ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if conn
+            .prepare("SELECT transfer_id FROM receive_payments LIMIT 0")
+            .is_err()
+        {
+            conn.execute(
+                "ALTER TABLE receive_payments ADD COLUMN transfer_id TEXT",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if conn
+            .prepare("SELECT preimage FROM receive_payments LIMIT 0")
+            .is_err()
+        {
+            conn.execute("ALTER TABLE receive_payments ADD COLUMN preimage TEXT", [])
+                .map_err(|e| e.to_string())?;
+        }
+        if conn
+            .prepare("SELECT claimable_amount_msat FROM receive_payments LIMIT 0")
+            .is_err()
+        {
+            conn.execute(
+                "ALTER TABLE receive_payments ADD COLUMN claimable_amount_msat INTEGER",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if conn
+            .prepare("SELECT claim_submitted FROM receive_payments LIMIT 0")
+            .is_err()
+        {
+            conn.execute(
+                "ALTER TABLE receive_payments ADD COLUMN claim_submitted INTEGER NOT NULL DEFAULT 0",
                 [],
             )
             .map_err(|e| e.to_string())?;
@@ -317,21 +367,117 @@ impl Db {
     pub async fn lightning_receive_for_hash(
         &self,
         payment_hash: &str,
-    ) -> Result<Option<(String, String, u64)>, String> {
+    ) -> Result<Option<LightningReceive>, String> {
         self.with(|c| {
             c.query_row(
-                "SELECT id, owner, json_extract(payload, '$.amount_sats')
-                 FROM requests
-                 WHERE kind='LIGHTNING_RECEIVE'
-                   AND json_extract(payload, '$.payment_hash')=?1
+                "SELECT r.id, r.owner,
+                        COALESCE(json_extract(r.payload, '$.receiver_identity_pubkey'), r.owner),
+                        json_extract(r.payload, '$.amount_sats'),
+                        COALESCE(json_extract(r.payload, '$.invoice'), ''),
+                        COALESCE(p.status, 'INVOICE_CREATED'), p.transfer_id,
+                        p.preimage, COALESCE(p.claim_submitted, 0)
+                 FROM requests r
+                 LEFT JOIN receive_payments p ON p.hash=?1
+                 WHERE r.kind='LIGHTNING_RECEIVE'
+                   AND json_extract(r.payload, '$.payment_hash')=?1
                  LIMIT 1",
                 (payment_hash,),
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok(LightningReceive {
+                        request_id: row.get(0)?,
+                        owner: row.get(1)?,
+                        receiver: row.get(2)?,
+                        amount_sats: row.get(3)?,
+                        invoice: row.get(4)?,
+                        status: row.get(5)?,
+                        transfer_id: row.get(6)?,
+                        preimage: row.get(7)?,
+                        claim_submitted: row.get::<_, i64>(8)? != 0,
+                    })
+                },
             )
             .map(Some)
             .or_else(|error| match error {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 error => Err(error),
+            })
+        })
+        .await
+    }
+
+    pub async fn mark_receive_claimable(&self, hash: &str, amount_msat: u64) -> Result<(), String> {
+        let amount_msat = i64::try_from(amount_msat)
+            .map_err(|_| "claimable amount is too large for storage".to_string())?;
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO receive_payments(hash,status,claimable_amount_msat)
+                 VALUES(?1,'HTLC_RECEIVED',?2)
+                 ON CONFLICT(hash) DO UPDATE SET
+                   status=CASE
+                     WHEN receive_payments.status IN ('TRANSFER_COMPLETED','HTLC_FAILED')
+                       OR receive_payments.transfer_id IS NOT NULL
+                     THEN receive_payments.status
+                     ELSE 'HTLC_RECEIVED'
+                   END,
+                   claimable_amount_msat=excluded.claimable_amount_msat",
+                (hash, amount_msat),
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Persist the operator result and its GraphQL transfer row together.
+    pub async fn commit_lightning_receive_swap(
+        &self,
+        hash: &str,
+        transfer_id: &str,
+        preimage: &str,
+        request_id: &str,
+        owner: &str,
+    ) -> Result<(), String> {
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            let changed = tx.execute(
+                "INSERT INTO transfers(spark_id,request_id,kind,status,owner)
+                 VALUES(?1,?2,'LIGHTNING_RECEIVE','TRANSFER_CREATED',?3)
+                 ON CONFLICT(spark_id) DO UPDATE SET
+                   status=excluded.status
+                 WHERE transfers.owner=excluded.owner
+                   AND transfers.request_id=excluded.request_id",
+                (transfer_id, request_id, owner),
+            )?;
+            if changed != 1 {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            tx.execute(
+                "INSERT INTO receive_payments(hash,status,transfer_id,preimage)
+                 VALUES(?1,'PAYMENT_PREIMAGE_RECOVERED',?2,?3)
+                 ON CONFLICT(hash) DO UPDATE SET
+                   status='PAYMENT_PREIMAGE_RECOVERED',
+                   transfer_id=excluded.transfer_id,
+                   preimage=excluded.preimage",
+                (hash, transfer_id, preimage),
+            )?;
+            tx.commit()
+        })
+        .await
+    }
+
+    pub async fn mark_receive_claim_submitted(&self, hash: &str) -> Result<(), String> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE receive_payments
+                 SET claim_submitted=1, status='PAYMENT_PREIMAGE_RECOVERED'
+                 WHERE hash=?1 AND transfer_id IS NOT NULL AND preimage IS NOT NULL",
+                (hash,),
+            )
+            .and_then(|changed| {
+                if changed == 1 {
+                    Ok(())
+                } else {
+                    Err(rusqlite::Error::QueryReturnedNoRows)
+                }
             })
         })
         .await
@@ -605,7 +751,12 @@ impl Db {
                  LEFT JOIN receive_payments p
                    ON p.hash=json_extract(r.payload, '$.payment_hash')
                  WHERE r.kind='LIGHTNING_RECEIVE'
-                   AND COALESCE(p.status, '') NOT IN ('TRANSFER_COMPLETED','HTLC_FAILED')",
+                   AND COALESCE(p.status, '') NOT IN ('TRANSFER_COMPLETED','HTLC_FAILED')
+                   AND p.transfer_id IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM transfers t
+                     WHERE t.request_id=r.id AND t.kind='LIGHTNING_RECEIVE'
+                   )",
             )?;
             let rows =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
@@ -805,7 +956,17 @@ mod tests {
 
         assert_eq!(
             db.lightning_receive_for_hash("hash").await.unwrap(),
-            Some(("request".to_string(), "owner".to_string(), 1234))
+            Some(LightningReceive {
+                request_id: "request".to_string(),
+                owner: "owner".to_string(),
+                receiver: "owner".to_string(),
+                amount_sats: 1234,
+                invoice: String::new(),
+                status: "INVOICE_CREATED".to_string(),
+                transfer_id: None,
+                preimage: None,
+                claim_submitted: false,
+            })
         );
         assert_eq!(
             db.transfer_for_request("request", "owner").await.unwrap(),

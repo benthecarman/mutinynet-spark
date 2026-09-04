@@ -11,7 +11,7 @@ dir_path = "/data"
 level = "Info"
 
 [tls]
-hosts = ["ldk-server"]
+hosts = ["ldk-server-2", "localhost"]
 
 [bitcoind]
 rpc_address = "bitcoind:8332"

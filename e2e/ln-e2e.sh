@@ -1,171 +1,136 @@
 #!/bin/bash
-# Full Lightning test suite for the SSP. The compose stack must be running.
+# Hermetic Lightning E2E with two Breez SDK wallets and two SSP instances.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-COMPOSE=(docker compose -f docker-compose.regtest.yml)
-export SPARK_ADMIN_TOKEN="${SPARK_ADMIN_TOKEN:-regtest-spark-admin-token}"
-export SSP_BASE_URL="${SSP_BASE_URL:-http://127.0.0.1:5000}"
-export SPARK_DANGEROUSLY_DISABLE_TLS_VERIFICATION="${SPARK_DANGEROUSLY_DISABLE_TLS_VERIFICATION:-1}"
-export SPARK_REF="${SPARK_REF:-/tmp/opencode/spark-ref}"
-export SDK_REF="${SDK_REF:-$SPARK_REF}"
-export SPARK_SDK_DIST="${SPARK_SDK_DIST:-$SDK_REF/sdks/js/packages/spark-sdk/dist/index.node.js}"
-export LN_RECEIVE_AMOUNT_SATS="${LN_RECEIVE_AMOUNT_SATS:-5000}"
-CONCURRENCY=${LN_RECEIVE_CONCURRENCY:-2}
-RECEIVE_CASES=$((CONCURRENCY + 4))
-if [ "$LN_RECEIVE_AMOUNT_SATS" -lt 1000 ]; then
-  echo "LN_RECEIVE_AMOUNT_SATS must be at least 1000 for a Spark leaf" >&2
-  exit 1
-fi
+PROJECT_NAME=${BREEZ_E2E_PROJECT_NAME:-mutinynet-ssp-breez-e2e}
+COMPOSE=(docker compose -p "$PROJECT_NAME" -f docker-compose.regtest.yml)
+export COMPOSE_PROGRESS=${COMPOSE_PROGRESS:-plain}
+export COMPOSE_BAKE=${COMPOSE_BAKE:-false}
+export SPARK_ADMIN_TOKEN=${SPARK_ADMIN_TOKEN:-regtest-spark-admin-token}
+SPARK_SOURCE_REF=${SPARK_REF:-/tmp/opencode/spark-ref}
+export LDK_SERVER_REF=${LDK_SERVER_REF:-/tmp/opencode/ldk-server-ref}
+export BITCOIN_RPC_USER=${BITCOIN_RPC_USER:-testutil}
+export BITCOIN_RPC_PASSWORD=${BITCOIN_RPC_PASSWORD:-testutilpassword}
+export BITCOIN_RPC_WALLET=${BITCOIN_RPC_WALLET:-default}
+export BITCOIN_RPC_URL=${BITCOIN_RPC_URL:-http://127.0.0.1:8332}
+export BREEZ_CHAIN_SERVICE_URL=${BREEZ_CHAIN_SERVICE_URL:-http://127.0.0.1:30000}
+
+command -v docker >/dev/null
+command -v git >/dev/null
+command -v cargo >/dev/null
+test -d "$SPARK_SOURCE_REF"
+test -d "$LDK_SERVER_REF"
+
+TLS_DIR=$(mktemp -d)
+SPARK_WORKTREE_ROOT=$(mktemp -d)
+SPARK_CLEAN_REF="$SPARK_WORKTREE_ROOT/spark"
+SPARK_COMMIT=${SPARK_OPERATOR_COMMIT:-HEAD}
+SPARK_WORKTREE_READY=0
+KEEP_STACK=${KEEP_BREEZ_E2E_STACK:-0}
+
+cleanup() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "=== Breez Lightning E2E failure logs ===" >&2
+    "${COMPOSE[@]}" ps -a >&2 || true
+    "${COMPOSE[@]}" logs --tail=250 \
+      spark-operator-0 spark-operator-1 spark-operator-2 \
+      ldk-server ldk-server-2 ssp ssp-2 >&2 || true
+  fi
+  rm -rf "$TLS_DIR"
+  if [ "$KEEP_STACK" != "1" ]; then
+    "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  fi
+  if [ "$SPARK_WORKTREE_READY" = "1" ]; then
+    git -C "$SPARK_SOURCE_REF" worktree remove --force \
+      "$SPARK_CLEAN_REF" >/dev/null 2>&1 || true
+  fi
+  rmdir "$SPARK_WORKTREE_ROOT" >/dev/null 2>&1 || true
+  exit "$status"
+}
+trap cleanup EXIT
+
+git -C "$SPARK_SOURCE_REF" worktree add --detach \
+  "$SPARK_CLEAN_REF" "$SPARK_COMMIT" >/dev/null
+SPARK_WORKTREE_READY=1
+export SPARK_REF=$SPARK_CLEAN_REF
+
+echo "=== reset isolated regtest stack ==="
+echo "Spark operator commit: $(git -C "$SPARK_REF" rev-parse HEAD)"
+"${COMPOSE[@]}" down -v --remove-orphans
+
+echo "=== start Bitcoin, operators, and Lightning nodes ==="
+"${COMPOSE[@]}" up --build -d \
+  postgres bitcoind bitcoin-init bitcoin-miner electrs cert-init \
+  spark-operator-0 spark-operator-1 spark-operator-2 \
+  ldk-server ldk-server-2
+
+echo "=== wait for the local chain service ==="
+for attempt in $(seq 1 120); do
+  if curl --fail --silent "$BREEZ_CHAIN_SERVICE_URL/blocks/tip/height" >/dev/null; then
+    break
+  fi
+  if [ "$attempt" = "120" ]; then
+    echo "Electrs did not become ready" >&2
+    exit 1
+  fi
+  sleep 2
+done
+
+echo "=== wait for Spark signing keyshares ==="
+for attempt in $(seq 1 120); do
+  ready=1
+  for index in 0 1 2; do
+    count=$("${COMPOSE[@]}" exec -T postgres psql \
+      -U postgres -d "sparkoperator_${index}" -tAc \
+      "SELECT count(*) FROM signing_keyshares WHERE status = 'AVAILABLE';" \
+      2>/dev/null || true)
+    count=$(echo "$count" | tr -d '[:space:]')
+    case "$count" in
+      ''|*[!0-9]*|0) ready=0 ;;
+    esac
+  done
+  if [ "$ready" = "1" ]; then
+    break
+  fi
+  if [ "$attempt" = "120" ]; then
+    echo "Spark signing keyshares did not become ready" >&2
+    exit 1
+  fi
+  sleep 5
+done
+
+echo "=== start both SSP instances ==="
+"${COMPOSE[@]}" build ssp
+"${COMPOSE[@]}" up --no-build --no-deps -d ssp ssp-2
+for port in 5000 5001; do
+  for attempt in $(seq 1 90); do
+    if curl --fail --silent "http://127.0.0.1:${port}/health" >/dev/null; then
+      break
+    fi
+    if [ "$attempt" = "90" ]; then
+      echo "SSP on port ${port} did not become healthy" >&2
+      exit 1
+    fi
+    sleep 4
+  done
+done
 
 LDK1=$("${COMPOSE[@]}" ps -q ldk-server)
 LDK2=$("${COMPOSE[@]}" ps -q ldk-server-2)
-BITCOIND=$("${COMPOSE[@]}" ps -q bitcoind)
-SSP=$("${COMPOSE[@]}" ps -q ssp)
-if [ -z "$LDK1" ] || [ -z "$LDK2" ] || [ -z "$BITCOIND" ] || [ -z "$SSP" ]; then
-  echo "compose services are not running" >&2
+if [ -z "$LDK1" ] || [ -z "$LDK2" ]; then
+  echo "Lightning containers are not running" >&2
   exit 1
 fi
-if [ ! -f "$SPARK_SDK_DIST" ]; then
-  echo "Spark SDK is not built at $SPARK_SDK_DIST" >&2
-  exit 1
-fi
-export LDK1_CONTAINER="$LDK1"
-export LDK2_CONTAINER="$LDK2"
-export SSP_CONTAINER="$SSP"
+export LDK1_CONTAINER=$LDK1
+export LDK2_CONTAINER=$LDK2
 
-failure_logs() {
-  local status=$?
-  if [ "$status" -ne 0 ]; then
-    echo "=== Lightning e2e failure logs ===" >&2
-    "${COMPOSE[@]}" logs --tail=150 ssp ldk-server ldk-server-2 >&2 || true
-  fi
-  exit "$status"
-}
-trap failure_logs EXIT
-
-ldk_key() {
-  docker exec "$1" sh -c "od -A n -t x1 /data/regtest/api_key | tr -d ' \\n'"
-}
-LDK1_KEY=$(ldk_key "$LDK1")
-LDK2_KEY=$(ldk_key "$LDK2")
-CLI1=(timeout 60 docker exec "$LDK1" ldk-server-cli --base-url localhost:3536 --api-key "$LDK1_KEY" --tls-cert /data/tls.crt)
-CLI2=(timeout 60 docker exec "$LDK2" ldk-server-cli --base-url localhost:3536 --api-key "$LDK2_KEY" --tls-cert /data/tls.crt)
-BTC=(timeout 60 docker exec "$BITCOIND" bitcoin-cli -regtest -rpcuser=testutil -rpcpassword=testutilpassword -rpcport=8332)
-
-json_field() {
-  local expression=$1
-  shift
-  node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);const v=($expression);process.stdout.write(String(v??''))})" "$@"
-}
-
-wait_until() {
-  local label=$1
-  local attempts=$2
-  shift 2
-  for _ in $(seq 1 "$attempts"); do
-    if "$@"; then
-      echo "$label"
-      return 0
-    fi
-    sleep 5
-  done
-  echo "timed out: $label" >&2
-  return 1
-}
-
-node_info_ready() {
-  "${CLI1[@]}" get-node-info >/dev/null 2>&1
-}
-
-node1_funded() {
-  local balance
-  balance=$("${CLI1[@]}" get-balances 2>/dev/null | json_field 'j.spendable_onchain_balance_sats') || return 1
-  [ "${balance:-0}" -gt 100000000 ]
-}
-
-channel_ready() {
-  "${CLI1[@]}" list-channels 2>/dev/null | node -e '
-    let s="";
-    process.stdin.on("data", d => s += d).on("end", () => {
-      const peer = process.argv[1];
-      const channels = JSON.parse(s).channels ?? [];
-      process.exit(channels.some(c => c.counterparty_node_id === peer && c.is_channel_ready) ? 0 : 1);
-    });
-  ' "$ID2"
-}
-
-node2_outbound_ready() {
-  local balance
-  balance=$("${CLI2[@]}" get-balances 2>/dev/null | json_field 'j.total_lightning_balance_sats') || return 1
-  [ "${balance:-0}" -ge 500000 ]
-}
-
-echo "=== prepare Lightning nodes ==="
-ID1=$("${CLI1[@]}" get-node-info | json_field 'j.node_id')
-ID2=$("${CLI2[@]}" get-node-info | json_field 'j.node_id')
-[ -n "$ID1" ] && [ -n "$ID2" ] || { echo "LDK node IDs are missing" >&2; exit 1; }
-echo "node1: $ID1"
-echo "node2: $ID2"
-
-A1=$("${CLI1[@]}" onchain-receive | json_field 'j.address')
-A2=$("${CLI2[@]}" onchain-receive | json_field 'j.address')
-"${BTC[@]}" -rpcwallet=default sendtoaddress "$A1" 2 >/dev/null
-"${BTC[@]}" -rpcwallet=default sendtoaddress "$A2" 1 >/dev/null
-MINER_ADDR=$("${BTC[@]}" -rpcwallet=default getnewaddress)
-"${BTC[@]}" generatetoaddress 6 "$MINER_ADDR" >/dev/null
-wait_until "node1 on-chain balance is ready" 60 node1_funded
-
-"${CLI1[@]}" connect-peer "$ID2" ldk-server-2:9735 --persist >/dev/null 2>&1 || true
-CHANNEL_COUNT=$("${CLI1[@]}" list-channels | json_field '(j.channels??[]).filter(c=>c.counterparty_node_id===process.argv[1]).length' "$ID2")
-if [ "${CHANNEL_COUNT:-0}" -eq 0 ]; then
-  "${CLI1[@]}" open-channel "$ID2" ldk-server-2:9735 2000000sat >/dev/null
-  "${BTC[@]}" generatetoaddress 6 "$MINER_ADDR" >/dev/null
-fi
-wait_until "exact node1-to-node2 channel is ready" 60 channel_ready
-
-if ! node2_outbound_ready; then
-  INV2=$("${CLI2[@]}" bolt11-receive 500000sat -d bootstrap | json_field 'j.invoice')
-  "${CLI1[@]}" bolt11-send "$INV2" >/dev/null
-fi
-wait_until "node2 outbound Lightning balance is ready" 60 node2_outbound_ready
-
-echo "=== provision exact Spark receive liquidity ==="
-FUND_LADDER="$LN_RECEIVE_AMOUNT_SATS" \
-  FUND_MULTIPLICITY="$RECEIVE_CASES" \
-  node e2e/fund-ssp.mjs
-
-echo "=== public SDK receive ==="
-node e2e/ln-receive.mjs
-
-echo "=== public SDK send and idempotent retry ==="
-node e2e/ln-send.mjs
-
-echo "=== authorization, validation, funding, and expiry failures ==="
-node e2e/ln-negative.mjs
-
-IDLE_SECONDS=${LN_STREAM_IDLE_SECONDS:-95}
-echo "=== event stream idle test (${IDLE_SECONDS}s) ==="
-sleep "$IDLE_SECONDS"
-node e2e/ln-receive.mjs
-
-echo "=== LDK restart and stream reconnect ==="
-docker restart "$LDK1" >/dev/null
-wait_until "LDK server is ready after restart" 60 node_info_ready
-wait_until "channel is ready after LDK restart" 60 channel_ready
-node e2e/ln-receive.mjs
-
-echo "=== missed-event reconciliation after SSP restart ==="
-node e2e/ln-reconcile.mjs
-
-echo "=== concurrent receive requests ==="
-pids=()
-for _ in $(seq 1 "$CONCURRENCY"); do
-  node e2e/ln-receive.mjs &
-  pids+=("$!")
+echo "=== copy operator trust certificates ==="
+for index in 0 1 2; do
+  "${COMPOSE[@]}" cp "cert-init:/tls/server_${index}.crt" "$TLS_DIR/server_${index}.crt"
 done
-for pid in "${pids[@]}"; do
-  wait "$pid"
-done
+export BREEZ_OPERATOR_CERT_DIR=$TLS_DIR
 
-echo "LN E2E PASS"
+echo "=== run Breez SDK send and receive ==="
+cargo run --locked --manifest-path e2e/breez/Cargo.toml

@@ -2,6 +2,7 @@ use axum::http::HeaderMap;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::{auth, ldk::LdkBackend, AppState, GraphqlRequest};
@@ -167,6 +168,19 @@ pub async fn dispatch(
             if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err("payment_hash must be 32 bytes hex".to_string());
             }
+            if state.db.lightning_receive_for_hash(&hash).await?.is_some() {
+                return Err("payment_hash already has a Lightning receive request".to_string());
+            }
+            let requested_receiver = str_of(&input, "receiver_identity_pubkey");
+            let receiver = if requested_receiver.is_empty() {
+                owner.clone()
+            } else {
+                secp256k1::PublicKey::from_str(&requested_receiver)
+                    .map_err(|_| {
+                        "receiver_identity_pubkey must be a compressed public key".to_string()
+                    })?
+                    .to_string()
+            };
             let memo = str_of(&input, "memo");
             let expiry = u32::try_from(opt_num(&input, "expiry_secs").unwrap_or(86_400))
                 .map_err(|_| "expiry_secs is out of range".to_string())?;
@@ -180,10 +194,9 @@ pub async fn dispatch(
                 .create_invoice(amount, &hash, &memo, expiry)
                 .await
                 .map_err(|e| format!("ldk create_invoice: {e}"))?;
-            // SSP-owned preimage (minted via mint_preimage): split into FROST
-            // shares, encrypt per operator, store via the coordinator with
-            // owner = SSP identity (attestor == holder, SO's own rule).
-            // Wallet-owned hashes skip this (preimage unknown here).
+            // The explicit SSP-minted HODL extension still stores its own
+            // shares. A standard SDK receive stores wallet-created shares in
+            // the SDK after this invoice has been validated.
             if state
                 .db
                 .get_preimage_for_owner(&hash, &owner)
@@ -203,6 +216,7 @@ pub async fn dispatch(
                 json!({"amount_sats": amount, "payment_hash": hash,
                        "invoice": inv.invoice, "network": state.config.network,
                        "expiry_secs": expiry,
+                       "receiver_identity_pubkey": receiver.clone(),
                        "invoice_expires_at": invoice_expires_at}),
                 None,
             )
@@ -231,7 +245,7 @@ pub async fn dispatch(
                     },
                     "status": "INVOICE_CREATED",
                     "transfer": null,
-                    "receiver_identity_public_key": owner,
+                    "receiver_identity_public_key": receiver,
                 }
             }}))
         }
@@ -621,25 +635,20 @@ pub async fn dispatch(
             let owner = auth::require_session(&state, headers).await?;
             let ids = ids_of(&input, v);
             let rows = state.db.transfers_for(&ids, &owner).await?;
-            let map_row = |t: &Value| {
-                let request_typename = match t.get("type").and_then(Value::as_str) {
-                    Some("PREIMAGE_SWAP") => "LightningSendRequest",
-                    Some("COOP_EXIT") => "CoopExitRequest",
-                    _ => "LeavesSwapRequest",
-                };
-                json!({
-                    "__typename": "Transfer",
-                    "total_amount": currency_amount(
-                        t.get("total_amount_sats").and_then(Value::as_u64).unwrap_or(0)
-                    ),
-                    "spark_id": t.get("spark_id").cloned().unwrap_or(Value::Null),
-                    "user_request": {
-                        "__typename": request_typename,
-                        "id": t.get("user_request_id").cloned().unwrap_or(Value::Null),
-                    },
-                })
-            };
-            let list: Vec<Value> = rows.iter().map(map_row).collect();
+            let mut list = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let request_id = row
+                    .get("user_request_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "transfer has no user request id".to_string())?;
+                let request = state
+                    .db
+                    .get_request(request_id, &owner)
+                    .await?
+                    .ok_or_else(|| format!("transfer request {request_id} was not found"))?;
+                let user_request = user_request_union(&state, &request).await;
+                list.push(transfer_response(row, user_request));
+            }
             Ok(json!({ "transfers": list }))
         }
         "UserRequest" | "user_request" => {
@@ -843,6 +852,13 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
                 .receive_status(payment_hash)
                 .await
                 .unwrap_or_else(|_| "INVOICE_CREATED".to_string());
+            let preimage = state
+                .db
+                .lightning_receive_for_hash(payment_hash)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|receive| receive.preimage);
             let transfer = state
                 .db
                 .transfer_for_request(request_id, owner)
@@ -854,7 +870,10 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
                         "__typename": "Transfer",
                         "total_amount": sats(amount),
                         "spark_id": spark_id,
-                        "user_request": {"id": request_id},
+                        "user_request": {
+                            "__typename": "LightningReceiveRequest",
+                            "id": request_id,
+                        },
                     })
                 });
             json!({
@@ -876,7 +895,11 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
                 },
                 "status": status,
                 "transfer": transfer,
-                "receiver_identity_public_key": owner,
+                "payment_preimage": preimage,
+                "receiver_identity_public_key": p
+                    .get("receiver_identity_pubkey")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(owner.to_string())),
             })
         }
         "LEAVES_SWAP" => {
@@ -932,6 +955,19 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
         }),
         _ => Value::Null,
     }
+}
+
+fn transfer_response(row: &Value, user_request: Value) -> Value {
+    json!({
+        "__typename": "Transfer",
+        "total_amount": currency_amount(
+            row.get("total_amount_sats")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        ),
+        "spark_id": row.get("spark_id").cloned().unwrap_or(Value::Null),
+        "user_request": user_request,
+    })
 }
 
 /// Build the request_lightning_send response from a stored LIGHTNING_SEND
@@ -1069,12 +1105,15 @@ fn validate_sats(amount: u64) -> Result<(), String> {
 }
 
 fn validate_network(state: &AppState, requested: &str) -> Result<(), String> {
-    if requested == state.config.network {
+    validate_network_name(&state.config.network, requested)
+}
+
+fn validate_network_name(configured: &str, requested: &str) -> Result<(), String> {
+    if requested == configured {
         Ok(())
     } else {
         Err(format!(
-            "network mismatch: configured {}, requested {requested}",
-            state.config.network
+            "network mismatch: configured {configured}, requested {requested}"
         ))
     }
 }
@@ -1130,7 +1169,10 @@ async fn sign_with_ssp(state: &AppState, message: &str) -> Result<String, String
 
 #[cfg(test)]
 mod tests {
-    use super::{currency_amount, str_of};
+    use super::{
+        apply_query_aliases, currency_amount, str_of, transfer_response, validate_network_name,
+        validate_sats,
+    };
     use serde_json::json;
 
     #[test]
@@ -1156,5 +1198,48 @@ mod tests {
         assert_eq!(amount["original_unit"], "SATOSHI");
         assert_eq!(amount["preferred_currency_unit"], "SATOSHI");
         assert_eq!(amount["preferred_currency_value_rounded"], 100);
+    }
+
+    #[test]
+    fn receive_network_and_amount_are_validated() {
+        assert!(validate_network_name("REGTEST", "REGTEST").is_ok());
+        assert!(validate_network_name("REGTEST", "MAINNET").is_err());
+        assert!(validate_sats(5_000).is_ok());
+        assert!(validate_sats(0).is_err());
+        assert!(validate_sats(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn transfers_include_the_full_receive_request() {
+        let row = json!({
+            "spark_id": "transfer-id",
+            "total_amount_sats": 5000,
+        });
+        let request = json!({
+            "__typename": "LightningReceiveRequest",
+            "id": "request-id",
+            "status": "TRANSFER_COMPLETED",
+            "payment_preimage": "01".repeat(32),
+            "invoice": {"encoded_invoice": "lnbcrt..."},
+        });
+        let mut transfer = transfer_response(&row, request);
+        apply_query_aliases(
+            &mut transfer,
+            "lightning_request_status: status\nlightning_receive_payment_preimage: payment_preimage",
+        );
+
+        assert_eq!(transfer["spark_id"], "transfer-id");
+        assert_eq!(
+            transfer["user_request"]["lightning_request_status"],
+            "TRANSFER_COMPLETED"
+        );
+        assert_eq!(
+            transfer["user_request"]["lightning_receive_payment_preimage"],
+            "01".repeat(32)
+        );
+        assert_eq!(
+            transfer["user_request"]["invoice"]["encoded_invoice"],
+            "lnbcrt..."
+        );
     }
 }

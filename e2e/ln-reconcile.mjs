@@ -6,7 +6,6 @@ import {
   cleanupWallet,
   initializeWallet,
   ldkJson,
-  mintInvoicePreimage,
   paymentByHash,
   poll,
 } from "./ln-test-helpers.mjs";
@@ -24,13 +23,12 @@ let sspStopped = false;
 try {
   ({ wallet } = await initializeWallet());
   const startingBalance = (await wallet.getBalance()).balance;
-  const paymentHash = await mintInvoicePreimage(wallet);
-  const request = await wallet.createLightningHodlInvoice({
+  const request = await wallet.createLightningInvoice({
     amountSats: AMOUNT_SATS,
-    paymentHash,
     memo: "ssp-reconcile",
     expirySeconds: 300,
   });
+  const paymentHash = request.invoice.paymentHash.toLowerCase();
 
   const stopStartedAt = Date.now();
   execFileSync("docker", ["stop", "--time", "10", SSP], { timeout: 20_000 });

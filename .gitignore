@@ -1,5 +1,6 @@
 /target
 /target/
+/e2e/breez/target/
 data/
 *.sqlite
 *.sqlite-journal

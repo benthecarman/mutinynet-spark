@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, str::FromStr, sync::Arc, time::Duration};
 
 use ldk_server_client::{
     client::LdkServerClient,
@@ -14,16 +14,18 @@ use ldk_server_client::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{config::Config, db::Db, spark::SparkService};
+use crate::{
+    config::Config,
+    db::Db,
+    spark::{LightningReceiveSwap, SparkService},
+};
 
 /// What the SSP needs from Lightning. BOLT11 only (no BOLT12 hold support in
 /// ldk-server, and receives stay BOLT11 by decision).
 ///
-/// Receive model (hodl, SSP-owned preimage): wallets mint a hash via
-/// mint_preimage first and use it in createLightningHodlInvoice. The SSP
-/// holds the preimage before payment (compliant: attestor == holder per
-/// the SO's own rule) and auto-claims on LN arrival. The SO binds invoice
-/// hash deliberately, so the SSP never substitutes hashes.
+/// Standard receives use a wallet-created preimage. The wallet stores its
+/// threshold shares with the Spark Operators, and the SSP redeems them only
+/// through InitiatePreimageSwapV3(REASON_RECEIVE) after PaymentClaimable.
 ///
 /// Send model: `pay_invoice` only INITS (`Bolt11Send`). Final status comes
 /// from `SubscribeEvents` (PaymentSuccessful/PaymentFailed) via
@@ -79,10 +81,19 @@ pub struct CreateInvoiceResult {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub enum LnEvent {
-    OutboundSucceeded { payment: Payment },
-    OutboundFailed { payment_id: String },
-    InboundClaimable { payment_hash: String },
-    InboundReceived { payment_hash: String },
+    OutboundSucceeded {
+        payment: Payment,
+    },
+    OutboundFailed {
+        payment_id: String,
+    },
+    InboundClaimable {
+        payment_hash: String,
+        amount_msat: Option<u64>,
+    },
+    InboundReceived {
+        payment_hash: String,
+    },
 }
 
 /// Runtime backend: live ldk-server when configured and reachable, else fake.
@@ -281,8 +292,14 @@ fn map_envelope(env: ldk_server_client::ldk_server_grpc::events::EventEnvelope) 
             }
         }
         LdkRawEvent::PaymentClaimable(e) => {
-            if let Some(hash) = bolt11_hash(e.payment) {
-                out.push(LnEvent::InboundClaimable { payment_hash: hash });
+            if let Some(payment) = e.payment {
+                let amount_msat = payment.amount_msat;
+                if let Some(hash) = bolt11_hash(Some(payment)) {
+                    out.push(LnEvent::InboundClaimable {
+                        payment_hash: hash,
+                        amount_msat,
+                    });
+                }
             }
         }
         LdkRawEvent::PaymentReceived(e) => {
@@ -304,12 +321,245 @@ fn bolt11_hash(p: Option<ldk_server_client::ldk_server_grpc::types::Payment>) ->
     }
 }
 
+#[async_trait::async_trait]
+trait ReceiveSpark: Send + Sync {
+    async fn swap_receive(
+        &self,
+        owner: &str,
+        payment_hash: &str,
+        invoice: &str,
+        amount_sats: u64,
+    ) -> Result<LightningReceiveSwap, String>;
+}
+
+#[async_trait::async_trait]
+impl ReceiveSpark for SparkService {
+    async fn swap_receive(
+        &self,
+        owner: &str,
+        payment_hash: &str,
+        invoice: &str,
+        amount_sats: u64,
+    ) -> Result<LightningReceiveSwap, String> {
+        self.swap_for_lightning_receive(owner, payment_hash, invoice, amount_sats, 0)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+trait ReceiveLdk: Send + Sync {
+    async fn claim_receive(
+        &self,
+        payment_hash: &str,
+        amount_msat: u64,
+        preimage: &str,
+    ) -> Result<(), String>;
+    async fn fail_receive(&self, payment_hash: &str) -> Result<(), String>;
+}
+
+#[async_trait::async_trait]
+impl ReceiveLdk for LdkServerClient {
+    async fn claim_receive(
+        &self,
+        payment_hash: &str,
+        amount_msat: u64,
+        preimage: &str,
+    ) -> Result<(), String> {
+        self.bolt11_claim_for_hash(Bolt11ClaimForHashRequest {
+            payment_hash: Some(payment_hash.to_string()),
+            claimable_amount_msat: Some(amount_msat),
+            preimage: preimage.to_string(),
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("claim Lightning receive {payment_hash}: {e}"))
+    }
+
+    async fn fail_receive(&self, payment_hash: &str) -> Result<(), String> {
+        self.bolt11_fail_for_hash(Bolt11FailForHashRequest {
+            payment_hash: payment_hash.to_string(),
+        })
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("fail Lightning receive {payment_hash}: {e}"))
+    }
+}
+
+const RECEIVE_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+];
+const RECEIVE_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+
+async fn retry_bounded<T, F, Fut>(mut operation: F, delays: &[Duration]) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    let mut last_error = None;
+    for attempt in 0..=delays.len() {
+        match tokio::time::timeout(RECEIVE_OPERATION_TIMEOUT, operation()).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => last_error = Some("receive operation timed out".to_string()),
+        }
+        if let Some(delay) = delays.get(attempt) {
+            tokio::time::sleep(*delay).await;
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "operation failed without an error".to_string()))
+}
+
+fn validate_receive_preimage(payment_hash: &str, preimage: &str) -> Result<(), String> {
+    let bytes = hex::decode(preimage).map_err(|e| format!("operator preimage is not hex: {e}"))?;
+    if bytes.len() != 32 {
+        return Err("operator preimage must be 32 bytes".to_string());
+    }
+    let digest = hex::encode(Sha256::digest(bytes));
+    if digest != payment_hash.to_lowercase() {
+        return Err("operator preimage does not match the Lightning payment hash".to_string());
+    }
+    Ok(())
+}
+
+fn is_definitive_swap_failure(error: &str) -> bool {
+    [
+        "Insufficient",
+        "insufficient",
+        "Unselectable",
+        "unselectable",
+        "NEEDS_TOPUP",
+        "exact receive amount is unavailable",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
+async fn fail_unfunded_receive<L: ReceiveLdk + ?Sized>(
+    db: &Db,
+    ldk: &L,
+    payment_hash: &str,
+    delays: &[Duration],
+) {
+    match retry_bounded(|| ldk.fail_receive(payment_hash), delays).await {
+        Ok(()) => {
+            let _ = db.set_receive_status(payment_hash, "HTLC_FAILED").await;
+        }
+        Err(error) => tracing::error!(
+            payment_hash,
+            "could not fail unfunded Lightning receive: {error}"
+        ),
+    }
+}
+
+/// Process one claimable receive under a lock shared by the event stream and
+/// reconciler. The database checkpoint separates the operator commit from the
+/// LDK claim, so an LDK retry never repeats the Spark transfer.
+async fn process_standard_receive<S, L>(
+    db: &Db,
+    receive_lock: &tokio::sync::Mutex<()>,
+    spark: &S,
+    ldk: &L,
+    payment_hash: &str,
+    amount_msat: Option<u64>,
+    delays: &[Duration],
+) -> Result<bool, String>
+where
+    S: ReceiveSpark + ?Sized,
+    L: ReceiveLdk + ?Sized,
+{
+    let _guard = receive_lock.lock().await;
+    let Some(mut receive) = db.lightning_receive_for_hash(payment_hash).await? else {
+        return Ok(false);
+    };
+    if receive.status == "TRANSFER_COMPLETED" || receive.status == "HTLC_FAILED" {
+        return Ok(true);
+    }
+    let expected_msat = receive
+        .amount_sats
+        .checked_mul(1000)
+        .ok_or_else(|| "Lightning receive amount is too large".to_string())?;
+    let actual_msat =
+        amount_msat.ok_or_else(|| "claimable Lightning payment has no amount".to_string())?;
+    if actual_msat != expected_msat {
+        fail_unfunded_receive(db, ldk, payment_hash, delays).await;
+        return Err(format!(
+            "claimable amount is {actual_msat} msat; expected {expected_msat} msat"
+        ));
+    }
+    db.mark_receive_claimable(payment_hash, actual_msat).await?;
+
+    if receive.transfer_id.is_none() || receive.preimage.is_none() {
+        let swap = match retry_bounded(
+            || {
+                spark.swap_receive(
+                    &receive.receiver,
+                    payment_hash,
+                    &receive.invoice,
+                    receive.amount_sats,
+                )
+            },
+            delays,
+        )
+        .await
+        {
+            Ok(swap) => swap,
+            Err(error) => {
+                db.set_receive_status(payment_hash, "TRANSFER_CREATION_FAILED")
+                    .await?;
+                // A connection error can hide a successful operator commit.
+                // Leave that HTLC held for reconciliation. Only fail now when
+                // no transfer could have been committed.
+                if is_definitive_swap_failure(&error) {
+                    fail_unfunded_receive(db, ldk, payment_hash, delays).await;
+                }
+                return Err(format!("Spark receive swap failed: {error}"));
+            }
+        };
+        if let Err(error) = validate_receive_preimage(payment_hash, &swap.preimage) {
+            db.set_receive_status(payment_hash, "PAYMENT_PREIMAGE_RECOVERING_FAILED")
+                .await?;
+            return Err(error);
+        }
+        db.commit_lightning_receive_swap(
+            payment_hash,
+            &swap.transfer_id,
+            &swap.preimage,
+            &receive.request_id,
+            &receive.owner,
+        )
+        .await?;
+        receive.transfer_id = Some(swap.transfer_id);
+        receive.preimage = Some(swap.preimage);
+    }
+
+    if receive.claim_submitted {
+        return Ok(true);
+    }
+    let preimage = receive
+        .preimage
+        .as_deref()
+        .ok_or_else(|| "committed Spark receive has no preimage".to_string())?;
+    validate_receive_preimage(payment_hash, preimage)?;
+    retry_bounded(
+        || ldk.claim_receive(payment_hash, expected_msat, preimage),
+        delays,
+    )
+    .await?;
+    db.mark_receive_claim_submitted(payment_hash).await?;
+    Ok(true)
+}
+
 #[derive(Clone)]
 pub struct LdkGrpcBackend {
     pub client: LdkServerClient,
     pub node_id: Option<String>,
     db: Arc<Db>,
     spark: Arc<SparkService>,
+    receive_lock: Arc<tokio::sync::Mutex<()>>,
+    invoice_network: bitcoin::Network,
 }
 
 impl LdkGrpcBackend {
@@ -349,6 +599,8 @@ impl LdkGrpcBackend {
             node_id: Some(info.node_id.clone()),
             db,
             spark,
+            receive_lock: Arc::new(tokio::sync::Mutex::new(())),
+            invoice_network: invoice_network(&config.network)?,
         })
     }
 
@@ -386,43 +638,55 @@ impl LdkGrpcBackend {
             .is_some())
     }
 
-    async fn fund_lightning_receive(&self, payment_hash: &str) -> Result<bool, String> {
-        let Some((request_id, owner, amount_sats)) =
-            self.db.lightning_receive_for_hash(payment_hash).await?
-        else {
+    async fn fund_ssp_owned_receive(&self, payment_hash: &str) -> Result<bool, String> {
+        let Some(receive) = self.db.lightning_receive_for_hash(payment_hash).await? else {
             return Ok(false);
         };
-        if self.preimage_for(payment_hash).await.is_none() {
-            return Ok(false);
-        }
         let transfer_id = self
             .spark
-            .settle_lightning_receive(&owner, payment_hash, amount_sats)
+            .settle_lightning_receive(&receive.receiver, payment_hash, receive.amount_sats)
             .await?;
         self.db
             .insert_transfer(
                 &transfer_id,
-                &request_id,
+                &receive.request_id,
                 "LIGHTNING_RECEIVE",
                 "TRANSFER_COMPLETED",
-                &owner,
+                &receive.owner,
             )
             .await?;
         Ok(true)
     }
 
-    async fn claim_funded_receive(&self, payment_hash: &str) -> Result<bool, String> {
-        if !self.fund_lightning_receive(payment_hash).await? {
+    async fn claim_ssp_owned_receive(
+        &self,
+        payment_hash: &str,
+        amount_msat: Option<u64>,
+    ) -> Result<bool, String> {
+        if !self.fund_ssp_owned_receive(payment_hash).await? {
             return Ok(false);
+        }
+        let receive = self
+            .db
+            .lightning_receive_for_hash(payment_hash)
+            .await?
+            .ok_or_else(|| format!("missing Lightning receive {payment_hash}"))?;
+        let expected_msat = receive
+            .amount_sats
+            .checked_mul(1000)
+            .ok_or_else(|| "Lightning receive amount is too large".to_string())?;
+        if amount_msat != Some(expected_msat) {
+            return Err("claimable amount does not match the SSP-owned invoice".to_string());
         }
         let preimage = self
             .preimage_for(payment_hash)
             .await
             .ok_or_else(|| format!("preimage disappeared for Lightning receive {payment_hash}"))?;
+        validate_receive_preimage(payment_hash, &preimage)?;
         self.client
             .bolt11_claim_for_hash(Bolt11ClaimForHashRequest {
                 payment_hash: Some(payment_hash.to_string()),
-                claimable_amount_msat: None,
+                claimable_amount_msat: Some(expected_msat),
                 preimage,
             })
             .await
@@ -431,14 +695,56 @@ impl LdkGrpcBackend {
     }
 
     async fn finish_received_payment(&self, payment_hash: &str) -> Result<bool, String> {
-        if !self.fund_lightning_receive(payment_hash).await? {
+        let Some(receive) = self.db.lightning_receive_for_hash(payment_hash).await? else {
             return Ok(false);
-        }
+        };
+        let transfer_id = match receive.transfer_id {
+            Some(id) => id,
+            None => self
+                .db
+                .transfer_for_request(&receive.request_id, &receive.owner)
+                .await?
+                .ok_or_else(|| {
+                    format!("Lightning receive {payment_hash} settled before its Spark transfer")
+                })?,
+        };
+        self.db
+            .insert_transfer(
+                &transfer_id,
+                &receive.request_id,
+                "LIGHTNING_RECEIVE",
+                "TRANSFER_COMPLETED",
+                &receive.owner,
+            )
+            .await?;
         self.db
             .set_receive_status(payment_hash, "TRANSFER_COMPLETED")
             .await?;
-        self.db.delete_preimage(payment_hash).await?;
         Ok(true)
+    }
+
+    async fn process_inbound_claimable(
+        &self,
+        payment_hash: &str,
+        amount_msat: Option<u64>,
+    ) -> Result<bool, String> {
+        // Keep the explicit SSP-minted HODL extension isolated. Standard SDK
+        // receives never put their preimage in this table.
+        if self.preimage_for(payment_hash).await.is_some() {
+            return self
+                .claim_ssp_owned_receive(payment_hash, amount_msat)
+                .await;
+        }
+        process_standard_receive(
+            self.db.as_ref(),
+            self.receive_lock.as_ref(),
+            self.spark.as_ref(),
+            &self.client,
+            payment_hash,
+            amount_msat,
+            &RECEIVE_RETRY_DELAYS,
+        )
+        .await
     }
 
     async fn reconcile_payments(&self) -> Result<(), String> {
@@ -493,15 +799,13 @@ impl LdkGrpcBackend {
                             self.db
                                 .set_receive_status(&payment_hash, "HTLC_FAILED")
                                 .await?;
-                            self.db.delete_preimage(&payment_hash).await?;
                         }
                     }
-                    _ => match self.claim_funded_receive(&payment_hash).await {
-                        Ok(true) => {
-                            self.db
-                                .set_receive_status(&payment_hash, "HTLC_RECEIVED")
-                                .await?;
-                        }
+                    _ => match self
+                        .process_inbound_claimable(&payment_hash, payment.amount_msat)
+                        .await
+                    {
+                        Ok(true) => {}
                         Ok(false) => {}
                         Err(error) => tracing::warn!(
                             payment_hash,
@@ -523,13 +827,12 @@ impl LdkGrpcBackend {
             .expired_receive_hashes(chrono::Utc::now().timestamp())
             .await?
         {
-            if self
-                .client
-                .bolt11_fail_for_hash(Bolt11FailForHashRequest {
-                    payment_hash: payment_hash.clone(),
-                })
-                .await
-                .is_ok()
+            if retry_bounded(
+                || self.client.fail_receive(&payment_hash),
+                &RECEIVE_RETRY_DELAYS,
+            )
+            .await
+            .is_ok()
             {
                 self.db
                     .set_receive_status(&payment_hash, "HTLC_FAILED")
@@ -544,6 +847,36 @@ impl LdkGrpcBackend {
 fn sats_to_msats(sats: u64) -> Result<u64, String> {
     sats.checked_mul(1000)
         .ok_or_else(|| "amount_sats is too large".to_string())
+}
+
+fn invoice_network(network: &str) -> Result<bitcoin::Network, String> {
+    match network.to_ascii_uppercase().as_str() {
+        "MAINNET" => Ok(bitcoin::Network::Bitcoin),
+        "TESTNET" => Ok(bitcoin::Network::Testnet),
+        "SIGNET" => Ok(bitcoin::Network::Signet),
+        "REGTEST" | "LOCAL" => Ok(bitcoin::Network::Regtest),
+        _ => Err(format!("unsupported Lightning invoice network {network}")),
+    }
+}
+
+fn validate_created_invoice(
+    invoice: &str,
+    payment_hash: &str,
+    amount_sats: u64,
+    network: bitcoin::Network,
+) -> Result<(), String> {
+    let invoice = lightning_invoice::Bolt11Invoice::from_str(invoice)
+        .map_err(|e| format!("decode created BOLT11 invoice: {e}"))?;
+    if invoice.payment_hash().to_string() != payment_hash.to_lowercase() {
+        return Err("created invoice payment hash does not match the wallet hash".to_string());
+    }
+    if invoice.amount_milli_satoshis() != Some(sats_to_msats(amount_sats)?) {
+        return Err("created invoice amount does not match the requested amount".to_string());
+    }
+    if invoice.network() != network {
+        return Err("created invoice network does not match the SSP network".to_string());
+    }
+    Ok(())
 }
 
 fn description_of(memo: &str) -> Option<Bolt11InvoiceDescription> {
@@ -712,21 +1045,31 @@ impl LdkBackend for LdkGrpcBackend {
         memo: &str,
         expiry_secs: u32,
     ) -> Result<CreateInvoiceResult, String> {
-        // Hodl receive, SSP-owned preimage model: the invoice carries the
-        // hash the wallet registered (minted by the SSP via mint_preimage,
-        // or wallet-supplied). The SSP holds the preimage before payment
-        // and claims on arrival. The SO binds invoice hash deliberately
-        // (ErrPaymentHashMismatch), so the SSP never substitutes hashes.
-        let resp = self
-            .client
-            .bolt11_receive_for_hash(Bolt11ReceiveForHashRequest {
-                amount_msat: Some(sats_to_msats(amount_sats)?),
-                description: description_of(memo),
-                expiry_secs,
-                payment_hash: payment_hash_hex.to_string(),
-            })
-            .await
-            .map_err(|e| e.to_string())?;
+        let request = Bolt11ReceiveForHashRequest {
+            amount_msat: Some(sats_to_msats(amount_sats)?),
+            description: description_of(memo),
+            expiry_secs,
+            payment_hash: payment_hash_hex.to_string(),
+        };
+        let resp = retry_bounded(
+            || {
+                let request = request.clone();
+                async {
+                    self.client
+                        .bolt11_receive_for_hash(request)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            },
+            &RECEIVE_RETRY_DELAYS,
+        )
+        .await?;
+        validate_created_invoice(
+            &resp.invoice,
+            payment_hash_hex,
+            amount_sats,
+            self.invoice_network,
+        )?;
         Ok(CreateInvoiceResult {
             invoice: resp.invoice,
             payment_hash: payment_hash_hex.to_string(),
@@ -813,18 +1156,18 @@ impl LdkBackend for LdkGrpcBackend {
                 }
                 let _ = self.db.set_payment(&payment_id, "FAILED").await;
             }
-            // Self-settling: SSP-minted invoices carry an SSP-held preimage,
-            // so claim immediately (claim_for_hash). Wallet-hash invoices
-            // have no preimage here until revealed via the reveal_preimage
-            // mutation; they wait (expiry fails them back).
-            LnEvent::InboundClaimable { payment_hash } => {
-                match self.claim_funded_receive(&payment_hash).await {
+            LnEvent::InboundClaimable {
+                payment_hash,
+                amount_msat,
+            } => {
+                match self
+                    .process_inbound_claimable(&payment_hash, amount_msat)
+                    .await
+                {
                     Ok(true) => {
-                        let _ = self
-                            .db
-                            .set_receive_status(&payment_hash, "HTLC_RECEIVED")
-                            .await;
-                        tracing::info!("funded and claimed hodl invoice {payment_hash}");
+                        tracing::info!(
+                            "committed Spark receive and submitted LDK claim {payment_hash}"
+                        );
                     }
                     Ok(false) => {}
                     Err(error) => tracing::warn!(
@@ -954,7 +1297,7 @@ impl LdkBackend for FakeLdkBackend {
             LnEvent::OutboundFailed { payment_id } => {
                 let _ = self.db.set_payment(&payment_id, "FAILED").await;
             }
-            LnEvent::InboundClaimable { payment_hash } => {
+            LnEvent::InboundClaimable { payment_hash, .. } => {
                 let _ = self
                     .db
                     .set_receive_status(&payment_hash, "HTLC_RECEIVED")
@@ -977,6 +1320,118 @@ impl LdkBackend for FakeLdkBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex as StdMutex,
+    };
+
+    #[derive(Default)]
+    struct MockSpark {
+        calls: AtomicUsize,
+        failures: AtomicUsize,
+        preimage: String,
+        log: Arc<StdMutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReceiveSpark for MockSpark {
+        async fn swap_receive(
+            &self,
+            _owner: &str,
+            _payment_hash: &str,
+            _invoice: &str,
+            _amount_sats: u64,
+        ) -> Result<LightningReceiveSwap, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.log.lock().unwrap().push("spark");
+            if self
+                .failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                    value.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err("operator unavailable".to_string());
+            }
+            Ok(LightningReceiveSwap {
+                transfer_id: "00000000-0000-4000-8000-000000000001".to_string(),
+                preimage: self.preimage.clone(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct MockLdk {
+        claims: AtomicUsize,
+        failures: AtomicUsize,
+        failed_holds: AtomicUsize,
+        log: Arc<StdMutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReceiveLdk for MockLdk {
+        async fn claim_receive(
+            &self,
+            _payment_hash: &str,
+            _amount_msat: u64,
+            _preimage: &str,
+        ) -> Result<(), String> {
+            self.claims.fetch_add(1, Ordering::SeqCst);
+            self.log.lock().unwrap().push("claim");
+            if self
+                .failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                    value.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Err("ldk unavailable".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn fail_receive(&self, _payment_hash: &str) -> Result<(), String> {
+            self.failed_holds.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    async fn receive_fixture() -> (Db, std::path::PathBuf, String, String) {
+        let dir =
+            std::env::temp_dir().join(format!("mutinynet-ssp-receive-{}", uuid::Uuid::new_v4()));
+        let db = Db::open(dir.to_str().unwrap()).unwrap();
+        let preimage = "01".repeat(32);
+        let payment_hash = hex::encode(Sha256::digest(hex::decode(&preimage).unwrap()));
+        db.insert_request(
+            "request",
+            "LIGHTNING_RECEIVE",
+            "request-owner",
+            &chrono::Utc::now().to_rfc3339(),
+            &serde_json::json!({
+                "payment_hash": payment_hash,
+                "amount_sats": 5_000,
+                "invoice": "ln-invoice",
+                "receiver_identity_pubkey": "receiver",
+                "expiry_secs": 300,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        db.set_receive_status(&payment_hash, "INVOICE_CREATED")
+            .await
+            .unwrap();
+        (db, dir, payment_hash, preimage)
+    }
+
+    fn mock_spark(preimage: String, log: Arc<StdMutex<Vec<&'static str>>>) -> MockSpark {
+        MockSpark {
+            preimage,
+            log,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn reconnect_backoff_is_bounded() {
@@ -994,5 +1449,189 @@ mod tests {
             Ok(2_100_000_000_000_000_000)
         );
         assert!(sats_to_msats(u64::MAX).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wallet_created_receive_commits_and_claims() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let spark = mock_spark(preimage, log.clone());
+        let ldk = MockLdk {
+            log: log.clone(),
+            ..Default::default()
+        };
+        let lock = tokio::sync::Mutex::new(());
+
+        assert!(
+            process_standard_receive(&db, &lock, &spark, &ldk, &hash, Some(5_000_000), &[],)
+                .await
+                .unwrap()
+        );
+        let receive = db.lightning_receive_for_hash(&hash).await.unwrap().unwrap();
+        assert!(receive.transfer_id.is_some());
+        assert_eq!(receive.preimage, Some("01".repeat(32)));
+        assert!(receive.claim_submitted);
+        assert_eq!(*log.lock().unwrap(), vec!["spark", "claim"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mismatched_operator_preimage_is_not_claimed() {
+        let (db, dir, hash, _) = receive_fixture().await;
+        let spark = mock_spark("02".repeat(32), Arc::default());
+        let ldk = MockLdk::default();
+
+        let error = process_standard_receive(
+            &db,
+            &tokio::sync::Mutex::new(()),
+            &spark,
+            &ldk,
+            &hash,
+            Some(5_000_000),
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("does not match"));
+        assert_eq!(ldk.claims.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.failed_holds.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_claimable_event_does_not_repeat_transfer_or_claim() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        let spark = mock_spark(preimage, Arc::default());
+        let ldk = MockLdk::default();
+        let lock = tokio::sync::Mutex::new(());
+
+        for _ in 0..2 {
+            process_standard_receive(&db, &lock, &spark, &ldk, &hash, Some(5_000_000), &[])
+                .await
+                .unwrap();
+        }
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ldk.claims.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_after_spark_commit_resumes_only_ldk_claim() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        db.commit_lightning_receive_swap(
+            &hash,
+            "00000000-0000-4000-8000-000000000001",
+            &preimage,
+            "request",
+            "request-owner",
+        )
+        .await
+        .unwrap();
+        let spark = mock_spark(preimage, Arc::default());
+        let ldk = MockLdk::default();
+
+        process_standard_receive(
+            &db,
+            &tokio::sync::Mutex::new(()),
+            &spark,
+            &ldk,
+            &hash,
+            Some(5_000_000),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.claims.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn operator_failure_keeps_hold_without_claiming() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        let spark = MockSpark {
+            failures: AtomicUsize::new(1),
+            ..mock_spark(preimage, Arc::default())
+        };
+        let ldk = MockLdk::default();
+
+        assert!(process_standard_receive(
+            &db,
+            &tokio::sync::Mutex::new(()),
+            &spark,
+            &ldk,
+            &hash,
+            Some(5_000_000),
+            &[],
+        )
+        .await
+        .is_err());
+        assert_eq!(ldk.claims.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.failed_holds.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ldk_claim_retries_without_repeating_spark_transfer() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        let spark = mock_spark(preimage, Arc::default());
+        let ldk = MockLdk {
+            failures: AtomicUsize::new(2),
+            ..Default::default()
+        };
+        let delays = [Duration::ZERO, Duration::ZERO];
+
+        process_standard_receive(
+            &db,
+            &tokio::sync::Mutex::new(()),
+            &spark,
+            &ldk,
+            &hash,
+            Some(5_000_000),
+            &delays,
+        )
+        .await
+        .unwrap();
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ldk.claims.load(Ordering::SeqCst), 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claimable_amount_must_match_invoice_amount() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        let spark = mock_spark(preimage, Arc::default());
+        let ldk = MockLdk::default();
+
+        assert!(process_standard_receive(
+            &db,
+            &tokio::sync::Mutex::new(()),
+            &spark,
+            &ldk,
+            &hash,
+            Some(4_999_000),
+            &[],
+        )
+        .await
+        .is_err());
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.claims.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.failed_holds.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn receive_invoice_networks_are_explicit() {
+        assert_eq!(
+            invoice_network("MAINNET").unwrap(),
+            bitcoin::Network::Bitcoin
+        );
+        assert_eq!(
+            invoice_network("TESTNET").unwrap(),
+            bitcoin::Network::Testnet
+        );
+        assert_eq!(invoice_network("SIGNET").unwrap(), bitcoin::Network::Signet);
+        assert_eq!(invoice_network("LOCAL").unwrap(), bitcoin::Network::Regtest);
+        assert!(invoice_network("unknown").is_err());
     }
 }

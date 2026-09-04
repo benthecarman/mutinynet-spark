@@ -140,6 +140,34 @@ Alert on repeated event-stream reconnects or reconciliation errors.
 See [ldk-server compatibility](LDK_GAPS.md) for supported calls and current
 backend gaps.
 
+Run the local Lightning acceptance test before deployment:
+
+```sh
+./e2e/ln-e2e.sh
+```
+
+It starts a fresh regtest network with local Electrs, three unmodified Spark
+Operators, two SSP instances, and two `ldk-server` nodes. Two Breez SDK wallets
+receive initial Spark balances through Lightning and then pay BOLT11 invoices
+in both directions. The test checks the wallet balances, Spark transfers,
+Lightning settlement, and preimage hashes.
+
+Run the live standard receive check with the Spark SDK wallet and the Mutinynet
+faucet payer from a host that can inspect the SSP's `ldk-server` container:
+
+```sh
+SPARK_SDK_DIST=<spark-sdk-dist> \
+SPARK_ADMIN_TOKEN=<token> \
+SSP_BASE_URL=<ssp-url> \
+LDK1_CONTAINER=<ldk-server-container> \
+LN_RECEIVE_PAYER=mutinynet-cli \
+node e2e/ln-receive.mjs
+```
+
+This deployment-only check creates a normal wallet invoice, calls
+`mutinynet-cli lightning`, and verifies the Spark balance, transfer, LDK state,
+and claimed preimage.
+
 ## Upgrade and rollback
 
 1. Back up the mnemonic file and the complete `SSP_DATA_DIR` volume.

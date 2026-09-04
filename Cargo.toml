@@ -28,7 +28,9 @@ flate2 = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 bip39 = { version = "2", features = ["rand"] }
 bitcoin = "0.32"
+lightning-invoice = "0.33"
 spark-wallet = { git = "https://github.com/benthecarman/spark-sdk", rev = "c7eecfe670798a8b8332ce412044cbd49123687a" }
+spark = { git = "https://github.com/benthecarman/spark-sdk", rev = "c7eecfe670798a8b8332ce412044cbd49123687a" }
 subtle = "2"
 # FROST VSS share splitting (mirrors signer/spark-frost vss.rs).
 k256 = { version = "0.13", features = ["arithmetic"] }

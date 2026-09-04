@@ -12,14 +12,29 @@ use std::{
     time::Duration,
 };
 
+use ::spark::{
+    operator::rpc::spark::{
+        initiate_preimage_swap_request::Reason as PreimageSwapReason, InitiatePreimageSwapRequest,
+        InvoiceAmount, InvoiceAmountProof, StartTransferRequest,
+    },
+    operator::{rpc::DefaultConnectionManager, OperatorPool},
+    services::{LeafKeyTweak, Transfer as SparkTransfer, TransferService, TransferType},
+    session_store::InMemorySessionStore,
+    signer::SparkSigner as CoreSparkSigner,
+    tree::{select_leaves_by_exact_amounts, TreeNode, TreeNodeStatus},
+};
 use bip39::{Language, Mnemonic};
-use bitcoin::{consensus::deserialize, Transaction};
+use bitcoin::{
+    consensus::deserialize,
+    hashes::{sha256, Hash as BitcoinHash},
+    Transaction,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use spark_wallet::{
     DefaultSigner, Network, OperatorPoolConfig, Preimage, PreimageRequestRole,
-    PreimageRequestStatus, SparkAddress, SparkSigner, SparkSignerAdapter, SparkWallet,
-    SparkWalletConfig, TransferId, TransferStatus, WalletTransfer,
+    PreimageRequestStatus, SparkAddress, SparkSignerAdapter, SparkWallet, SparkWalletConfig,
+    TransferId, TransferStatus, WalletLeaf, WalletTransfer,
 };
 
 use crate::config::Config;
@@ -39,10 +54,18 @@ pub struct SwapFill {
     pub leaf_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LightningReceiveSwap {
+    pub transfer_id: String,
+    pub preimage: String,
+}
+
 pub struct SparkService {
     wallet: Arc<SparkWallet>,
     network: Network,
     identity: spark_wallet::PublicKey,
+    operator_pool: Arc<OperatorPool>,
+    transfer_service: Arc<TransferService>,
     liquidity_lock: tokio::sync::Mutex<()>,
     needs_topup: AtomicBool,
 }
@@ -54,7 +77,7 @@ impl SparkService {
             load_or_create_mnemonic(&config.spark_mnemonic_file, config.spark_mnemonic_required)?;
         let seed = mnemonic.to_seed("");
         let signer = Arc::new(DefaultSigner::new(&seed, network).map_err(|e| e.to_string())?);
-        let signer = Arc::new(SparkSignerAdapter::new(signer));
+        let signer: Arc<dyn CoreSparkSigner> = Arc::new(SparkSignerAdapter::new(signer));
         let identity = signer
             .get_identity_public_key()
             .await
@@ -118,6 +141,28 @@ impl SparkService {
         wallet_config.split_secret_threshold = config.frost_threshold as u32;
         wallet_config.leaf_auto_optimize_enabled = false;
 
+        // Keep an authenticated operator client beside the embedded wallet.
+        // SparkWallet does not expose its pool, but receive settlement needs the
+        // existing low-level InitiatePreimageSwapV3 RPC and generated types.
+        let operator_pool = Arc::new(
+            OperatorPool::connect(
+                &wallet_config.operator_pool,
+                Arc::new(DefaultConnectionManager::new()),
+                Arc::new(InMemorySessionStore::default()),
+                signer.clone(),
+                None,
+            )
+            .await
+            .map_err(|e| format!("connect receive operator clients: {e}"))?,
+        );
+        let transfer_service = Arc::new(TransferService::new(
+            signer.clone(),
+            network,
+            wallet_config.split_secret_threshold,
+            operator_pool.clone(),
+            None,
+        ));
+
         let wallet = Arc::new(
             SparkWallet::connect(wallet_config, signer)
                 .await
@@ -127,6 +172,8 @@ impl SparkService {
             wallet,
             network,
             identity,
+            operator_pool,
+            transfer_service,
             liquidity_lock: tokio::sync::Mutex::new(()),
             needs_topup: AtomicBool::new(false),
         }))
@@ -298,6 +345,147 @@ impl SparkService {
         Ok(transfer.id.to_string())
     }
 
+    /// Atomically transfer SSP leaves and redeem the wallet's operator-held
+    /// preimage shares through InitiatePreimageSwapV3(REASON_RECEIVE).
+    pub async fn swap_for_lightning_receive(
+        &self,
+        owner: &str,
+        payment_hash: &str,
+        invoice: &str,
+        amount_sats: u64,
+        fee_sats: u64,
+    ) -> Result<LightningReceiveSwap, String> {
+        if fee_sats != 0 {
+            return Err("Spark receive swaps do not support a fee".to_string());
+        }
+        let payment_hash_bytes =
+            hex::decode(payment_hash).map_err(|e| format!("decode Lightning payment hash: {e}"))?;
+        let payment_hash = sha256::Hash::from_slice(&payment_hash_bytes)
+            .map_err(|e| format!("Lightning payment hash: {e}"))?;
+        let owner_key = spark_wallet::PublicKey::from_str(owner).map_err(|e| e.to_string())?;
+        let transfer_id = payment_transfer_id(&payment_hash.to_string())?;
+
+        let _guard = self.liquidity_lock.lock().await;
+        self.wallet.sync().await.map_err(|e| e.to_string())?;
+        if let Some(recovered) = self
+            .recover_lightning_receive_swap(&transfer_id, &payment_hash, owner_key, amount_sats)
+            .await?
+        {
+            return Ok(recovered);
+        }
+        let leaves = self.wallet.list_leaves().await.map_err(|e| e.to_string())?;
+        let available = leaves
+            .available
+            .into_iter()
+            .map(wallet_leaf_to_tree_node)
+            .collect::<Result<Vec<_>, _>>()?;
+        let selected = select_leaves_by_exact_amounts(&available, &[amount_sats])
+            .map_err(|e| self.liquidity_error(e.to_string()))?;
+        let leaf_tweaks = selected
+            .into_iter()
+            .map(|node| LeafKeyTweak {
+                node,
+                incoming_key: None,
+            })
+            .collect::<Vec<_>>();
+        let expiry = std::time::SystemTime::now() + Duration::from_secs(30 * 60);
+        let prepared = self
+            .transfer_service
+            .prepare_transfer_request(
+                &transfer_id,
+                &leaf_tweaks,
+                &owner_key,
+                // A receive commits a normal SSP-to-wallet transfer. The
+                // payment hash belongs to the enclosing preimage swap. If it
+                // is also set here, the SDK creates HTLC refund transactions,
+                // which do not match the operators' normal transfer ladder.
+                None,
+                Some(expiry),
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let response = self
+            .operator_pool
+            .get_coordinator()
+            .client
+            .initiate_preimage_swap_v3(build_lightning_receive_swap_request(
+                &payment_hash,
+                invoice,
+                amount_sats,
+                owner_key,
+                fee_sats,
+                prepared.transfer_request,
+            ))
+            .await
+            .map_err(|e| format!("InitiatePreimageSwapV3(REASON_RECEIVE): {e}"))?;
+
+        let preimage = Preimage::try_from(response.preimage)
+            .map_err(|_| "operator response did not contain a 32-byte preimage".to_string())?;
+        let transfer: SparkTransfer = response
+            .transfer
+            .ok_or_else(|| "operator receive swap did not return a transfer".to_string())?
+            .try_into()
+            .map_err(|e: ::spark::services::ServiceError| e.to_string())?;
+        let result = validate_lightning_receive_swap(
+            transfer,
+            preimage,
+            &payment_hash,
+            &transfer_id,
+            self.identity,
+            owner_key,
+            amount_sats,
+        )?;
+        self.needs_topup.store(false, Ordering::Relaxed);
+        Ok(result)
+    }
+
+    async fn recover_lightning_receive_swap(
+        &self,
+        transfer_id: &TransferId,
+        payment_hash: &sha256::Hash,
+        receiver: spark_wallet::PublicKey,
+        amount_sats: u64,
+    ) -> Result<Option<LightningReceiveSwap>, String> {
+        let result = self
+            .wallet
+            .query_htlc(
+                vec![transfer_id.to_string()],
+                vec![payment_hash.to_string()],
+                None,
+                PreimageRequestRole::Sender,
+                None,
+            )
+            .await
+            .map_err(|e| format!("recover receive swap: {e}"))?;
+        let Some(request) = result.items.into_iter().find(|request| {
+            request.payment_hash == *payment_hash
+                && request
+                    .transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.id == *transfer_id)
+        }) else {
+            return Ok(None);
+        };
+        let Some(preimage) = request.preimage else {
+            return Ok(None);
+        };
+        let transfer = request
+            .transfer
+            .ok_or_else(|| "recovered receive swap has no transfer".to_string())?;
+        validate_lightning_receive_swap(
+            transfer,
+            preimage,
+            payment_hash,
+            transfer_id,
+            self.identity,
+            receiver,
+            amount_sats,
+        )
+        .map(Some)
+    }
+
     pub async fn fill_swap(
         self: &Arc<Self>,
         owner: &str,
@@ -453,6 +641,77 @@ impl SparkService {
     }
 }
 
+fn build_lightning_receive_swap_request(
+    payment_hash: &sha256::Hash,
+    invoice: &str,
+    amount_sats: u64,
+    receiver: spark_wallet::PublicKey,
+    fee_sats: u64,
+    transfer_request: StartTransferRequest,
+) -> InitiatePreimageSwapRequest {
+    InitiatePreimageSwapRequest {
+        payment_hash: payment_hash.to_byte_array().to_vec(),
+        invoice_amount: Some(InvoiceAmount {
+            value_sats: amount_sats,
+            invoice_amount_proof: Some(InvoiceAmountProof {
+                bolt11_invoice: invoice.to_string(),
+            }),
+        }),
+        reason: PreimageSwapReason::Receive as i32,
+        transfer: None,
+        receiver_identity_public_key: receiver.serialize().to_vec(),
+        fee_sats,
+        transfer_request: Some(transfer_request),
+    }
+}
+
+fn validate_lightning_receive_swap(
+    transfer: SparkTransfer,
+    preimage: Preimage,
+    payment_hash: &sha256::Hash,
+    transfer_id: &TransferId,
+    sender: spark_wallet::PublicKey,
+    receiver: spark_wallet::PublicKey,
+    amount_sats: u64,
+) -> Result<LightningReceiveSwap, String> {
+    if preimage.compute_hash() != *payment_hash {
+        return Err("operator preimage does not match the Lightning payment hash".to_string());
+    }
+    if transfer.id != *transfer_id
+        || transfer.sender_identity_public_key != sender
+        || transfer.receiver_identity_public_key != receiver
+        || transfer.total_value != amount_sats
+        || transfer.transfer_type != TransferType::PreimageSwap
+    {
+        return Err("operator receive swap returned a mismatched transfer".to_string());
+    }
+    Ok(LightningReceiveSwap {
+        transfer_id: transfer.id.to_string(),
+        preimage: preimage.encode_hex(),
+    })
+}
+
+fn wallet_leaf_to_tree_node(leaf: WalletLeaf) -> Result<TreeNode, String> {
+    Ok(TreeNode {
+        id: leaf.id,
+        tree_id: leaf.tree_id,
+        value: leaf.value,
+        parent_node_id: leaf.parent_node_id,
+        node_tx: leaf.node_tx,
+        refund_tx: leaf.refund_tx,
+        direct_tx: leaf.direct_tx,
+        direct_refund_tx: leaf.direct_refund_tx,
+        direct_from_cpfp_refund_tx: leaf.direct_from_cpfp_refund_tx,
+        vout: leaf.vout,
+        verifying_public_key: leaf.verifying_public_key,
+        owner_identity_public_key: leaf.owner_identity_public_key,
+        signing_keyshare: leaf
+            .signing_keyshare
+            .ok_or_else(|| "available Spark leaf has no signing keyshare".to_string())?,
+        status: TreeNodeStatus::Available,
+    })
+}
+
 fn validate_transfer(
     transfer: &WalletTransfer,
     sender: spark_wallet::PublicKey,
@@ -566,6 +825,40 @@ mod tests {
             payment_transfer_id(hash).unwrap().to_string(),
             "00112233-4455-4677-8899-aabbccddeeff"
         );
+    }
+
+    #[test]
+    fn receive_swap_request_uses_existing_receive_protocol() {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&[3; 32]).unwrap();
+        let receiver = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+        let payment_hash = sha256::Hash::hash(b"wallet preimage");
+        let transfer_request = StartTransferRequest {
+            transfer_id: "transfer".to_string(),
+            ..Default::default()
+        };
+
+        let request = build_lightning_receive_swap_request(
+            &payment_hash,
+            "ln-invoice",
+            5_000,
+            receiver,
+            0,
+            transfer_request,
+        );
+
+        assert_eq!(request.reason, PreimageSwapReason::Receive as i32);
+        assert_eq!(request.payment_hash, payment_hash.to_byte_array());
+        assert_eq!(request.receiver_identity_public_key, receiver.serialize());
+        assert!(request.transfer.is_none());
+        assert_eq!(request.fee_sats, 0);
+        let amount = request.invoice_amount.unwrap();
+        assert_eq!(amount.value_sats, 5_000);
+        assert_eq!(
+            amount.invoice_amount_proof.unwrap().bolt11_invoice,
+            "ln-invoice"
+        );
+        assert_eq!(request.transfer_request.unwrap().transfer_id, "transfer");
     }
 
     #[test]

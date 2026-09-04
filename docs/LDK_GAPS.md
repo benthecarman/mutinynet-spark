@@ -19,14 +19,18 @@ the stored request and do not start a second Lightning payment.
 
 ### BOLT11 receive
 
-The tested receive flow uses an SSP-owned preimage. The SSP calls
-`Bolt11ReceiveForHash`, waits for `PaymentClaimable`, pays the Spark recipient,
-and calls `Bolt11ClaimForHash`. It calls `Bolt11FailForHash` when the hold
-invoice expires or setup fails.
+The wallet creates the preimage and stores encrypted threshold shares with the
+Spark Operators through the existing Spark SDK receive flow. The SSP calls
+`Bolt11ReceiveForHash` for that hash and waits for `PaymentClaimable`. It then
+prepares an SSP-to-wallet transfer and calls `InitiatePreimageSwapV3` with
+`REASON_RECEIVE`. The operators commit the transfer and return the reconstructed
+preimage. The SSP verifies the preimage hash before it calls
+`Bolt11ClaimForHash`.
 
-The SSP stores its preimage before invoice creation and stores encrypted FROST
-shares with the Spark Operators. This lets it complete the Spark payout before
-it releases the Lightning preimage.
+The Spark commit and returned preimage are stored before the Lightning claim.
+Retries and process restarts therefore do not create a second Spark transfer.
+The SSP calls `Bolt11FailForHash` when an unfunded swap cannot complete or the
+hold invoice expires.
 
 ### Event recovery
 
@@ -80,8 +84,6 @@ These limitations are in the SSP and must not be attributed to `ldk-server`:
 
 - `lightning_receive_quote` does not emit the protobuf `TransferManifest`
   required by the SDK quote flow.
-- Automatic receive uses the SSP-owned preimage extension. A wallet-owned
-  preimage must be sent through `reveal_preimage` before the SSP can claim it.
 - BOLT12 send is not wired into the SSP. Funding verification calls the
   BOLT11-only `DecodeInvoice`, and final Spark settlement matches only BOLT11
   payment records. `ldk-server` already provides `Bolt12Send` and exposes the

@@ -146,6 +146,28 @@ services:
           sleep 10
         done
 
+  electrs:
+    image: coffernetwork/regtest-electrs:28.1@sha256:7cd973541afc28e75ff18b93050df4e91749b38af031930ed2b77f4088a3d246
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    command:
+      - --network=regtest
+      - --jsonrpc-import
+      - --cookie=testutil:testutilpassword
+      - --daemon-rpc-addr=bitcoind:8332
+      - --db-dir=/electrs
+      - --electrum-rpc-addr=0.0.0.0:60401
+      - --http-addr=0.0.0.0:3002
+      - --monitoring-addr=0.0.0.0:24224
+      - --cors=*
+      - --address-search
+    ports:
+      - "127.0.0.1:30000:3002"
+    volumes:
+      - electrs-data:/electrs
+    restart: unless-stopped
+
   spark-operator-0:
     <<: *operator-common
     command:
@@ -230,8 +252,20 @@ services:
     volumes:
       - ldk-data-2:/data
       - ./e2e/ldk-server-2-config.toml:/config.toml:ro
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - /config.toml
+      - |
+        ldk-server /config.toml &
+        PID=$$!
+        trap 'kill -TERM "$$PID"' TERM INT
+        while kill -0 "$$PID" 2>/dev/null; do
+          if [ -f /data/regtest/api_key ] && [ -f /data/tls.crt ]; then
+            chmod 0444 /data/regtest/api_key /data/tls.crt
+            break
+          fi
+          sleep 1
+        done
+        wait "$$PID"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "test -r /data/regtest/api_key && ldk-server-cli --base-url localhost:3536 --api-key $$(od -A n -t x1 /data/regtest/api_key | tr -d ' \\n') --tls-cert /data/tls.crt get-node-info >/dev/null"]
@@ -282,10 +316,53 @@ services:
       SSP_FROST_OPERATORS: '[{"id":0,"identifier":"0000000000000000000000000000000000000000000000000000000000000001","identityPublicKey":"0322ca18fc489ae25418a0e768273c2c61cabb823edfb14feb891e9bec62016510"},{"id":1,"identifier":"0000000000000000000000000000000000000000000000000000000000000002","identityPublicKey":"0341727a6c41b168f07eb50865ab8c397a53c7eef628ac1020956b705e43b6cb27"},{"id":2,"identifier":"0000000000000000000000000000000000000000000000000000000000000003","identityPublicKey":"0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6"}]'
       RUST_LOG: info
 
+  # The second SSP gives each Breez wallet a distinct Lightning node. This
+  # prevents the test from paying an invoice back to the same node.
+  ssp-2:
+    image: ${SSP_IMAGE:-ghcr.io/benthecarman/mutinynet-ssp:latest}
+    build:
+      context: .
+      dockerfile: ssp.Dockerfile
+    depends_on:
+      - spark-operator-0
+      - spark-operator-1
+      - spark-operator-2
+      - ldk-server-2
+    ports:
+      - "127.0.0.1:5001:5000"
+    healthcheck:
+      test: ["CMD", "mutinynet-ssp", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - ssp-data-2:/data
+      - ldk-data-2:/ldk-data:ro
+      - tls-certs:/tls:ro
+    environment:
+      SSP_LISTEN_ADDR: 0.0.0.0:5000
+      SSP_NETWORK: REGTEST
+      SSP_DATA_DIR: /data
+      SSP_PUBLIC_URL: http://ssp-2:5000
+      SPARK_MNEMONIC_FILE: /data/spark.mnemonic
+      SO_HOSTS: spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535
+      SO_IDENTITY_PUBKEYS: 0322ca18fc489ae25418a0e768273c2c61cabb823edfb14feb891e9bec62016510,0341727a6c41b168f07eb50865ab8c397a53c7eef628ac1020956b705e43b6cb27,0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6
+      SO_CERT_FILES: /tls/server_0.crt,/tls/server_1.crt,/tls/server_2.crt
+      SPARK_ADMIN_TOKEN: ${SPARK_ADMIN_TOKEN:?set SPARK_ADMIN_TOKEN}
+      LDK_GRPC_ADDR: ldk-server-2:3536
+      LDK_API_KEY_FILE: /ldk-data/regtest/api_key
+      LDK_TLS_CERT_FILE: /ldk-data/tls.crt
+      SSP_SWAP_FEE_SATS: 0
+      SSP_FROST_THRESHOLD: 2
+      SSP_FROST_OPERATORS: '[{"id":0,"identifier":"0000000000000000000000000000000000000000000000000000000000000001","identityPublicKey":"0322ca18fc489ae25418a0e768273c2c61cabb823edfb14feb891e9bec62016510"},{"id":1,"identifier":"0000000000000000000000000000000000000000000000000000000000000002","identityPublicKey":"0341727a6c41b168f07eb50865ab8c397a53c7eef628ac1020956b705e43b6cb27"},{"id":2,"identifier":"0000000000000000000000000000000000000000000000000000000000000003","identityPublicKey":"0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6"}]'
+      RUST_LOG: info
+
 volumes:
   postgres-data:
   bitcoind-data:
+  electrs-data:
   tls-certs:
   ldk-data:
   ldk-data-2:
   ssp-data:
+  ssp-data-2:

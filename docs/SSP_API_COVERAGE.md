@@ -17,9 +17,9 @@ complete the underlying financial action.
 | `request_swap` | Supported and tested | Verifies the funded outbound transfer and completes an atomic Swap V3 counter transfer from exact SSP leaves |
 | `request_lightning_send` | BOLT11 supported and tested | Verifies Spark funding, starts one payment, tracks final LDK state, and settles the preimage swap idempotently |
 | `lightning_send_fee_estimate` | Limited | Returns the current zero-fee policy; it is not a route estimate |
-| `mint_invoice_preimage` | Supported SSP extension | Creates and stores an SSP-owned preimage before invoice creation |
-| `request_lightning_receive` | Supported and tested for SSP-owned preimages | Creates a BOLT11 hold invoice, stores FROST shares, pays Spark before claim, and reconciles missed events |
-| `reveal_preimage` | Supported SSP extension | Validates and reveals a wallet-held preimage for a matching receive request |
+| `mint_invoice_preimage` | Supported SSP extension | Creates an SSP-owned preimage for the explicit HODL extension; standard receive does not use it |
+| `request_lightning_receive` | BOLT11 supported and tested | Creates a hold invoice for the wallet hash, redeems wallet-held operator shares with `REASON_RECEIVE`, commits Spark before the LDK claim, and reconciles missed events |
+| `reveal_preimage` | Supported SSP extension | Reveals a preimage only for an explicit HODL flow; standard receive does not require it |
 | `transfers`, `user_request` | Supported for SSP-created records | Returns owner-scoped durable swap and Lightning state |
 | `lightning_receive_quote` | Compatibility only | Returns a signed JSON manifest; the SDK quote flow requires a protobuf `TransferManifest` |
 | `static_deposit_quote`, `claim_static_deposit` | Regtest test path | Signs a fixed-value test quote; no production UTXO valuation or completed claim transfer |
@@ -32,15 +32,22 @@ complete the underlying financial action.
 
 The current end-to-end flow is:
 
-1. Authenticate the wallet with the SSP.
-2. Call `mint_invoice_preimage` through the authenticated SSP client.
-3. Pass the returned hash to the SDK `createLightningHodlInvoice` method.
-4. Pay the BOLT11 invoice.
-5. Poll the receive request until `TRANSFER_COMPLETED`.
+1. Authenticate a standard Spark SDK wallet with the SSP.
+2. Call the SDK `createLightningInvoice` method. The wallet creates the
+   preimage and stores its threshold shares with the Spark Operators.
+3. Pay the returned BOLT11 invoice.
+4. Poll the receive request until `TRANSFER_COMPLETED`.
 
-This flow lets the SSP fund the Spark transfer before it releases the
-Lightning preimage. Ordinary quoted receive invoices are not supported until
+The SSP redeems the shares only as part of the operators' atomic Spark transfer.
+It does not generate a replacement preimage and does not require
+`reveal_preimage`. Fee-bearing quoted receive invoices remain unsupported until
 the SSP emits the required protobuf manifest.
+
+`e2e/ln-e2e.sh` runs this flow on a fresh local regtest network through the
+Rust Breez SDK at revision `c7eecfe`. It uses local Electrs for Breez chain
+data, two SSP instances, and two `ldk-server` nodes. Each Breez wallet sends
+and receives a BOLT11 payment, and the test checks balances, settlement, and
+preimage hashes.
 
 ## SDK compatibility
 
