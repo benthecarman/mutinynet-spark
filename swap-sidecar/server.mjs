@@ -48,6 +48,13 @@ let SSP_IDENTITY = process.env.SSP_IDENTITY_PUBKEY ?? "";
 const SO_HOSTS = (process.env.SO_HOSTS ?? "127.0.0.1:8535,127.0.0.1:8536,127.0.0.1:8537").split(",");
 const MNEMONIC_FILE = process.env.SIDECAR_MNEMONIC_FILE ?? "./sidecar.mnemonic";
 const FILL_RECEIPTS_FILE = process.env.SIDECAR_FILL_RECEIPTS_FILE ?? "./swap-fills.json";
+const SWAP_TRANSFER_LOOKUP_TIMEOUT_MS = Number(
+  process.env.SIDECAR_SWAP_TRANSFER_LOOKUP_TIMEOUT_MS ?? "15000",
+);
+const SWAP_TRANSFER_LOOKUP_INTERVAL_MS = Number(
+  process.env.SIDECAR_SWAP_TRANSFER_LOOKUP_INTERVAL_MS ?? "250",
+);
+const SWAP_CLAIM_TIMEOUT_MS = Number(process.env.SIDECAR_SWAP_CLAIM_TIMEOUT_MS ?? "300000");
 
 let fillReceipts = {};
 if (fs.existsSync(FILL_RECEIPTS_FILE)) {
@@ -61,6 +68,7 @@ function persistFillReceipts() {
 }
 
 const fillsInProgress = new Set();
+const swapClaimsInProgress = new Set();
 let liquidityTail = Promise.resolve();
 
 async function withLiquidityLock(action) {
@@ -82,12 +90,94 @@ function publicKeyHex(value) {
   return Buffer.from(value ?? []).toString("hex").toLowerCase();
 }
 
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitForSwapTransfer(service, transferId) {
+  const deadline = Date.now() + SWAP_TRANSFER_LOOKUP_TIMEOUT_MS;
+  let lastError;
+  do {
+    try {
+      if (typeof service.queryTransfer === "function") {
+        const transfer = await service.queryTransfer(transferId);
+        if (transfer) return transfer;
+      }
+      const pending = await service.queryPendingTransfers({ transferIds: [transferId] });
+      const transfer = pending?.transfers?.find((candidate) => candidate.id === transferId);
+      if (transfer) return transfer;
+      lastError = undefined;
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(SWAP_TRANSFER_LOOKUP_INTERVAL_MS);
+  } while (Date.now() < deadline);
+
+  const detail = lastError instanceof Error ? `: ${lastError.message}` : "";
+  throw new Error(`outbound swap transfer was not found for the sidecar${detail}`);
+}
+
+async function reconcileSwapClaim(transferId, receivedTotal) {
+  if (swapClaimsInProgress.has(transferId)) return;
+  swapClaimsInProgress.add(transferId);
+  const service = wallet.transferService ?? wallet._transferService;
+  const deadline = Date.now() + SWAP_CLAIM_TIMEOUT_MS;
+  let delayMs = 250;
+  try {
+    while (Date.now() < deadline) {
+      try {
+        const transfer = await service.queryTransfer(transferId);
+        if (transfer?.status === 5) {
+          fillReceipts[transferId].inboundClaimedAt = new Date().toISOString();
+          persistFillReceipts();
+          return;
+        }
+        // The primary side of a swap is not claimable until the user claims
+        // the counter-transfer and advances it past sender-key-tweak pending.
+        if (transfer && transfer.status >= 2 && transfer.status <= 4) {
+          const claimedLeaves = await service.claimTransfer(transfer);
+          const claimedTotal = claimedLeaves.reduce(
+            (sum, leaf) => sum + Number(leaf.value ?? 0),
+            0,
+          );
+          if (claimedTotal !== receivedTotal) {
+            throw new Error(`claimed ${claimedTotal} sats; expected ${receivedTotal}`);
+          }
+          fillReceipts[transferId].inboundClaimedAt = new Date().toISOString();
+          persistFillReceipts();
+          console.log(`swap-fill ${transferId}: claimed ${claimedTotal} inbound sats`);
+          return;
+        }
+      } catch (error) {
+        console.error(`swap-fill ${transferId}: claim retry:`, error.message);
+      }
+      await sleep(delayMs);
+      delayMs = Math.min(delayMs * 2, 5000);
+    }
+    console.error(`swap-fill ${transferId}: inbound claim reconciliation timed out`);
+  } finally {
+    swapClaimsInProgress.delete(transferId);
+  }
+}
+
 function validHash(value) {
   return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
 
 function transferIdForPaymentHash(paymentHash) {
   const bytes = Buffer.from(paymentHash.slice(0, 32), "hex");
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function counterTransferIdForPrimary(primaryTransferId) {
+  const bytes = crypto
+    .createHash("sha256")
+    .update(`swap-counter:${primaryTransferId}`)
+    .digest()
+    .subarray(0, 16);
   bytes[6] = (bytes[6] & 0x0f) | 0x40;
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
   const hex = bytes.toString("hex");
@@ -199,6 +289,17 @@ if (!SSP_IDENTITY) {
 }
 console.log("SSP identity:", SSP_IDENTITY);
 console.log("sidecar wallet:", await wallet.getSparkAddress());
+
+for (const [transferId, receipt] of Object.entries(fillReceipts)) {
+  if (
+    receipt?.status === "complete" &&
+    receipt.receivedTotal &&
+    !receipt.inboundClaimedAt &&
+    !transferId.startsWith("lightning-receive:")
+  ) {
+    void reconcileSwapClaim(transferId, receipt.receivedTotal);
+  }
+}
 
 let needsTopup = false;
 
@@ -436,6 +537,7 @@ const server = http.createServer(async (req, res) => {
       const {
         ownerIdentityPubkey,
         outboundTransferId,
+        adaptorPublicKey,
         targetAmountsSats,
         receivedTotalAmountSats,
         payoutTotalAmountSats,
@@ -444,8 +546,13 @@ const server = http.createServer(async (req, res) => {
       const targets = (targetAmountsSats ?? []).map(Number);
       const receivedTotal = Number(receivedTotalAmountSats);
       const payoutTotal = Number(payoutTotalAmountSats);
-      if (!ownerIdentityPubkey || !outboundTransferId || targets.length === 0) {
-        return send(400, { error: "ownerIdentityPubkey, outboundTransferId, and targetAmountsSats are required" });
+      if (
+        !/^[0-9a-f]{66}$/i.test(ownerIdentityPubkey ?? "") ||
+        typeof outboundTransferId !== "string" ||
+        !/^[0-9a-f]{66}$/i.test(adaptorPublicKey ?? "") ||
+        targets.length === 0
+      ) {
+        return send(400, { error: "ownerIdentityPubkey, outboundTransferId, adaptorPublicKey, and targetAmountsSats are required" });
       }
       if (
         !targets.every((n) => Number.isSafeInteger(n) && n > 0) ||
@@ -458,11 +565,25 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isSafeInteger(targetTotal) || targetTotal > payoutTotal || payoutTotal > receivedTotal) {
         return send(400, { error: "invalid target, payout, or received total" });
       }
+      if (payoutTotal !== receivedTotal) {
+        return send(400, { error: "Swap V3 fees are not supported by the operator protocol" });
+      }
       const existing = fillReceipts[outboundTransferId];
-      if (existing && (existing.ownerIdentityPubkey !== ownerIdentityPubkey || existing.receivedTotal !== receivedTotal)) {
+      if (
+        existing &&
+        (existing.ownerIdentityPubkey !== ownerIdentityPubkey ||
+          existing.receivedTotal !== receivedTotal ||
+          (existing.adaptorPublicKey && existing.adaptorPublicKey !== adaptorPublicKey))
+      ) {
         return send(409, { error: "outbound transfer is already bound to another fill" });
       }
-      if (existing?.status === "complete") return send(200, existing.result);
+      if (existing?.status === "complete") {
+        send(200, existing.result);
+        if (!existing.inboundClaimedAt) {
+          void reconcileSwapClaim(outboundTransferId, receivedTotal);
+        }
+        return;
+      }
       if (fillsInProgress.has(outboundTransferId)) {
         return send(409, { error: "swap fill is already in progress" });
       }
@@ -474,19 +595,12 @@ const server = http.createServer(async (req, res) => {
             status: "claiming",
             ownerIdentityPubkey,
             receivedTotal,
+            adaptorPublicKey,
           };
           persistFillReceipts();
           const svc = wallet.transferService ?? wallet._transferService;
           if (!svc) throw new Error("transfer service unavailable");
-          const pending = await svc.queryPendingTransfers({ transferIds: [outboundTransferId] });
-          let inbound = pending?.transfers?.find((transfer) => transfer.id === outboundTransferId);
-          if (!inbound) {
-            await wallet.experimental_syncWallet();
-            inbound = await wallet.getTransfer(outboundTransferId);
-            if (inbound?.status !== "TRANSFER_STATUS_COMPLETED") {
-              throw new Error("outbound swap transfer was not found for the sidecar");
-            }
-          }
+          const inbound = await waitForSwapTransfer(svc, outboundTransferId);
           if (publicKeyHex(inbound.senderIdentityPublicKey) !== ownerIdentityPubkey.toLowerCase()) {
             throw new Error("outbound swap transfer sender does not match the session owner");
           }
@@ -504,33 +618,36 @@ const server = http.createServer(async (req, res) => {
           if (Number(inbound.totalValue) !== receivedTotal) {
             throw new Error(`outbound swap transfer has ${inbound.totalValue} sats; expected ${receivedTotal}`);
           }
-          if (inbound.status !== "TRANSFER_STATUS_COMPLETED" && inbound.status !== 5) {
-            const claimedLeaves = await svc.claimTransfer(inbound);
-            const claimedTotal = claimedLeaves.reduce(
-              (sum, leaf) => sum + Number(leaf.value ?? 0),
-              0,
-            );
-            if (claimedTotal !== receivedTotal) {
-              throw new Error(`claimed ${claimedTotal} sats; expected ${receivedTotal}`);
-            }
-          }
-          fillReceipts[outboundTransferId].status = "funded";
+          fillReceipts[outboundTransferId].status = "verified";
           persistFillReceipts();
         }
 
-        await wallet.experimental_syncWallet();
-        if (typeof wallet.transferV2 !== "function") {
-          throw new Error("atomic multi-receiver transferV2 is unavailable");
-        }
-        const change = payoutTotal - targetTotal;
-        const amounts = [...targets];
-        if (change > 0) amounts.push(change);
-        const tx = await wallet.transferV2({
-          receivers: amounts.map((amountSats) => ({
-            amountSats,
+        const svc = wallet.transferService ?? wallet._transferService;
+        if (!svc) throw new Error("transfer service unavailable");
+        const counterTransferId = counterTransferIdForPrimary(outboundTransferId);
+        let tx = await svc.queryTransfer(counterTransferId);
+        if (!tx) {
+          await wallet.experimental_syncWallet();
+          if (typeof wallet.transferSwapCounter !== "function") {
+            throw new Error("Swap V3 counter transfers are unavailable");
+          }
+          const change = receivedTotal - targetTotal;
+          const amounts = [...targets];
+          if (change > 0) amounts.push(change);
+          tx = await wallet.transferSwapCounter({
             receiverSparkAddress: receiver,
-          })),
-        });
+            targetAmountsSats: amounts,
+            primaryTransferId: outboundTransferId,
+            adaptorPublicKey: Uint8Array.from(Buffer.from(adaptorPublicKey, "hex")),
+            counterTransferId,
+          });
+        }
+        if (Number(tx.totalValue) !== receivedTotal) {
+          throw new Error(`counter transfer has ${tx.totalValue} sats; expected ${receivedTotal}`);
+        }
+        if (publicKeyHex(tx.receiverIdentityPublicKey) !== ownerIdentityPubkey.toLowerCase()) {
+          throw new Error("counter transfer receiver does not match the session owner");
+        }
         const leaves = (tx.leaves ?? [])
           .map((leaf) => leaf.leaf?.id)
           .filter(Boolean)
@@ -543,34 +660,28 @@ const server = http.createServer(async (req, res) => {
             direct_from_cpfp_raw_unsigned_refund_transaction: "",
             direct_from_cpfp_adaptor_signed_signature: "",
           }));
-        if (leaves.length === 0) {
-          leaves.push({
-            leaf_id: crypto.randomUUID(),
-            raw_unsigned_refund_transaction: "",
-            adaptor_signed_signature: "",
-            direct_raw_unsigned_refund_transaction: "",
-            direct_adaptor_signed_signature: "",
-            direct_from_cpfp_raw_unsigned_refund_transaction: "",
-            direct_from_cpfp_adaptor_signed_signature: "",
-          });
-        }
+        if (leaves.length === 0) throw new Error("counter transfer has no leaves");
         const result = { inboundTransferSparkId: tx.id, swapLeaves: leaves };
         fillReceipts[outboundTransferId] = {
           status: "complete",
           ownerIdentityPubkey,
           receivedTotal,
+          adaptorPublicKey,
+          counterTransferId,
           result,
         };
         persistFillReceipts();
         console.log(`swap-fill ${idempotencyKey}: received ${receivedTotal}, paid ${payoutTotal} sats -> ${receiver.slice(0, 20)}... tx=${tx.id}`);
         needsTopup = false;
-        return send(200, result);
+        send(200, result);
+        void reconcileSwapClaim(outboundTransferId, receivedTotal);
+        return;
       } finally {
         fillsInProgress.delete(outboundTransferId);
       }
     } catch (e) {
-      // A depleted ladder leaves the verified inbound in the sidecar wallet
-      // with a funded receipt. The same request can resume after a top-up.
+      // A depleted ladder leaves a verified receipt. The same request can
+      // resume after a top-up without repeating the counter-transfer.
       const needsTopupErr = /available balance|NEEDS_TOPUP/.test(e.message);
       if (needsTopupErr) needsTopup = true;
       console.error(`swap-fill failed${needsTopupErr ? " (NEEDS_TOPUP)" : ""}:`, e.message);

@@ -12,6 +12,8 @@ import { sendToAddress, mineAndWait } from "./faucet.mjs";
 const health = await (await fetch("http://127.0.0.1:5000/health")).json();
 if (health.status !== "ok") throw new Error("SSP unhealthy");
 console.log(`[e2e 0] SSP health: network=${health.network} ldk_mode=${health.ldk_mode} identity=${health.ssp_identity_pubkey}`);
+const sidecarHealth = await (await fetch("http://127.0.0.1:5001/health")).json();
+const sidecarBalanceBefore = BigInt(sidecarHealth.breakdown?.available ?? sidecarHealth.balance);
 const SSP = {
   baseUrl: process.env.SSP_BASE_URL ?? "http://127.0.0.1:5000",
   identityPublicKey: process.env.SSP_IDENTITY_PUBKEY ?? health.ssp_identity_pubkey,
@@ -55,8 +57,10 @@ const b = await SparkWallet.initialize({ options: opts() });
 const addrB = await b.wallet.getSparkAddress();
 step(6, `wallet B ready: ${addrB}`);
 
-await a.wallet.transfer({ amountSats: 100_000, receiverSparkAddress: addrB });
-step(7, "transferred 100000 A -> B");
+// A partial spend of a single 100,000-sat leaf must use RequestSwap and the
+// funded sidecar. A full-leaf transfer would bypass the path under test.
+await a.wallet.transfer({ amountSats: 50_000, receiverSparkAddress: addrB });
+step(7, "transferred 50000 A -> B through a leaf swap");
 
 const balB = await b.wallet.getBalance();
 step(8, `B balance before sync: ${balB.balance} sats`);
@@ -71,8 +75,21 @@ async function pollBalance(w, want, tag) {
   }
   throw new Error(`balance never reached ${want}`);
 }
-await pollBalance(b.wallet, 100_000n, 8.1);
-await pollBalance(a.wallet, 0n, 8.2);
+await pollBalance(b.wallet, 50_000n, 8.1);
+await pollBalance(a.wallet, 50_000n, 8.2);
+
+for (let i = 0; i < 30; i++) {
+  const current = await (await fetch("http://127.0.0.1:5001/health")).json();
+  const available = BigInt(current.breakdown?.available ?? current.balance);
+  step(8.3, `sidecar balance poll ${i}: ${available} sats`);
+  if (available === sidecarBalanceBefore) break;
+  if (i === 29) {
+    throw new Error(
+      `sidecar did not reclaim swap input: ${available}; expected ${sidecarBalanceBefore}`,
+    );
+  }
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+}
 
 // SSP-specific: static-deposit quote through OUR ssp (exercises quote signing).
 const staticAddr = await a.wallet.getStaticDepositAddress();

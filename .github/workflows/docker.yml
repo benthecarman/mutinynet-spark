@@ -40,8 +40,8 @@ jobs:
       - name: Check out pinned upstream sources
         run: |
           mkdir -p /tmp/opencode
-          git clone --filter=blob:none --no-checkout https://github.com/buildonspark/spark "$SPARK_REF"
-          git -C "$SPARK_REF" fetch --depth=1 origin 0b3a32a05c9ac06cc411683551dd1f1bde9d0caa
+          git clone --filter=blob:none --no-checkout https://github.com/benthecarman/spark "$SPARK_REF"
+          git -C "$SPARK_REF" fetch --depth=1 origin 5a1fc3201c0d8611479d3bafdfb43b026cc1e876
           git -C "$SPARK_REF" checkout --detach FETCH_HEAD
           git clone --filter=blob:none --no-checkout https://github.com/lightningdevkit/ldk-server "$LDK_SERVER_REF"
           git -C "$LDK_SERVER_REF" fetch --depth=1 origin 6d6d810714706c225ce7effc2163eff6a1b54221

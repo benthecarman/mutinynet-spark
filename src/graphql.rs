@@ -323,6 +323,12 @@ pub async fn dispatch(
             if ext_id.is_empty() {
                 return Err("user_outbound_transfer_external_id is required".to_string());
             }
+            let adaptor_pubkey = str_of(&input, "adaptor_pubkey");
+            if adaptor_pubkey.len() != 66
+                || !adaptor_pubkey.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("adaptor_pubkey must be a compressed public key".to_string());
+            }
             let network = state.config.network.clone();
             // Target list (rc schema) or scalar (dated schema).
             let targets: Vec<u64> = match input.get("target_amount_sats") {
@@ -342,9 +348,16 @@ pub async fn dispatch(
             }
             // Funded sidecar completes the swap with a real SO transfer.
             // Without it swapLeaves stays empty and the SDK rejects the swap.
-            let (inbound_id, swap_leaves) =
-                fill_swap_via_sidecar(&state, &owner, &ext_id, &targets, total, payout_total)
-                    .await?;
+            let (inbound_id, swap_leaves) = fill_swap_via_sidecar(
+                &state,
+                &owner,
+                &ext_id,
+                &adaptor_pubkey,
+                &targets,
+                total,
+                payout_total,
+            )
+            .await?;
             let rec = store_request(
                 &state,
                 "LEAVES_SWAP",
@@ -962,6 +975,7 @@ async fn fill_swap_via_sidecar(
     state: &AppState,
     owner_identity_pubkey: &str,
     outbound_transfer_id: &str,
+    adaptor_pubkey: &str,
     targets: &[u64],
     received_total_sats: u64,
     payout_total_sats: u64,
@@ -978,6 +992,7 @@ async fn fill_swap_via_sidecar(
         .json(&serde_json::json!({
             "ownerIdentityPubkey": owner_identity_pubkey,
             "outboundTransferId": outbound_transfer_id,
+            "adaptorPublicKey": adaptor_pubkey,
             "targetAmountsSats": targets,
             "receivedTotalAmountSats": received_total_sats,
             "payoutTotalAmountSats": payout_total_sats,

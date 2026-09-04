@@ -119,8 +119,27 @@ if [ ! -f "$SDK_DIST" ]; then
 fi
 npm ci --prefix swap-sidecar --omit=dev --no-audit --no-fund
 
+echo "=== verify SDK network mapping ==="
+SPARK_SDK_DIST="$SDK_DIST" node e2e/sdk-network.mjs
+
 echo "=== run e2e ==="
 SPARK_SDK_DIST="$SDK_DIST" node e2e/e2e.mjs
+
+echo "=== verify atomic swap state on every operator ==="
+for index in 0 1 2; do
+  linked=$("${COMPOSE[@]}" exec -T postgres psql \
+    -U postgres -d "sparkoperator_${index}" -tAc \
+    "SELECT count(*) FROM transfers counter JOIN transfers primary_transfer ON counter.transfer_counter_swap_transfer = primary_transfer.id WHERE counter.type = 'COUNTER_SWAP_V3' AND counter.status = 'COMPLETED' AND primary_transfer.type = 'PRIMARY_SWAP_V3' AND primary_transfer.status = 'COMPLETED' AND counter.total_value = primary_transfer.total_value;")
+  unsettled=$("${COMPOSE[@]}" exec -T postgres psql \
+    -U postgres -d "sparkoperator_${index}" -tAc \
+    "SELECT count(*) FROM transfers WHERE type IN ('PRIMARY_SWAP_V3', 'COUNTER_SWAP_V3') AND status <> 'COMPLETED';")
+  linked=$(echo "$linked" | tr -d '[:space:]')
+  unsettled=$(echo "$unsettled" | tr -d '[:space:]')
+  if [ "$linked" -lt 1 ] || [ "$unsettled" -ne 0 ]; then
+    echo "operator ${index} has linked=${linked} unsettled=${unsettled} swap transfers"
+    exit 1
+  fi
+done
 
 echo "=== run Lightning e2e ==="
 SPARK_SDK_DIST="$SDK_DIST" ./e2e/ln-e2e.sh

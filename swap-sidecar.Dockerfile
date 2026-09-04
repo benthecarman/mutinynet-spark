@@ -1,12 +1,14 @@
 # Self-contained swap sidecar: builds the pinned spark-sdk inside, then runs
-# the SSP sidecar server. Override SDK pin with --build-arg SPARK_REF=<sha>.
-ARG SPARK_REF=0b3a32a05c9ac06cc411683551dd1f1bde9d0caa
+# the SSP sidecar server. Override the source and pin with build arguments.
+ARG SPARK_REPO=https://github.com/benthecarman/spark
+ARG SPARK_REF=5a1fc3201c0d8611479d3bafdfb43b026cc1e876
 
 FROM node:22-bookworm AS sdk-build
+ARG SPARK_REPO
 ARG SPARK_REF
 RUN apt-get update && apt-get install -y git clang lld python3 make g++ && rm -rf /var/lib/apt/lists/*
 RUN corepack enable && corepack prepare yarn@4.13.0 --activate
-RUN git clone https://github.com/buildonspark/spark /spark \
+RUN git clone ${SPARK_REPO} /spark \
  && cd /spark && git checkout ${SPARK_REF}
 WORKDIR /spark/sdks/js
 RUN yarn install && yarn build:sdk \
