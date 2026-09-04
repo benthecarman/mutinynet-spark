@@ -352,7 +352,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
     }
-    // Periodic prune: expired sessions + challenges older than 1h.
+    // Periodic prune: expired sessions, challenges older than 1h, orphan
+    // preimages and stubbed compatibility requests older than 24h.
     {
         let db = db.clone();
         tokio::spawn(async move {
@@ -362,6 +363,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let _ = db.prune_expired_sessions(&now.to_rfc3339()).await;
                 let _ = db
                     .prune_challenges(&(now - chrono::Duration::hours(1)).to_rfc3339())
+                    .await;
+                let _ = db
+                    .prune_compat_requests(&(now - chrono::Duration::hours(24)).to_rfc3339())
                     .await;
                 let _ = db
                     .prune_orphan_preimages(&(now - chrono::Duration::hours(24)).to_rfc3339())

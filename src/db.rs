@@ -271,6 +271,58 @@ impl Db {
         .await
     }
 
+    /// Compatibility-only request kinds (stubbed operations with no
+    /// settlement lifecycle). Their storage is bounded by a rolling per-owner
+    /// quota and TTL pruning.
+    pub const COMPAT_REQUEST_KINDS: [&str; 3] = [
+        "COOP_EXIT",
+        "CLAIM_STATIC_DEPOSIT",
+        "CLAIM_INSTANT_STATIC_DEPOSIT",
+    ];
+
+    /// Per-owner compatibility request count inside the window.
+    pub async fn compat_request_count(
+        &self,
+        owner: &str,
+        since_rfc3339: &str,
+    ) -> Result<i64, String> {
+        let kinds = Self::COMPAT_REQUEST_KINDS.join("','");
+        self.with(move |c| {
+            c.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM requests
+                     WHERE owner=?1 AND created_at>=?2 AND kind IN ('{kinds}')"
+                ),
+                (owner, since_rfc3339),
+                |r| r.get(0),
+            )
+        })
+        .await
+    }
+
+    /// Delete compatibility-only requests older than the cutoff, plus any
+    /// orphaned compatibility transfer rows referencing them. These stubs
+    /// carry no settlement audit value.
+    pub async fn prune_compat_requests(&self, older_than_rfc3339: &str) -> Result<usize, String> {
+        let kinds = Self::COMPAT_REQUEST_KINDS.join("','");
+        self.with(move |c| {
+            c.execute(
+                "DELETE FROM transfers
+                 WHERE kind='COOP_EXIT'
+                   AND request_id NOT IN (SELECT id FROM requests)",
+                [],
+            )?;
+            c.execute(
+                &format!(
+                    "DELETE FROM requests
+                     WHERE created_at<?1 AND kind IN ('{kinds}')"
+                ),
+                (older_than_rfc3339,),
+            )
+        })
+        .await
+    }
+
     pub async fn get_request(&self, id: &str, owner: &str) -> Result<Option<Value>, String> {
         self.with(|c| {
             c.query_row(
@@ -1223,6 +1275,76 @@ mod tests {
                 .unwrap(),
             Some(spark_id.to_string())
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compat_requests_are_counted_and_pruned() {
+        let (db, dir) = test_db();
+        let old = "2020-01-01T00:00:00+00:00";
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_request(
+            "old-coop",
+            "COOP_EXIT",
+            "owner",
+            old,
+            &serde_json::json!({"exit_speed": "MEDIUM"}),
+            None,
+        )
+        .await
+        .unwrap();
+        db.insert_request(
+            "old-claim",
+            "CLAIM_STATIC_DEPOSIT",
+            "owner",
+            old,
+            &serde_json::json!({"transaction_id": "tx"}),
+            None,
+        )
+        .await
+        .unwrap();
+        db.insert_request(
+            "old-send",
+            "LIGHTNING_SEND",
+            "owner",
+            old,
+            &serde_json::json!({"amount_sats": 1}),
+            None,
+        )
+        .await
+        .unwrap();
+        db.insert_request(
+            "new-coop",
+            "COOP_EXIT",
+            "owner",
+            &now,
+            &serde_json::json!({"exit_speed": "MEDIUM"}),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Only compat rows inside the window are quota-counted.
+        assert_eq!(
+            db.compat_request_count(
+                "owner",
+                &(chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339()
+            )
+            .await
+            .unwrap(),
+            1
+        );
+
+        // Pruning removes only old compatibility rows; financial records stay.
+        assert_eq!(db.prune_compat_requests(&now).await.unwrap(), 2);
+        assert!(db.get_request("old-send", "owner").await.unwrap().is_some());
+        assert!(db.get_request("new-coop", "owner").await.unwrap().is_some());
+        assert!(db.get_request("old-coop", "owner").await.unwrap().is_none());
+        assert!(db
+            .get_request("old-claim", "owner")
+            .await
+            .unwrap()
+            .is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

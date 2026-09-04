@@ -575,12 +575,13 @@ pub async fn dispatch(
             {
                 return Err("unknown, mismatched, or already claimed quote".to_string());
             }
+            enforce_compat_quota(&state, &owner).await?;
             store_request(
                 &state,
                 "CLAIM_STATIC_DEPOSIT",
                 &owner,
                 &now,
-                input.clone(),
+                static_deposit_payload(&input),
                 None,
             )
             .await?;
@@ -598,12 +599,13 @@ pub async fn dispatch(
         }
         "CreateClaimInstantStaticDeposit" | "create_claim_instant_static_deposit" => {
             let owner = auth::require_session(&state, headers).await?;
+            enforce_compat_quota(&state, &owner).await?;
             let rec = store_request(
                 &state,
                 "CLAIM_INSTANT_STATIC_DEPOSIT",
                 &owner,
                 &now,
-                input.clone(),
+                static_deposit_payload(&input),
                 None,
             )
             .await?;
@@ -621,14 +623,17 @@ pub async fn dispatch(
                 exit_speed
             };
             let coop_exit_txid = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-            let mut payload = input.clone();
-            if let Some(object) = payload.as_object_mut() {
-                object.insert(
-                    "coop_exit_txid".to_string(),
-                    Value::String(coop_exit_txid.clone()),
-                );
-                object.insert("exit_speed".to_string(), Value::String(exit_speed.clone()));
+            let mut payload = json!({
+                "coop_exit_txid": coop_exit_txid,
+                "exit_speed": exit_speed,
+            });
+            if let Some(ext_id) = input
+                .get("user_outbound_transfer_external_id")
+                .and_then(Value::as_str)
+            {
+                payload["user_outbound_transfer_external_id"] = Value::String(ext_id.to_string());
             }
+            enforce_compat_quota(&state, &owner).await?;
             let rec = store_request(&state, "COOP_EXIT", &owner, &now, payload, None).await?;
             let req_id = rec["id"].as_str().unwrap_or("").to_string();
             // Compatibility stub: never insert the client-supplied
@@ -1088,6 +1093,38 @@ async fn send_response_from_record(
         }
     }}))
 }
+/// Compatibility-only request kinds: stubbed operations with no settlement
+/// lifecycle. Their durable footprint is bounded by a payload allowlist, a
+/// per-owner rolling quota, and TTL pruning (see `Db::prune_compat_requests`).
+const COMPAT_QUOTA_WINDOW_HOURS: i64 = 24;
+const MAX_COMPAT_REQUESTS_PER_OWNER: i64 = 1_000;
+/// Hard ceiling for any persisted request payload. Real financial payloads
+/// (invoices, offers) are a few KiB; anything larger is client padding.
+const MAX_REQUEST_PAYLOAD_BYTES: usize = 16 * 1024;
+
+/// Reject compatibility mutations once the owner already holds the quota of
+/// compat rows inside the rolling window.
+async fn enforce_compat_quota(state: &AppState, owner: &str) -> Result<(), String> {
+    let since =
+        (chrono::Utc::now() - chrono::Duration::hours(COMPAT_QUOTA_WINDOW_HOURS)).to_rfc3339();
+    let count = state.db.compat_request_count(owner, &since).await?;
+    if count >= MAX_COMPAT_REQUESTS_PER_OWNER {
+        return Err("compatibility request quota reached; try again later".to_string());
+    }
+    Ok(())
+}
+
+/// Copy only the small known static-deposit fields. Unknown client JSON
+/// (which may be megabytes of padding) must never reach durable storage.
+fn static_deposit_payload(input: &Value) -> Value {
+    let mut payload = serde_json::Map::new();
+    for key in ["transaction_id", "output_index", "quote_signature"] {
+        if let Some(value) = input.get(key) {
+            payload.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(payload)
+}
 
 /// Insert a user-request row into sqlite and return the record shape that
 /// `user_request_union` reads: {id, type, created_at, payload}.
@@ -1099,6 +1136,10 @@ async fn store_request(
     payload: Value,
     idempotency_key: Option<&str>,
 ) -> Result<Value, String> {
+    let serialized = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    if serialized.len() > MAX_REQUEST_PAYLOAD_BYTES {
+        return Err("request payload is too large".to_string());
+    }
     let id = Uuid::new_v4().to_string();
     state
         .db
@@ -1256,8 +1297,8 @@ async fn sign_with_ssp(state: &AppState, message: &str) -> Result<String, String
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_query_aliases, currency_amount, str_of, transfer_response, validate_network_name,
-        validate_sats,
+        apply_query_aliases, currency_amount, static_deposit_payload, str_of, transfer_response,
+        validate_network_name, validate_sats,
     };
     use serde_json::json;
 
@@ -1327,5 +1368,23 @@ mod tests {
             transfer["user_request"]["invoice"]["encoded_invoice"],
             "lnbcrt..."
         );
+    }
+
+    #[test]
+    fn static_deposit_payload_drops_unknown_client_fields() {
+        let input = json!({
+            "transaction_id": "00".repeat(32),
+            "output_index": 0,
+            "quote_signature": "sig",
+            "padding": "x".repeat(64),
+            "nested": {"deep": ["padding"]},
+        });
+
+        let payload = static_deposit_payload(&input);
+        assert_eq!(payload["transaction_id"], json!("00".repeat(32)));
+        assert_eq!(payload["output_index"], json!(0));
+        assert_eq!(payload["quote_signature"], json!("sig"));
+        assert!(payload.get("padding").is_none());
+        assert!(payload.get("nested").is_none());
     }
 }
