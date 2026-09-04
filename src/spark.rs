@@ -566,10 +566,21 @@ impl SparkService {
             return Err("swap targets exceed the payout".to_string());
         }
 
-        let _guard = self.liquidity_lock.lock().await;
+        // Resolve and validate the funding transfer before taking the
+        // liquidity lock: a missing or underfunded caller-supplied id must
+        // not occupy the lock (wait_for_transfer polls for up to 15 s) that
+        // both Lightning receive payout paths also need. The transfer is
+        // re-fetched and revalidated under the lock before anything moves.
         let primary_id = TransferId::from_str(outbound_transfer_id)?;
         let primary = self.wait_for_transfer(&primary_id).await?;
         let owner_key = spark_wallet::PublicKey::from_str(owner).map_err(|e| e.to_string())?;
+        validate_transfer(&primary, owner_key, self.identity, received_total_sats)?;
+
+        let _guard = self.liquidity_lock.lock().await;
+        let primary = self
+            .find_transfer(&primary_id)
+            .await?
+            .ok_or_else(|| "outbound swap transfer was not found for the SSP".to_string())?;
         validate_transfer(&primary, owner_key, self.identity, received_total_sats)?;
 
         let counter_id = counter_transfer_id(outbound_transfer_id);
@@ -586,7 +597,13 @@ impl SparkService {
                     amounts.push(change);
                 }
                 self.wallet
-                    .transfer_swap_counter(amounts, &receiver, primary_id, adaptor, counter_id)
+                    .transfer_swap_counter(
+                        amounts,
+                        &receiver,
+                        primary_id.clone(),
+                        adaptor,
+                        counter_id,
+                    )
                     .await
                     .map_err(|e| self.liquidity_error(e.to_string()))?
             }
@@ -602,7 +619,6 @@ impl SparkService {
         }
         self.needs_topup.store(false, Ordering::Relaxed);
         let service = self.clone();
-        let primary_id = TransferId::from_str(outbound_transfer_id)?;
         tokio::spawn(async move { service.reconcile_swap_claim(primary_id).await });
         Ok(SwapFill {
             transfer_id: counter.id.to_string(),
