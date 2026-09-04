@@ -123,6 +123,13 @@ Use `SSP_BASE_URL`, `BITCOIN_RPC_URL`, `BITCOIN_RPC_USER`, and
 `BITCOIN_RPC_PASSWORD` when the services are not at the local defaults. Do not
 put quotes inside values passed through Docker's `--env-file` option.
 
+The funding ladder must be able to make each supported receive amount exactly.
+A ladder that starts at 1,000 sats cannot settle a 68-sat receive. Standard
+Bitcoin relay policy also rejects on-chain deposit outputs below the dust
+limit. Obtain small denominations from an off-chain Spark liquidity source, or
+use a private mining path that explicitly accepts these nonstandard outputs.
+The local Lightning E2E uses the private regtest mining path for this reason.
+
 Keep `MAX_SWAP_TOTAL_SATS` below the amount of liquidity that the operator can
 safely expose. Add small denominations before `needs_topup` becomes true.
 

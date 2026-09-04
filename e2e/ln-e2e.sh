@@ -22,6 +22,9 @@ command -v cargo >/dev/null
 test -d "$SPARK_SOURCE_REF"
 test -d "$LDK_SERVER_REF"
 
+echo "=== check Breez E2E client ==="
+cargo check --locked --manifest-path e2e/breez/Cargo.toml
+
 TLS_DIR=$(mktemp -d)
 SPARK_WORKTREE_ROOT=$(mktemp -d)
 SPARK_CLEAN_REF="$SPARK_WORKTREE_ROOT/spark"

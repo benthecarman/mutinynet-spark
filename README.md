@@ -71,9 +71,11 @@ With the two checkouts at their default paths, run:
 ```
 
 The script always creates a separate Compose project with empty volumes. It
-funds exact SSP leaves, creates bidirectional Lightning liquidity, bootstraps
-both Breez wallets through standard BOLT11 receives, and then makes two Breez
-payments in opposite directions. It verifies each Spark balance, each Breez
+funds binary SSP leaf sets, creates bidirectional Lightning liquidity,
+bootstraps both Breez wallets through standard BOLT11 receives, and then makes
+two Breez payments in opposite directions. The default payments are 68 and 37
+sats. The isolated regtest node accepts the small nonstandard deposit outputs
+that create these leaves. The test verifies each Spark balance, each Breez
 payment record, both LDK payment records, and the received preimages.
 
 Run `./e2e/e2e.sh` for the supplemental API, idempotency, failure, reconnect,

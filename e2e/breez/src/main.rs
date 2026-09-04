@@ -56,10 +56,10 @@ fn optional_env(name: &str, default: &str) -> String {
 
 impl TestConfig {
     fn from_env() -> Result<Self> {
-        let send_amount_sats = optional_env("BREEZ_SEND_AMOUNT_SATS", "3000")
+        let send_amount_sats = optional_env("BREEZ_SEND_AMOUNT_SATS", "37")
             .parse()
             .context("BREEZ_SEND_AMOUNT_SATS is not an integer")?;
-        let receive_amount_sats = optional_env("BREEZ_RECEIVE_AMOUNT_SATS", "5000")
+        let receive_amount_sats = optional_env("BREEZ_RECEIVE_AMOUNT_SATS", "68")
             .parse()
             .context("BREEZ_RECEIVE_AMOUNT_SATS is not an integer")?;
         let timeout_secs = optional_env("BREEZ_E2E_TIMEOUT_SECS", "180")
@@ -363,16 +363,7 @@ async fn fund_ssp(
     let address = deposit["address"]
         .as_str()
         .context("SSP deposit response has no address")?;
-    let txid = bitcoin_rpc(
-        client,
-        config,
-        "sendtoaddress",
-        json!([address, amount_sats as f64 / 100_000_000.0]),
-    )
-    .await?
-    .as_str()
-    .context("sendtoaddress did not return a transaction ID")?
-    .to_string();
+    let txid = send_regtest_deposit(client, config, address, amount_sats).await?;
     let miner_address = bitcoin_rpc(client, config, "getnewaddress", json!([]))
         .await?
         .as_str()
@@ -415,6 +406,91 @@ async fn fund_ssp(
         Some(json!({ "transaction_hex": transaction_hex, "vout": vout })),
     )
     .await?;
+    Ok(())
+}
+
+async fn send_regtest_deposit(
+    client: &Client,
+    config: &TestConfig,
+    address: &str,
+    amount_sats: u64,
+) -> Result<String> {
+    const FEE_SATS: u64 = 1_000;
+
+    let unspent = bitcoin_rpc(client, config, "listunspent", json!([1])).await?;
+    let input = unspent
+        .as_array()
+        .context("listunspent did not return an array")?
+        .iter()
+        .find(|utxo| utxo["spendable"].as_bool() == Some(true))
+        .context("Bitcoin wallet has no confirmed spendable output")?;
+    let input_sats = (input["amount"]
+        .as_f64()
+        .context("listunspent output has no amount")?
+        * 100_000_000.0)
+        .round() as u64;
+    ensure!(
+        input_sats > amount_sats + FEE_SATS,
+        "Bitcoin wallet output cannot fund the SSP deposit"
+    );
+
+    let change_address = bitcoin_rpc(client, config, "getrawchangeaddress", json!([]))
+        .await?
+        .as_str()
+        .context("getrawchangeaddress did not return an address")?
+        .to_string();
+    let mut outputs = serde_json::Map::new();
+    outputs.insert(
+        address.to_string(),
+        json!(amount_sats as f64 / 100_000_000.0),
+    );
+    outputs.insert(
+        change_address,
+        json!((input_sats - amount_sats - FEE_SATS) as f64 / 100_000_000.0),
+    );
+    let raw = bitcoin_rpc(
+        client,
+        config,
+        "createrawtransaction",
+        json!([[{
+            "txid": input["txid"],
+            "vout": input["vout"],
+            "sequence": 0
+        }], Value::Object(outputs)]),
+    )
+    .await?
+    .as_str()
+    .context("createrawtransaction did not return transaction hex")?
+    .to_string();
+    let signed = bitcoin_rpc(client, config, "signrawtransactionwithwallet", json!([raw])).await?;
+    ensure!(
+        signed["complete"].as_bool() == Some(true),
+        "Bitcoin wallet did not complete the deposit signature"
+    );
+    bitcoin_rpc(
+        client,
+        config,
+        "sendrawtransaction",
+        json!([signed["hex"], 0]),
+    )
+    .await?
+    .as_str()
+    .context("sendrawtransaction did not return a transaction ID")
+    .map(str::to_string)
+}
+
+async fn fund_ssp_binary_ladder(
+    client: &reqwest::Client,
+    config: &TestConfig,
+    ssp_url: &str,
+    amount_sats: u64,
+) -> Result<()> {
+    for bit in 0..u64::BITS {
+        let denomination = 1_u64 << bit;
+        if amount_sats & denomination != 0 {
+            fund_ssp(client, config, ssp_url, denomination).await?;
+        }
+    }
     Ok(())
 }
 
@@ -835,11 +911,11 @@ async fn run(
     wallet_a: &Wallet,
     wallet_b: &Wallet,
 ) -> Result<()> {
-    println!("fund exact SSP leaves");
-    fund_ssp(client, config, wallet_b.ssp_url, config.receive_amount_sats).await?;
-    fund_ssp(client, config, wallet_b.ssp_url, config.send_amount_sats).await?;
-    fund_ssp(client, config, wallet_a.ssp_url, config.receive_amount_sats).await?;
-    fund_ssp(client, config, wallet_a.ssp_url, config.send_amount_sats).await?;
+    println!("fund binary SSP leaf ladders");
+    fund_ssp_binary_ladder(client, config, wallet_b.ssp_url, config.receive_amount_sats).await?;
+    fund_ssp_binary_ladder(client, config, wallet_b.ssp_url, config.send_amount_sats).await?;
+    fund_ssp_binary_ladder(client, config, wallet_a.ssp_url, config.receive_amount_sats).await?;
+    fund_ssp_binary_ladder(client, config, wallet_a.ssp_url, config.send_amount_sats).await?;
 
     println!("bootstrap both wallets through Lightning receive");
     bootstrap_wallet(
