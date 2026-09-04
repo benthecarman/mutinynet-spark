@@ -74,7 +74,8 @@ graceful SSP stop.
 ## Deployment
 
 Use [the deployment runbook](docs/DEPLOY.md) for service requirements,
-configuration, startup, liquidity, backups, and monitoring. The `deploy/`
-directory contains a local Caddy edge example and an LDK command helper. It is
-not a production topology. The production Compose definition is in
-[MutinyWallet/mutiny-net](https://github.com/MutinyWallet/mutiny-net).
+configuration, startup, liquidity, backups, and monitoring. Current Lightning
+backend limits are in [ldk-server compatibility](docs/LDK_GAPS.md). The
+`deploy/` directory contains a local Caddy edge example and an LDK command
+helper. It is not a production topology. The production Compose definition is
+in [MutinyWallet/mutiny-net](https://github.com/MutinyWallet/mutiny-net).

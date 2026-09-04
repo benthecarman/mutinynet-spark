@@ -49,5 +49,9 @@ correctly and treats TESTNET and SIGNET BOLT11 invoices as compatible because
 both use the `lntb` prefix. Released SDK versions without that fix cannot run
 the complete MutinyNet Lightning test.
 
-BOLT12 sends are not production-supported. `ldk-server` can start them, but the
-SSP settlement path currently requires a BOLT11 payment hash and preimage.
+BOLT12 sends are not production-supported. The SSP rejects offers in its
+BOLT11-only funding verification and does not map BOLT12 payment state into
+Spark settlement. `ldk-server` already exposes the send call, hash, and
+preimage needed for SSP-side support.
+
+See [ldk-server compatibility](LDK_GAPS.md) for the complete backend boundary.

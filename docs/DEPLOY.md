@@ -136,6 +136,9 @@ Treat `/health` as ready only when `ldk_mode` is `live` and `ldk_node_id` is the
 expected node. Alert on repeated event-stream reconnects or reconciliation
 errors.
 
+See [ldk-server compatibility](LDK_GAPS.md) for supported calls and current
+backend gaps.
+
 ## Upgrade and rollback
 
 1. Back up the mnemonic file and the complete `SSP_DATA_DIR` volume.
