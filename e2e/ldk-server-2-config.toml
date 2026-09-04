@@ -1,4 +1,4 @@
-# ldk-server regtest config for the e2e stack (bitcoind backend, decision 5).
+# Second ldk-server regtest node for the end-to-end stack.
 [node]
 network = "regtest"
 listening_addresses = ["0.0.0.0:9735"]

@@ -132,10 +132,9 @@ pub async fn dispatch(
             };
             validate_network(&state, &network)?;
             let transfer_id = Uuid::new_v4().to_string();
-            // TODO(live): serialize a real TransferManifest proto (see
-            // protos/spark + docs/LDK_GAPS.md). The SDK proto-decodes this on
-            // receive, so LN-receive e2e needs the real manifest + key-signed
-            // issuer_signature. Base64 JSON keeps the shape for now.
+            // The SDK quote flow needs a protobuf TransferManifest. This JSON
+            // manifest keeps the GraphQL response shape but is not accepted as
+            // a production receive quote.
             let manifest = json!({
                 "transfer_id": transfer_id,
                 "amount_sats": amount,

@@ -1,39 +1,80 @@
 # mutinynet-ssp
 
-Self-hosted Spark Service Provider (SSP) in one Rust binary, wired to
-`ldk-server` and the Breez Spark SDK.
+`mutinynet-ssp` is a self-hosted Spark Service Provider written in Rust. One
+process provides the SSP GraphQL API, owns the Spark liquidity wallet, fills
+Swap V3 requests, and settles Lightning payments through `ldk-server`.
 
-- Serves the SSP GraphQL surface the `@buildonspark/spark-sdk` `SspClient` expects
-  (`graphql/spark/rc` + `graphql/spark/2025-03-19`).
-- Live Lightning is selected at run time when `LDK_GRPC_ADDR`, an API key,
-  and the TLS certificate are configured. Fake Lightning requires the explicit
-  development-only setting `SSP_ALLOW_FAKE_LN=1`.
-- The funded Spark liquidity wallet, Swap V3 settlement, FROST share storage,
-  and quote signing run inside the SSP process. There is no runtime JavaScript
-  sidecar.
-- Works with any network via env (`REGTEST` today, MutinyNet signet at deploy).
+The service uses the Breez Spark Rust SDK for its embedded wallet. Spark
+Operators remain separate services and use the existing Spark protocol. The
+operator build must expose the authenticated counter-swap RPC used by the SSP.
 
-## Run (regtest e2e)
+## Supported flows
 
-```sh
-./e2e/e2e.sh   # compose up, fund the SSP, then test Spark and Lightning
-curl http://127.0.0.1:5000/health
+- Wallet challenge authentication and durable 24-hour sessions.
+- Partial Spark transfers through atomic Swap V3 counter transfers.
+- BOLT11 Lightning sends backed by a verified Spark preimage-swap transfer.
+- BOLT11 Lightning receives with an SSP-held preimage and a Spark payout.
+- Durable payment state, event-stream reconnect, and payment reconciliation.
+- Authenticated Spark liquidity deposits and exact-leaf funding.
+
+Static-deposit quotes are test-only on regtest. Cooperative exits, instant
+static deposits, receive quotes, request history pagination, and wallet
+webhooks are not production-complete. See
+[SSP API coverage](docs/SSP_API_COVERAGE.md) for the exact operation status.
+
+## HTTP endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Process, Spark wallet, liquidity, and LDK status |
+| `POST /graphql/spark/rc` | Current Spark SDK GraphQL endpoint |
+| `POST /graphql/spark/2025-03-19` | Dated Spark SDK endpoint |
+| `POST /graphql` | GraphQL compatibility alias |
+| `POST /admin/spark/deposit-address` | Create a Spark deposit address |
+| `POST /admin/spark/claim-deposit` | Claim a confirmed deposit output |
+
+The admin endpoints require `Authorization: Bearer <SPARK_ADMIN_TOKEN>`.
+
+## Client configuration
+
+Read `ssp_identity_pubkey` from `/health` and use it as the SSP identity:
+
+```json
+{
+  "baseUrl": "https://ssp.example.com",
+  "schemaEndpoint": "graphql/spark/rc",
+  "identityPublicKey": "<ssp_identity_pubkey>"
+}
 ```
 
-Point the SDK at it via `sspClientOptions` (`baseUrl` + `schemaEndpoint`
-`graphql/spark/rc` + the `ssp_identity_pubkey` from `/health`).
+The wallet network, operator set, and SSP must use the same Bitcoin network.
+For MutinyNet, use `SIGNET`. The pinned JavaScript SDK fork fixes SIGNET
+network mapping and accepts the shared TESTNET/SIGNET `lntb` invoice prefix.
 
-The current Lightning receive quote uses a JSON compatibility manifest. The
-stock SDK expects a protobuf `TransferManifest`, so use the raw GraphQL receive
-path until the protobuf serializer and signing digest are implemented.
+## Local end-to-end test
 
-## Deploy
+The test stack contains bitcoind, PostgreSQL, three Spark Operators, two
+`ldk-server` nodes, and the SSP. It needs Docker Compose, Node.js 22, and built
+checkouts of the pinned Spark and `ldk-server` revisions. The CI workflow shows
+the complete checkout and build commands; the revisions are listed in
+[the fixture README](e2e/upstream/README.md).
 
-See `docs/DEPLOY.md` (first-boot order, liquidity ops, secrets) plus
-`deploy/` (Caddy edge, env template, LDK channel script).
+With the two checkouts at their default paths, run:
 
-## Docs
+```sh
+./e2e/e2e.sh
+curl --fail http://127.0.0.1:5000/health
+```
 
-- `docs/SSP_API_COVERAGE.md` – op-by-op status.
-- `docs/LDK_GAPS.md` – missing `ldk-server-client` APIs + fake-data swap map.
-- `docs/SO_SETUP_MUTINYNET.md` – SO + MutinyNet deploy path.
+The suite verifies Spark deposit and transfer, atomic swap state, Lightning
+send and receive, idempotency, authorization failures, expiry, an idle event
+stream, LDK reconnect, restart reconciliation, concurrent receives, and a
+graceful SSP stop.
+
+## Deployment
+
+Use [the deployment runbook](docs/DEPLOY.md) for service requirements,
+configuration, startup, liquidity, backups, and monitoring. The `deploy/`
+directory contains a local Caddy edge example and an LDK command helper. It is
+not a production topology. The production Compose definition is in
+[MutinyWallet/mutiny-net](https://github.com/MutinyWallet/mutiny-net).

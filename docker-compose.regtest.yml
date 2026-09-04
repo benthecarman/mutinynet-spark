@@ -179,7 +179,7 @@ services:
         aliases:
           - spark-operator-2.minikube.local
 
-  # ---- Lightning backend (decision 5: bitcoind backend) --------------------
+  # ---- Lightning backend ---------------------------------------------------
   # Built from a local ldk-server checkout (set LDK_SERVER_REF). The SSP talks
   # to it over gRPC whenever LDK_GRPC_ADDR and credentials are set.
   ldk-server:
@@ -272,7 +272,7 @@ services:
       SO_IDENTITY_PUBKEYS: ${SO_IDENTITY_PUBKEYS:-0322ca18fc489ae25418a0e768273c2c61cabb823edfb14feb891e9bec62016510,0341727a6c41b168f07eb50865ab8c397a53c7eef628ac1020956b705e43b6cb27,0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6}
       SO_CERT_FILES: /tls/server_0.crt,/tls/server_1.crt,/tls/server_2.crt
       SPARK_ADMIN_TOKEN: ${SPARK_ADMIN_TOKEN:?set SPARK_ADMIN_TOKEN}
-      # Live LDK backend (decision 5): bitcoind-backed ldk-server above.
+      # Live LDK backend: bitcoind-backed ldk-server above.
       LDK_GRPC_ADDR: ${LDK_GRPC_ADDR:-ldk-server:3536}
       LDK_API_KEY: ${LDK_API_KEY:-}
       LDK_API_KEY_FILE: ${LDK_API_KEY_FILE:-/ldk-data/regtest/api_key}
