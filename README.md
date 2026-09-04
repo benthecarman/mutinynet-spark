@@ -55,6 +55,43 @@ The wallet network, operator set, and SSP must use the same Bitcoin network.
 For MutinyNet, use `SIGNET`. The pinned JavaScript SDK fork fixes SIGNET
 network mapping and accepts the shared TESTNET/SIGNET `lntb` invoice prefix.
 
+### MutinyNet Spark configuration
+
+Use the following wallet configuration to connect to the MutinyNet Spark
+operators and SSP:
+
+```json
+{
+  "network": "SIGNET",
+  "signingOperators": {
+    "0000000000000000000000000000000000000000000000000000000000000001": {
+      "id": 0,
+      "identifier": "0000000000000000000000000000000000000000000000000000000000000001",
+      "address": "https://0.spark.mutinynet.com",
+      "identityPublicKey": "02d446dcd16eef9814d6491f64898f96e70061ed06e01393e2801a2bae8d9582e5"
+    },
+    "0000000000000000000000000000000000000000000000000000000000000002": {
+      "id": 1,
+      "identifier": "0000000000000000000000000000000000000000000000000000000000000002",
+      "address": "https://1.spark.mutinynet.com",
+      "identityPublicKey": "026ee53806c9c8323d79f11b4980af3002e30040ced8c4adc34b684454121b5764"
+    }
+  },
+  "electrsUrl": "https://mutinynet.com/api",
+  "sspClientOptions": {
+    "baseUrl": "https://ssp.mutinynet.com",
+    "schemaEndpoint": "graphql/spark/rc",
+    "identityPublicKey": "0306e597d556f83e3b6f4a524c7cd84630b14ce323252d9cc1f8444a9b00a46756"
+  },
+  "expectedWithdrawBondSats": 10000,
+  "expectedWithdrawRelativeBlockLocktime": 1000,
+  "optimizationOptions": {
+    "auto": false,
+    "multiplicity": 0
+  }
+}
+```
+
 ## Local end-to-end test
 
 The Lightning acceptance stack contains bitcoind, a local Electrs Esplora
