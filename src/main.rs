@@ -57,11 +57,28 @@ struct GraphqlResponse {
     data: serde_json::Value,
 }
 
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+async fn identity_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "identityPublicKey": state.spark.identity(),
+    }))
+}
+
+async fn status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if !admin_authorized(&state.config, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        );
+    }
     let backend = state.ldk.read().await;
     let spark = state.spark.health().await;
-    Json(serde_json::json!({
-        "status": "ok",
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
         "network": state.config.network,
         "ssp_identity_pubkey": state.spark.identity(),
         "identity_source": "spark-wallet",
@@ -69,7 +86,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "spark_error": spark.as_ref().err(),
         "ldk_mode": if backend.live_node_id().is_some() { "live" } else { "fake" },
         "ldk_node_id": backend.live_node_id(),
-    }))
+        })),
+    )
 }
 
 fn admin_authorized(config: &Config, headers: &HeaderMap) -> bool {
@@ -363,6 +381,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/", get(health))
+        .route("/identity", get(identity_handler))
+        .route("/status", get(status))
         .route("/admin/spark/deposit-address", post(spark_deposit_address))
         .route("/admin/spark/claim-deposit", post(spark_claim_deposit))
         // Both schema endpoints the SDK uses:
@@ -453,6 +473,13 @@ async fn binary_healthcheck() -> Result<(), Box<dyn std::error::Error + Send + S
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[tokio::test]
+    async fn health_only_reports_status() {
+        let Json(body) = health().await;
+
+        assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    }
 
     #[test]
     fn inflate_accepts_zlib_and_raw_deflate() {

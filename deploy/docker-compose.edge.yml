@@ -5,7 +5,7 @@
 #   2. docker compose -f docker-compose.regtest.yml \
 #        -f deploy/docker-compose.edge.yml --env-file deploy/.env \
 #        up -d ssp ldk-server caddy
-#   3. Publish the SSP identity from https://<SSP_DOMAIN>/health as wallets'
+#   3. Publish the SSP identity from https://<SSP_DOMAIN>/identity as wallets'
 #      sspClientOptions.identityPublicKey (schemaEndpoint graphql/spark/rc).
 #   4. Run e2e/e2e.sh to provision and test the local stack.
 

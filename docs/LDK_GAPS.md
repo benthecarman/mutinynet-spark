@@ -95,8 +95,9 @@ See [SSP API coverage](SSP_API_COVERAGE.md) for the operation-level status.
 ## Deployment requirements
 
 Production must provide `LDK_GRPC_ADDR`, either `LDK_API_KEY` or
-`LDK_API_KEY_FILE`, and `LDK_TLS_CERT_FILE`. `/health` must report
-`ldk_mode: "live"` and the expected `ldk_node_id`.
+`LDK_API_KEY_FILE`, and `LDK_TLS_CERT_FILE`. Authenticated `/status` must report
+`ldk_mode: "live"` and the expected `ldk_node_id`; `/health` reports only basic
+process liveness.
 
 Do not enable `SSP_ALLOW_FAKE_LN` in production. Fake mode is only for isolated
 development tests.

@@ -5,6 +5,7 @@ const HTTP_TIMEOUT_MS = Number(process.env.E2E_HTTP_TIMEOUT_MS ?? "15000");
 
 export const SSP_BASE_URL = process.env.SSP_BASE_URL ?? "http://127.0.0.1:5000";
 export const GRAPHQL_URL = `${SSP_BASE_URL}/graphql/spark/rc`;
+const SPARK_ADMIN_TOKEN = process.env.SPARK_ADMIN_TOKEN ?? "";
 
 const apiKeys = new Map();
 
@@ -77,14 +78,25 @@ export async function fetchJson(url, options = {}) {
 }
 
 export async function assertLiveHealth() {
+  if (!SPARK_ADMIN_TOKEN) throw new Error("set SPARK_ADMIN_TOKEN");
   const health = await fetchJson(`${SSP_BASE_URL}/health`);
-  if (health.status !== "ok" || health.ldk_mode !== "live") {
-    throw new Error(`SSP is not live and healthy: ${JSON.stringify(health)}`);
+  if (health.status !== "ok") {
+    throw new Error(`SSP is unhealthy: ${JSON.stringify(health)}`);
   }
-  if (!/^[0-9a-f]{66}$/i.test(health.ssp_identity_pubkey ?? "")) {
-    throw new Error("SSP health has no valid identity public key");
+  const identity = await fetchJson(`${SSP_BASE_URL}/identity`);
+  if (!/^[0-9a-f]{66}$/i.test(identity.identityPublicKey ?? "")) {
+    throw new Error("SSP identity endpoint has no valid public key");
   }
-  return health;
+  const status = await fetchJson(`${SSP_BASE_URL}/status`, {
+    headers: { Authorization: `Bearer ${SPARK_ADMIN_TOKEN}` },
+  });
+  if (status.ldk_mode !== "live") {
+    throw new Error(`SSP Lightning backend is not live: ${JSON.stringify(status)}`);
+  }
+  if (status.ssp_identity_pubkey !== identity.identityPublicKey) {
+    throw new Error("SSP public and operational identities do not match");
+  }
+  return status;
 }
 
 export function walletOptions(health) {

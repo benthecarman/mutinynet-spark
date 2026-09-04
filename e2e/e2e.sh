@@ -82,7 +82,8 @@ curl -s http://127.0.0.1:5000/health; echo
 
 echo "=== embedded Spark wallet funded ==="
 SPARK_JSON=$(curl --fail --silent --show-error --max-time 15 \
-  http://127.0.0.1:5000/health)
+  -H "Authorization: Bearer $SPARK_ADMIN_TOKEN" \
+  http://127.0.0.1:5000/status)
 SPARK_BAL=$(echo "$SPARK_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).spark?.available_sats??0)}catch{console.log(0)}})") || SPARK_BAL=0
 SPARK_TOPUP=$(echo "$SPARK_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{console.log(JSON.parse(s).spark?.needs_topup===true?'yes':'no')}catch{console.log('no')}})") || SPARK_TOPUP=no
 case "$SPARK_BAL" in
@@ -96,7 +97,11 @@ if [ "${SPARK_BAL:-0}" = "0" ] || [ "${SPARK_BAL:-0}" = "null" ] || [ "${SPARK_B
   node e2e/fund-ssp.mjs
 fi
 
-SSP_ID=$(curl -s http://127.0.0.1:5000/health | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);if(j.ssp_identity_pubkey!==j.spark?.identity_pubkey)process.exit(1);console.log(j.ssp_identity_pubkey)})")
+SSP_ID=$(curl -s http://127.0.0.1:5000/identity | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{console.log(JSON.parse(s).identityPublicKey??'')})")
+STATUS_ID=$(echo "$SPARK_JSON" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);if(j.ssp_identity_pubkey!==j.spark?.identity_pubkey)process.exit(1);console.log(j.ssp_identity_pubkey)})")
+if [ -z "$SSP_ID" ] || [ "$SSP_ID" != "$STATUS_ID" ]; then
+  echo "SSP identity mismatch: public=$SSP_ID status=$STATUS_ID"; exit 1
+fi
 echo "SSP and embedded wallet identity aligned: $SSP_ID"
 
 SDK_DIST="$SDK_REF/sdks/js/packages/spark-sdk/dist/index.node.js"

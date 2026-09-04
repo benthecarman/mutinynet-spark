@@ -9,13 +9,22 @@ if (!SDK_DIST) throw new Error("set SPARK_SDK_DIST to the built spark-sdk node e
 const { SparkWallet } = await import(SDK_DIST);
 import { sendToAddress, mineAndWait } from "./faucet.mjs";
 
-const health = await (await fetch("http://127.0.0.1:5000/health")).json();
+const SSP_BASE_URL = process.env.SSP_BASE_URL ?? "http://127.0.0.1:5000";
+const SPARK_ADMIN_TOKEN = process.env.SPARK_ADMIN_TOKEN;
+if (!SPARK_ADMIN_TOKEN) throw new Error("set SPARK_ADMIN_TOKEN");
+const statusOptions = {
+  headers: { Authorization: `Bearer ${SPARK_ADMIN_TOKEN}` },
+};
+const health = await (await fetch(`${SSP_BASE_URL}/health`)).json();
 if (health.status !== "ok") throw new Error("SSP unhealthy");
-console.log(`[e2e 0] SSP health: network=${health.network} ldk_mode=${health.ldk_mode} identity=${health.ssp_identity_pubkey}`);
-const sparkBalanceBefore = BigInt(health.spark.available_sats);
+const identity = await (await fetch(`${SSP_BASE_URL}/identity`)).json();
+if (!identity.identityPublicKey) throw new Error("SSP identity unavailable");
+const status = await (await fetch(`${SSP_BASE_URL}/status`, statusOptions)).json();
+console.log(`[e2e 0] SSP healthy: network=${status.network} ldk_mode=${status.ldk_mode}`);
+const sparkBalanceBefore = BigInt(status.spark.available_sats);
 const SSP = {
-  baseUrl: process.env.SSP_BASE_URL ?? "http://127.0.0.1:5000",
-  identityPublicKey: process.env.SSP_IDENTITY_PUBKEY ?? health.ssp_identity_pubkey,
+  baseUrl: SSP_BASE_URL,
+  identityPublicKey: process.env.SSP_IDENTITY_PUBKEY ?? identity.identityPublicKey,
   schemaEndpoint: "graphql/spark/rc",
 };
 
@@ -70,7 +79,7 @@ await pollBalance(b.wallet, 50_000n, 8.1);
 await pollBalance(a.wallet, 50_000n, 8.2);
 
 for (let i = 0; i < 30; i++) {
-  const current = await (await fetch("http://127.0.0.1:5000/health")).json();
+  const current = await (await fetch(`${SSP_BASE_URL}/status`, statusOptions)).json();
   const available = BigInt(current.spark.available_sats);
   step(8.3, `SSP Spark balance poll ${i}: ${available} sats`);
   if (available === sparkBalanceBefore) break;

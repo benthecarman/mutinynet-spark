@@ -88,10 +88,11 @@ that belong to the currently running operator instances.
 2. Wait for every operator to have signing keyshares and stable TLS files.
 3. Start `ldk-server` and verify its node information and channels.
 4. Start the SSP and wait for `/health`.
-5. Verify that `status` is `ok`, `spark_error` is `null`, and `ldk_mode` is
-   `live`.
-6. Verify that `ssp_identity_pubkey` equals `spark.identity_pubkey` and the
-   configured client identity.
+5. Query authenticated `/status` and verify that `spark_error` is `null` and
+   `ldk_mode` is `live`.
+6. Verify that `/identity`'s `identityPublicKey` equals `/status`'s
+   `ssp_identity_pubkey`, `spark.identity_pubkey`, and the configured client
+   identity.
 7. Fund the exact Spark leaf denominations needed by the service.
 
 Start or recreate the SSP only after operator certificates are ready. This
@@ -100,7 +101,7 @@ prevents the wallet from keeping connections to replaced certificates.
 ## Liquidity
 
 Swap fills and Lightning receives need exact SSP-owned Spark leaves. Monitor
-these `/health` fields:
+these authenticated `/status` fields:
 
 - `spark.available_sats`: spendable leaves visible on the operators.
 - `spark.owned_sats`: all wallet-owned leaves, including temporarily missing
@@ -132,9 +133,9 @@ outbound capacity. The SSP keeps the server-streaming event RPC open without a
 unary deadline, reconnects with capped exponential backoff, and reconciles
 payment state every 30 seconds.
 
-Treat `/health` as ready only when `ldk_mode` is `live` and `ldk_node_id` is the
-expected node. Alert on repeated event-stream reconnects or reconciliation
-errors.
+Use `/health` for basic process liveness. Treat authenticated `/status` as
+ready only when `ldk_mode` is `live` and `ldk_node_id` is the expected node.
+Alert on repeated event-stream reconnects or reconciliation errors.
 
 See [ldk-server compatibility](LDK_GAPS.md) for supported calls and current
 backend gaps.
@@ -152,8 +153,8 @@ data volume during an image rollback.
 ## Secrets and backups
 
 - Do not commit the Spark mnemonic, `SPARK_ADMIN_TOKEN`, or LDK API key.
-- Restrict the admin endpoints at the network edge as well as with the bearer
-  token.
+- Restrict `/status` and the admin endpoints at the network edge as well as
+  with the bearer token.
 - Stop the SSP or use a SQLite-aware backup before copying its data directory.
 - Back up `spark.mnemonic` and the complete SQLite data together.
 - Test restore procedures with a wallet identity check before adding funds.

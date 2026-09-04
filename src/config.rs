@@ -54,7 +54,7 @@ impl Config {
             cors_origins: get("SSP_CORS_ORIGINS", ""),
             network: get("SSP_NETWORK", "REGTEST"),
             // Empty = use the resolved signing key's pubkey (first boot
-            // generates its mnemonic and publishes the key via /health).
+            // generates its mnemonic and publishes the key via /identity).
             ssp_identity_pubkey: get("SSP_IDENTITY_PUBKEY", ""),
             data_dir: get("SSP_DATA_DIR", "./data"),
             ldk_grpc_addr: get("LDK_GRPC_ADDR", ""),

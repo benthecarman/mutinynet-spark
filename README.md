@@ -26,24 +26,27 @@ webhooks are not production-complete. See
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /health` | Process, Spark wallet, liquidity, and LDK status |
+| `GET /health` | Basic process health (`{ "status": "ok" }`) |
+| `GET /identity` | Public SSP identity discovery |
+| `GET /status` | Spark wallet, liquidity, and LDK status (admin bearer token required) |
 | `POST /graphql/spark/rc` | Current Spark SDK GraphQL endpoint |
 | `POST /graphql/spark/2025-03-19` | Dated Spark SDK endpoint |
 | `POST /graphql` | GraphQL compatibility alias |
 | `POST /admin/spark/deposit-address` | Create a Spark deposit address |
 | `POST /admin/spark/claim-deposit` | Claim a confirmed deposit output |
 
-The admin endpoints require `Authorization: Bearer <SPARK_ADMIN_TOKEN>`.
+The status and admin endpoints require
+`Authorization: Bearer <SPARK_ADMIN_TOKEN>`.
 
 ## Client configuration
 
-Read `ssp_identity_pubkey` from `/health` and use it as the SSP identity:
+Read `identityPublicKey` from `/identity` and use it as the SSP identity:
 
 ```json
 {
   "baseUrl": "https://ssp.example.com",
   "schemaEndpoint": "graphql/spark/rc",
-  "identityPublicKey": "<ssp_identity_pubkey>"
+  "identityPublicKey": "<identityPublicKey>"
 }
 ```
 

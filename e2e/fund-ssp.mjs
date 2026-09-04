@@ -51,7 +51,11 @@ for (const deposit of deposits) {
   });
 }
 
-const health = await (await fetch(`${SSP_URL}/health`)).json();
+const status = await (
+  await fetch(`${SSP_URL}/status`, {
+    headers: { Authorization: `Bearer ${TOKEN}` },
+  })
+).json();
 console.log(
-  `funded: ${health.spark.available_sats} sats across ${deposits.length} exact leaves`,
+  `funded: ${status.spark.available_sats} sats across ${deposits.length} exact leaves`,
 );
