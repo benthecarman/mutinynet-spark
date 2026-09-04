@@ -51,13 +51,10 @@ pub trait LdkBackend: Send + Sync {
     ) -> Result<CreateInvoiceResult, String>;
     /// Called when the SO/user reveals a preimage for a pending hodl invoice.
     /// Wired to Bolt11ClaimForHash in live mode.
-    #[allow(dead_code)]
     async fn reveal_and_claim(&self, payment_hash_hex: &str, preimage_hex: &str) -> bool;
     /// Expiry path for hodl invoices (Bolt11FailForHash in live mode).
-    #[allow(dead_code)]
     async fn fail_hold(&self, payment_hash_hex: &str) -> bool;
     /// SSP-held preimage lookup (None when the wallet owns the preimage).
-    #[allow(dead_code)]
     async fn preimage_for(&self, payment_hash_hex: &str) -> Option<String>;
     async fn apply_ln_event(&self, event: LnEvent);
     fn live_node_id(&self) -> Option<String>;
@@ -70,16 +67,12 @@ pub struct PayResult {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct CreateInvoiceResult {
     pub invoice: String,
-    #[allow(dead_code)]
-    pub payment_hash: String,
 }
 
 /// Minimal SSP view of ldk-server SubscribeEvents payloads.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub enum LnEvent {
     OutboundSucceeded {
         payment: Payment,
@@ -412,14 +405,14 @@ where
     Err(last_error.unwrap_or_else(|| "operation failed without an error".to_string()))
 }
 
-fn validate_receive_preimage(payment_hash: &str, preimage: &str) -> Result<(), String> {
-    let bytes = hex::decode(preimage).map_err(|e| format!("operator preimage is not hex: {e}"))?;
+fn validate_preimage(payment_hash: &str, preimage: &str) -> Result<(), String> {
+    let bytes = hex::decode(preimage).map_err(|e| format!("preimage is not hex: {e}"))?;
     if bytes.len() != 32 {
-        return Err("operator preimage must be 32 bytes".to_string());
+        return Err("preimage must be 32 bytes".to_string());
     }
     let digest = hex::encode(Sha256::digest(bytes));
     if digest != payment_hash.to_lowercase() {
-        return Err("operator preimage does not match the Lightning payment hash".to_string());
+        return Err("preimage does not match the Lightning payment hash".to_string());
     }
     Ok(())
 }
@@ -518,7 +511,7 @@ where
                 return Err(format!("Spark receive swap failed: {error}"));
             }
         };
-        if let Err(error) = validate_receive_preimage(payment_hash, &swap.preimage) {
+        if let Err(error) = validate_preimage(payment_hash, &swap.preimage) {
             db.set_receive_status(payment_hash, "PAYMENT_PREIMAGE_RECOVERING_FAILED")
                 .await?;
             return Err(error);
@@ -542,7 +535,7 @@ where
         .preimage
         .as_deref()
         .ok_or_else(|| "committed Spark receive has no preimage".to_string())?;
-    validate_receive_preimage(payment_hash, preimage)?;
+    validate_preimage(payment_hash, preimage)?;
     retry_bounded(
         || ldk.claim_receive(payment_hash, expected_msat, preimage),
         delays,
@@ -682,7 +675,7 @@ impl LdkGrpcBackend {
             .preimage_for(payment_hash)
             .await
             .ok_or_else(|| format!("preimage disappeared for Lightning receive {payment_hash}"))?;
-        validate_receive_preimage(payment_hash, &preimage)?;
+        validate_preimage(payment_hash, &preimage)?;
         self.client
             .bolt11_claim_for_hash(Bolt11ClaimForHashRequest {
                 payment_hash: Some(payment_hash.to_string()),
@@ -1072,15 +1065,11 @@ impl LdkBackend for LdkGrpcBackend {
         )?;
         Ok(CreateInvoiceResult {
             invoice: resp.invoice,
-            payment_hash: payment_hash_hex.to_string(),
         })
     }
 
     async fn reveal_and_claim(&self, payment_hash_hex: &str, preimage_hex: &str) -> bool {
-        let digest = hex::encode(Sha256::digest(
-            hex::decode(preimage_hex).unwrap_or_default(),
-        ));
-        if digest != payment_hash_hex.to_lowercase() {
+        if validate_preimage(payment_hash_hex, preimage_hex).is_err() {
             return false;
         }
         let claimed = self
@@ -1259,15 +1248,11 @@ impl LdkBackend for FakeLdkBackend {
                 &payment_hash_hex[..std::cmp::min(8, payment_hash_hex.len())],
                 expiry_secs
             ),
-            payment_hash: payment_hash_hex.to_string(),
         })
     }
 
     async fn reveal_and_claim(&self, payment_hash_hex: &str, preimage_hex: &str) -> bool {
-        let digest = hex::encode(Sha256::digest(
-            hex::decode(preimage_hex).unwrap_or_default(),
-        ));
-        if digest != payment_hash_hex.to_lowercase() {
+        if validate_preimage(payment_hash_hex, preimage_hex).is_err() {
             return false;
         }
         self.db

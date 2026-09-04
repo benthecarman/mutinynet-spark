@@ -24,6 +24,21 @@ pub struct LightningReceive {
     pub claim_submitted: bool,
 }
 
+fn ensure_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    migration: &str,
+) -> rusqlite::Result<()> {
+    if conn
+        .prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))
+        .is_err()
+    {
+        conn.execute(migration, [])?;
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn open(data_dir: &str) -> Result<Self, String> {
         std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
@@ -44,101 +59,67 @@ impl Db {
              CREATE TABLE IF NOT EXISTS static_quotes(txid TEXT NOT NULL, vout INTEGER NOT NULL, credit INTEGER NOT NULL, signature TEXT NOT NULL, created_at TEXT NOT NULL, claimed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(txid, vout));",
         )
         .map_err(|e| e.to_string())?;
-        // Lightweight migrations for DBs created by older builds: probe for
-        // the column, ALTER when missing.
-        if conn
-            .prepare("SELECT issued_at FROM challenges LIMIT 0")
-            .is_err()
-        {
-            conn.execute(
+        // Keep old databases compatible without a migration framework. Each
+        // probe is idempotent and runs only at startup.
+        for (table, column, migration) in [
+            (
+                "challenges",
+                "issued_at",
                 "ALTER TABLE challenges ADD COLUMN issued_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        if conn.prepare("SELECT owner FROM transfers LIMIT 0").is_err() {
-            conn.execute(
+            ),
+            (
+                "transfers",
+                "owner",
                 "ALTER TABLE transfers ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        if conn
-            .prepare("SELECT idempotency_key FROM requests LIMIT 0")
-            .is_err()
-        {
-            conn.execute("ALTER TABLE requests ADD COLUMN idempotency_key TEXT", [])
-                .map_err(|e| e.to_string())?;
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_owner_idem ON requests(owner, idempotency_key) WHERE idempotency_key IS NOT NULL AND idempotency_key <> ''",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        if conn.prepare("SELECT owner FROM preimages LIMIT 0").is_err() {
-            conn.execute(
+            ),
+            (
+                "requests",
+                "idempotency_key",
+                "ALTER TABLE requests ADD COLUMN idempotency_key TEXT",
+            ),
+            (
+                "preimages",
+                "owner",
                 "ALTER TABLE preimages ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        if conn
-            .prepare("SELECT created_at FROM preimages LIMIT 0")
-            .is_err()
-        {
-            conn.execute(
+            ),
+            (
+                "preimages",
+                "created_at",
                 "ALTER TABLE preimages ADD COLUMN created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        if conn
-            .prepare("SELECT claimed FROM static_quotes LIMIT 0")
-            .is_err()
-        {
-            conn.execute(
+            ),
+            (
+                "static_quotes",
+                "claimed",
                 "ALTER TABLE static_quotes ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        if conn
-            .prepare("SELECT transfer_id FROM receive_payments LIMIT 0")
-            .is_err()
-        {
-            conn.execute(
+            ),
+            (
+                "receive_payments",
+                "transfer_id",
                 "ALTER TABLE receive_payments ADD COLUMN transfer_id TEXT",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        if conn
-            .prepare("SELECT preimage FROM receive_payments LIMIT 0")
-            .is_err()
-        {
-            conn.execute("ALTER TABLE receive_payments ADD COLUMN preimage TEXT", [])
-                .map_err(|e| e.to_string())?;
-        }
-        if conn
-            .prepare("SELECT claimable_amount_msat FROM receive_payments LIMIT 0")
-            .is_err()
-        {
-            conn.execute(
+            ),
+            (
+                "receive_payments",
+                "preimage",
+                "ALTER TABLE receive_payments ADD COLUMN preimage TEXT",
+            ),
+            (
+                "receive_payments",
+                "claimable_amount_msat",
                 "ALTER TABLE receive_payments ADD COLUMN claimable_amount_msat INTEGER",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        if conn
-            .prepare("SELECT claim_submitted FROM receive_payments LIMIT 0")
-            .is_err()
-        {
-            conn.execute(
+            ),
+            (
+                "receive_payments",
+                "claim_submitted",
                 "ALTER TABLE receive_payments ADD COLUMN claim_submitted INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
+            ),
+        ] {
+            ensure_column(&conn, table, column, migration).map_err(|e| e.to_string())?;
         }
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_owner_idem ON requests(owner, idempotency_key) WHERE idempotency_key IS NOT NULL AND idempotency_key <> ''",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(Self {
             inner: Arc::new(Mutex::new(conn)),
         })

@@ -13,12 +13,9 @@ use k256::{elliptic_curve::PrimeField, ProjectivePoint, Scalar};
 use rand::rngs::OsRng;
 use vsss_rs::{feldman, FeldmanVerifierSet, IdentifierPrimeField, Share, ValueGroup};
 
-/// A share with Feldman proofs, byte-oriented like the SDK's
-/// `WasmVerifiableSecretShare` ({threshold, index, share, proofs}).
+/// A share with Feldman proofs, byte-oriented like the SDK wire format.
 #[derive(Clone, Debug)]
 pub struct VerifiableSecretShare {
-    #[allow(dead_code)]
-    pub threshold: usize,
     pub index: u32,
     pub share: Vec<u8>,
     /// Compressed SEC1 pubkeys (33 bytes each), one per coefficient.
@@ -85,7 +82,6 @@ pub fn split_secret_with_proofs(
     Ok(shares
         .iter()
         .map(|s| VerifiableSecretShare {
-            threshold,
             index: scalar_to_index(&s.identifier().0),
             share: scalar_to_bytes(&s.value().0),
             proofs: proofs.clone(),
