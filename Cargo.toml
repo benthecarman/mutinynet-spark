@@ -42,5 +42,8 @@ ecies = { version = "0.2.11", default-features = false, features = ["aes-rust"] 
 # LDK_GRPC_ADDR + credentials are set, fake mode otherwise).
 ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", package = "ldk-server-client" }
 
+[dev-dependencies]
+parking_lot = "0.12"
+
 [features]
 default = []

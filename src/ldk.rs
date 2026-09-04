@@ -1563,17 +1563,16 @@ impl LdkBackend for FakeLdkBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Mutex as StdMutex,
-    };
+    use parking_lot::Mutex as SyncMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
     struct MockSpark {
         calls: AtomicUsize,
         failures: AtomicUsize,
         preimage: String,
-        log: Arc<StdMutex<Vec<&'static str>>>,
+        error_message: Option<String>,
+        log: Arc<SyncMutex<Vec<&'static str>>>,
     }
 
     #[async_trait::async_trait]
@@ -1586,7 +1585,10 @@ mod tests {
             _amount_sats: u64,
         ) -> Result<LightningReceiveSwap, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.log.lock().unwrap().push("spark");
+            self.log.lock().push("spark");
+            if let Some(error) = &self.error_message {
+                return Err(error.clone());
+            }
             if self
                 .failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
@@ -1626,7 +1628,7 @@ mod tests {
         claims: AtomicUsize,
         failures: AtomicUsize,
         failed_holds: AtomicUsize,
-        log: Arc<StdMutex<Vec<&'static str>>>,
+        log: Arc<SyncMutex<Vec<&'static str>>>,
     }
 
     #[async_trait::async_trait]
@@ -1638,7 +1640,7 @@ mod tests {
             _preimage: &str,
         ) -> Result<(), String> {
             self.claims.fetch_add(1, Ordering::SeqCst);
-            self.log.lock().unwrap().push("claim");
+            self.log.lock().push("claim");
             if self
                 .failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
@@ -1685,7 +1687,7 @@ mod tests {
         (db, dir, payment_hash, preimage)
     }
 
-    fn mock_spark(preimage: String, log: Arc<StdMutex<Vec<&'static str>>>) -> MockSpark {
+    fn mock_spark(preimage: String, log: Arc<SyncMutex<Vec<&'static str>>>) -> MockSpark {
         MockSpark {
             preimage,
             log,
@@ -1750,7 +1752,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn wallet_created_receive_commits_and_claims() {
         let (db, dir, hash, preimage) = receive_fixture().await;
-        let log = Arc::new(StdMutex::new(Vec::new()));
+        let log = Arc::new(SyncMutex::new(Vec::new()));
         let spark = mock_spark(preimage, log.clone());
         let ldk = MockLdk {
             log: log.clone(),
@@ -1767,7 +1769,7 @@ mod tests {
         assert!(receive.transfer_id.is_some());
         assert_eq!(receive.preimage, Some("01".repeat(32)));
         assert!(receive.claim_submitted);
-        assert_eq!(*log.lock().unwrap(), vec!["spark", "claim"]);
+        assert_eq!(*log.lock(), vec!["spark", "claim"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2039,6 +2041,38 @@ mod tests {
         // immediately instead of waiting for expiry cleanup.
         assert_eq!(spark.calls.load(Ordering::SeqCst), 0);
         assert_eq!(ldk.claims.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.failed_holds.load(Ordering::SeqCst), 1);
+        assert_eq!(db.receive_status(&hash).await.unwrap(), "HTLC_FAILED");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unselectable_amount_fails_the_hold_for_refund() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        let spark = MockSpark {
+            // Exact-conservation leaf selection reports unrepresentable
+            // amounts this way; the string must stay a definitive failure.
+            error_message: Some("unselectable amount".to_string()),
+            ..mock_spark(preimage, Arc::new(SyncMutex::new(Vec::new())))
+        };
+        let ldk = MockLdk::default();
+
+        assert!(process_standard_receive(
+            &db,
+            &tokio::sync::Mutex::new(()),
+            &spark,
+            &ldk,
+            &hash,
+            Some(5_000_000),
+            &[],
+        )
+        .await
+        .is_err());
+
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ldk.claims.load(Ordering::SeqCst), 0);
+        // The hold is failed so the payer is refunded instead of waiting
+        // for expiry cleanup.
         assert_eq!(ldk.failed_holds.load(Ordering::SeqCst), 1);
         assert_eq!(db.receive_status(&hash).await.unwrap(), "HTLC_FAILED");
         std::fs::remove_dir_all(dir).unwrap();

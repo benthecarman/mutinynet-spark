@@ -2164,6 +2164,7 @@ dependencies = [
  "k256",
  "ldk-server-client",
  "lightning-invoice",
+ "parking_lot",
  "rand 0.8.8",
  "rusqlite",
  "secp256k1",

@@ -1377,6 +1377,23 @@ mod tests {
 
         let mode = std::fs::metadata(&db_path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+
+        // A write in WAL mode creates the -wal sidecar; SQLite gives it
+        // exactly the database file's mode, so it must be owner-only too.
+        db.insert_request(
+            "request",
+            "LIGHTNING_RECEIVE",
+            "owner",
+            &chrono::Utc::now().to_rfc3339(),
+            &serde_json::json!({"payment_hash": "hash"}),
+            None,
+        )
+        .await
+        .unwrap();
+        let wal_path = dir.join("ssp.sqlite-wal");
+        assert!(wal_path.exists());
+        let wal_mode = std::fs::metadata(&wal_path).unwrap().permissions().mode();
+        assert_eq!(wal_mode & 0o777, 0o600);
         drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
     }
