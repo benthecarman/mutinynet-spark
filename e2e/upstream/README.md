@@ -16,7 +16,7 @@ revisions:
 
 The supplemental JavaScript suite builds the SDK and runs `e2e/e2e.sh`. Local
 runs must set `SPARK_REF`, `SDK_REF`, and `LDK_SERVER_REF` if the checkouts are
-not in `/tmp/opencode`.
+not in a shared temporary checkout.
 
 The Lightning acceptance test runs `e2e/ln-e2e.sh`. It uses the Spark checkout
 only to build three local operators and uses the Rust Breez SDK at revision

@@ -19,7 +19,7 @@ failure_logs() {
 }
 trap failure_logs EXIT
 
-export SPARK_REF="${SPARK_REF:-/tmp/opencode/spark-ref}"
+export SPARK_REF="${SPARK_REF:-/tmp/open-ssp/spark-ref}"
 export SDK_REF="${SDK_REF:-$SPARK_REF}"
 export SPARK_DANGEROUSLY_DISABLE_TLS_VERIFICATION=1
 export MINING=1
@@ -72,6 +72,30 @@ for attempt in $(seq 1 120); do
   sleep 5
 done
 
+echo "=== wait for SO SSP endpoints ==="
+for attempt in $(seq 1 60); do
+  ssp_endpoints_ready=1
+  for index in 0 1 2; do
+    if ! "${COMPOSE[@]}" exec -T "spark-operator-${index}" \
+      bash -c 'echo >/dev/tcp/127.0.0.1/8536' 2>/dev/null; then
+      ssp_endpoints_ready=0
+      break
+    fi
+  done
+  if [ "$ssp_endpoints_ready" = "1" ]; then
+    echo "SO SSP endpoints ready"
+    break
+  fi
+  if [ "$attempt" = 60 ]; then
+    echo "SO SSP endpoints did not become ready"
+    exit 1
+  fi
+  sleep 2
+done
+
+echo "=== start SSPs after operators are ready ==="
+"${COMPOSE[@]}" up -d --no-deps ssp ssp-2
+
 echo "=== wait for SSP ==="
 for i in $(seq 1 90); do
   if curl -sf http://127.0.0.1:5000/health > /dev/null; then break; fi
@@ -90,11 +114,11 @@ case "$SPARK_BAL" in
   ''|*[!0-9]*) SPARK_BAL=0 ;;
 esac
 echo "Spark available: $SPARK_BAL topup_flag: $SPARK_TOPUP"
-# Swap ladder denominations deplete as fills consume exact matches; top up
-# before the wallet is empty (failed fills can lock leaves operator-side).
-if [ "${SPARK_BAL:-0}" = "0" ] || [ "${SPARK_BAL:-0}" = "null" ] || [ "${SPARK_BAL:-0}" -lt 10000000 ] || [ "$SPARK_TOPUP" = "yes" ]; then
+# A single coarse leaf makes the two swaps below exercise an initial split and
+# then a repeated split of its change child.
+if [ "${SPARK_BAL:-0}" = "0" ] || [ "${SPARK_BAL:-0}" = "null" ] || [ "${SPARK_BAL:-0}" -lt 114000 ] || [ "$SPARK_TOPUP" = "yes" ]; then
   echo "funding/topping up embedded Spark wallet..."
-  node e2e/fund-ssp.mjs
+  FUND_LADDER=114000 FUND_MULTIPLICITY=1 node e2e/fund-ssp.mjs
 fi
 
 SSP_ID=$(curl -s http://127.0.0.1:5000/identity | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{console.log(JSON.parse(s).identityPublicKey??'')})")
@@ -123,6 +147,38 @@ for index in 0 1 2; do
   unsettled=$(echo "$unsettled" | tr -d '[:space:]')
   if [ "$linked" -lt 1 ] || [ "$unsettled" -ne 0 ]; then
     echo "operator ${index} has linked=${linked} unsettled=${unsettled} swap transfers"
+    exit 1
+  fi
+
+  max_depth=$("${COMPOSE[@]}" exec -T postgres psql \
+    -U postgres -d "sparkoperator_${index}" -tAc \
+    "WITH RECURSIVE depths AS (
+       SELECT id, tree_node_parent, 0 AS depth FROM tree_nodes WHERE tree_node_parent IS NULL
+       UNION ALL
+       SELECT child.id, child.tree_node_parent, parent.depth + 1
+       FROM tree_nodes child JOIN depths parent ON child.tree_node_parent = parent.id
+     ) SELECT COALESCE(MAX(depth), 0) FROM depths;")
+  direct_grandchildren=$("${COMPOSE[@]}" exec -T postgres psql \
+    -U postgres -d "sparkoperator_${index}" -tAc \
+    "WITH RECURSIVE depths AS (
+       SELECT id, tree_node_parent, direct_tx, 0 AS depth FROM tree_nodes WHERE tree_node_parent IS NULL
+       UNION ALL
+       SELECT child.id, child.tree_node_parent, child.direct_tx, parent.depth + 1
+       FROM tree_nodes child JOIN depths parent ON child.tree_node_parent = parent.id
+     ) SELECT count(*) FROM depths WHERE depth >= 2 AND direct_tx IS NOT NULL;")
+  transferred_parent_splits=$("${COMPOSE[@]}" exec -T postgres psql \
+    -U postgres -d "sparkoperator_${index}" -tAc \
+    "SELECT count(DISTINCT parent.id)
+     FROM tree_nodes parent
+     JOIN tree_nodes child ON child.tree_node_parent = parent.id
+     JOIN trees tree ON parent.tree_node_tree = tree.id
+     JOIN deposit_addresses deposit ON tree.deposit_address_tree = deposit.id
+     WHERE parent.owner_identity_pubkey <> deposit.owner_identity_pubkey;")
+  max_depth=$(echo "$max_depth" | tr -d '[:space:]')
+  direct_grandchildren=$(echo "$direct_grandchildren" | tr -d '[:space:]')
+  transferred_parent_splits=$(echo "$transferred_parent_splits" | tr -d '[:space:]')
+  if [ "$max_depth" -lt 2 ] || [ "$direct_grandchildren" -lt 1 ] || [ "$transferred_parent_splits" -lt 1 ]; then
+    echo "operator ${index} has max split depth=${max_depth} direct grandchildren=${direct_grandchildren} transferred-parent splits=${transferred_parent_splits}"
     exit 1
   fi
 done

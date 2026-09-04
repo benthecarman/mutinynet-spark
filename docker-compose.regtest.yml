@@ -1,7 +1,7 @@
 # Local regtest e2e stack: bitcoind + postgres + 3 Spark Operators + our SSP.
 #
 # Usage:
-#   SPARK_REF=/tmp/opencode/spark-ref docker compose -f docker-compose.regtest.yml up --build -d
+#   SPARK_REF=/tmp/open-ssp/spark-ref docker compose -f docker-compose.regtest.yml up --build -d
 #   ./e2e/e2e.sh   # runs the SDK end-to-end test, tears nothing down
 #   docker compose -f docker-compose.regtest.yml down
 #
@@ -13,7 +13,7 @@
 
 x-operator-common: &operator-common
   build:
-    context: ${SPARK_REF:-/tmp/opencode/spark-ref}
+    context: ${SPARK_REF:-/tmp/open-ssp/spark-ref}
     dockerfile: Dockerfile
   depends_on:
     postgres:
@@ -175,6 +175,8 @@ services:
       - /opt/spark/entrypoint.sh 0
     ports:
       - "127.0.0.1:8535:8535"
+    expose:
+      - "8536"
     networks:
       default:
         aliases:
@@ -186,6 +188,8 @@ services:
       - /opt/spark/entrypoint.sh 1
     ports:
       - "127.0.0.1:8536:8535"
+    expose:
+      - "8536"
     networks:
       default:
         aliases:
@@ -197,6 +201,8 @@ services:
       - /opt/spark/entrypoint.sh 2
     ports:
       - "127.0.0.1:8537:8535"
+    expose:
+      - "8536"
     networks:
       default:
         aliases:
@@ -207,7 +213,7 @@ services:
   # to it over gRPC whenever LDK_GRPC_ADDR and credentials are set.
   ldk-server:
     build:
-      context: ${LDK_SERVER_REF:-/tmp/opencode/ldk-server-ref}
+      context: ${LDK_SERVER_REF:-/tmp/open-ssp/ldk-server-ref}
       dockerfile: Dockerfile
     depends_on:
       bitcoind:
@@ -231,6 +237,7 @@ services:
         trap 'kill -TERM "$$PID"' TERM INT
         while kill -0 "$$PID" 2>/dev/null; do
           if [ -f /data/regtest/api_key ] && [ -f /data/tls.crt ]; then
+            chmod 0755 /data/regtest
             chmod 0444 /data/regtest/api_key /data/tls.crt
             break
           fi
@@ -242,7 +249,7 @@ services:
   # Second node: LN counterparty for e2e send/receive (channel peer for ldk-server).
   ldk-server-2:
     build:
-      context: ${LDK_SERVER_REF:-/tmp/opencode/ldk-server-ref}
+      context: ${LDK_SERVER_REF:-/tmp/open-ssp/ldk-server-ref}
       dockerfile: Dockerfile
     depends_on:
       bitcoind:
@@ -261,6 +268,7 @@ services:
         trap 'kill -TERM "$$PID"' TERM INT
         while kill -0 "$$PID" 2>/dev/null; do
           if [ -f /data/regtest/api_key ] && [ -f /data/tls.crt ]; then
+            chmod 0755 /data/regtest
             chmod 0444 /data/regtest/api_key /data/tls.crt
             break
           fi
@@ -306,6 +314,9 @@ services:
       SO_HOSTS: ${SO_HOSTS:-spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535}
       SO_IDENTITY_PUBKEYS: ${SO_IDENTITY_PUBKEYS:-0322ca18fc489ae25418a0e768273c2c61cabb823edfb14feb891e9bec62016510,0341727a6c41b168f07eb50865ab8c397a53c7eef628ac1020956b705e43b6cb27,0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6}
       SO_CERT_FILES: /tls/server_0.crt,/tls/server_1.crt,/tls/server_2.crt
+      SSP_OPERATOR_HOSTS: spark-operator-0.minikube.local:8536,spark-operator-1.minikube.local:8536,spark-operator-2.minikube.local:8536
+      SSP_OPERATOR_CERT_FILES: /tls/server_0.crt,/tls/server_1.crt,/tls/server_2.crt
+      SSP_MIN_SPLIT_CHILD_SATS: 330
       SPARK_ADMIN_TOKEN: ${SPARK_ADMIN_TOKEN:?set SPARK_ADMIN_TOKEN}
       # Live LDK backend: bitcoind-backed ldk-server above.
       LDK_GRPC_ADDR: ${LDK_GRPC_ADDR:-ldk-server:3536}
@@ -349,6 +360,9 @@ services:
       SO_HOSTS: spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535
       SO_IDENTITY_PUBKEYS: 0322ca18fc489ae25418a0e768273c2c61cabb823edfb14feb891e9bec62016510,0341727a6c41b168f07eb50865ab8c397a53c7eef628ac1020956b705e43b6cb27,0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6
       SO_CERT_FILES: /tls/server_0.crt,/tls/server_1.crt,/tls/server_2.crt
+      SSP_OPERATOR_HOSTS: spark-operator-0.minikube.local:8536,spark-operator-1.minikube.local:8536,spark-operator-2.minikube.local:8536
+      SSP_OPERATOR_CERT_FILES: /tls/server_0.crt,/tls/server_1.crt,/tls/server_2.crt
+      SSP_MIN_SPLIT_CHILD_SATS: 330
       SPARK_ADMIN_TOKEN: ${SPARK_ADMIN_TOKEN:?set SPARK_ADMIN_TOKEN}
       LDK_GRPC_ADDR: ldk-server-2:3536
       LDK_API_KEY_FILE: /ldk-data/regtest/api_key

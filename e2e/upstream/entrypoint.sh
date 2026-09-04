@@ -50,4 +50,5 @@ exec spark-operator \
   -ephemeral-database "postgresql://postgres@postgres:5432/spark_ephemeral_${INDEX}?sslmode=disable" \
   -server-cert "$TLS_DIR/server_${INDEX}.crt" \
   -server-key "$TLS_DIR/server_${INDEX}.key" \
+  -ssp-grpc-port 8536 \
   -local true

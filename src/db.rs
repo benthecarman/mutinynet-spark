@@ -1318,6 +1318,24 @@ impl Db {
         .await
     }
 
+    /// Retire overrides when an incoming transfer rotates those node IDs back
+    /// to their normal derived keys. Pending split keys are intentionally kept:
+    /// they represent a different, not-yet-bound creation operation.
+    pub async fn retire_spark_leaf_keys(&self, node_ids: &[String]) -> Result<(), String> {
+        let node_ids = node_ids.to_vec();
+        self.with(move |c| {
+            let tx = c.unchecked_transaction()?;
+            for node_id in node_ids {
+                tx.execute(
+                    "DELETE FROM spark_leaf_key_overrides WHERE node_id=?1",
+                    (&node_id,),
+                )?;
+            }
+            tx.commit()
+        })
+        .await
+    }
+
     pub async fn pending_spark_split_keys(
         &self,
         operation_id: &str,
@@ -1555,6 +1573,16 @@ impl ::spark::signer::LeafKeyOverrideStore for Db {
     ) -> Result<(), ::spark::signer::LeafKeyOverrideStoreError> {
         let node_ids = node_ids.iter().map(ToString::to_string).collect::<Vec<_>>();
         self.bind_pending_spark_split_keys(operation_id, &node_ids)
+            .await
+            .map_err(::spark::signer::LeafKeyOverrideStoreError::Generic)
+    }
+
+    async fn retire_leaf_keys(
+        &self,
+        node_ids: &[::spark::tree::TreeNodeId],
+    ) -> Result<(), ::spark::signer::LeafKeyOverrideStoreError> {
+        let node_ids = node_ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+        self.retire_spark_leaf_keys(&node_ids)
             .await
             .map_err(::spark::signer::LeafKeyOverrideStoreError::Generic)
     }
@@ -2021,6 +2049,57 @@ mod tests {
                 .await
                 .unwrap(),
             Some(vec![vec![1], vec![2]])
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retiring_returned_leaf_override_is_atomic_and_restart_safe() {
+        let (db, dir) = test_db();
+        db.put_pending_spark_split_keys(
+            "split",
+            "parent",
+            &[b"encrypted-a".to_vec(), b"encrypted-b".to_vec()],
+        )
+        .await
+        .unwrap();
+        db.get_or_insert_spark_split(&SparkSplitOperation {
+            operation_id: "split".to_string(),
+            parent_node_id: "parent".to_string(),
+            parent_value_sats: 2_000,
+            child_values_sats: vec![1_000, 1_000],
+            plan: vec![1],
+            status: "SUBMITTED".to_string(),
+            child_node_ids: Vec::new(),
+            last_error: None,
+        })
+        .await
+        .unwrap();
+        db.bind_pending_spark_split_keys("split", &["child-a".to_string(), "child-b".to_string()])
+            .await
+            .unwrap();
+
+        db.put_pending_spark_split_keys("next-split", "other-parent", &[vec![9], vec![10]])
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            db.retire_spark_leaf_keys(&["child-a".to_string()])
+                .await
+                .unwrap();
+        }
+        drop(db);
+
+        let db = Db::open(dir.to_str().unwrap()).unwrap();
+        assert_eq!(db.spark_leaf_key_override("child-a").await.unwrap(), None);
+        assert_eq!(
+            db.spark_leaf_key_override("child-b").await.unwrap(),
+            Some(b"encrypted-b".to_vec())
+        );
+        assert_eq!(
+            db.pending_spark_split_keys("next-split", "other-parent")
+                .await
+                .unwrap(),
+            Some(vec![vec![9], vec![10]])
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

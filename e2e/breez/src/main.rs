@@ -31,7 +31,8 @@ struct TestConfig {
     cert_dir: PathBuf,
     send_amount_sats: u64,
     receive_amount_sats: u64,
-    ssp_receive_leaf_sats: u64,
+    repeated_receive_amount_sats: u64,
+    ssp_funding_leaf_sats: u64,
     timeout: Duration,
 }
 
@@ -65,9 +66,13 @@ impl TestConfig {
         let receive_amount_sats = optional_env("BREEZ_RECEIVE_AMOUNT_SATS", "2000")
             .parse()
             .context("BREEZ_RECEIVE_AMOUNT_SATS is not an integer")?;
-        let ssp_receive_leaf_sats: u64 = optional_env("BREEZ_SSP_RECEIVE_LEAF_SATS", "1000")
+        let repeated_receive_amount_sats =
+            optional_env("BREEZ_REPEATED_RECEIVE_AMOUNT_SATS", "1333")
+                .parse()
+                .context("BREEZ_REPEATED_RECEIVE_AMOUNT_SATS is not an integer")?;
+        let ssp_funding_leaf_sats: u64 = optional_env("BREEZ_SSP_FUNDING_LEAF_SATS", "5000")
             .parse()
-            .context("BREEZ_SSP_RECEIVE_LEAF_SATS is not an integer")?;
+            .context("BREEZ_SSP_FUNDING_LEAF_SATS is not an integer")?;
         let timeout_secs = optional_env("BREEZ_E2E_TIMEOUT_SECS", "180")
             .parse()
             .context("BREEZ_E2E_TIMEOUT_SECS is not an integer")?;
@@ -80,19 +85,12 @@ impl TestConfig {
             "BREEZ_RECEIVE_AMOUNT_SATS must be positive"
         );
         ensure!(
-            send_amount_sats == ssp_receive_leaf_sats,
-            "BREEZ_SEND_AMOUNT_SATS must equal one SSP receive leaf"
+            repeated_receive_amount_sats > 0,
+            "BREEZ_REPEATED_RECEIVE_AMOUNT_SATS must be positive"
         );
-        // Receives are exactly value-conserving: the SSP pays exactly the
-        // invoice amount from whole leaves and cannot split its own leaves
-        // (Spark leaf swaps are SSP-mediated), so the bootstrap amount must
-        // be composable from the coarse ladder - here exactly two leaves.
         ensure!(
-            receive_amount_sats
-                == ssp_receive_leaf_sats
-                    .checked_mul(2)
-                    .context("BREEZ_SSP_RECEIVE_LEAF_SATS is too large")?,
-            "BREEZ_RECEIVE_AMOUNT_SATS must equal exactly two SSP receive leaves"
+            ssp_funding_leaf_sats > receive_amount_sats + repeated_receive_amount_sats,
+            "BREEZ_SSP_FUNDING_LEAF_SATS must cover both split receives"
         );
 
         Ok(Self {
@@ -105,7 +103,8 @@ impl TestConfig {
             cert_dir: PathBuf::from(required_env("BREEZ_OPERATOR_CERT_DIR")?),
             send_amount_sats,
             receive_amount_sats,
-            ssp_receive_leaf_sats,
+            repeated_receive_amount_sats,
+            ssp_funding_leaf_sats,
             timeout: Duration::from_secs(timeout_secs),
         })
     }
@@ -452,6 +451,22 @@ async fn ssp_available_balance(client: &Client, config: &TestConfig, ssp_url: &s
     status["spark"]["available_sats"]
         .as_u64()
         .context("SSP status has no available Spark balance")
+}
+
+async fn restart_ssp(
+    client: &Client,
+    config: &TestConfig,
+    ssp_url: &str,
+    container_env: &str,
+) -> Result<()> {
+    let container = required_env(container_env)?;
+    command_output("docker", &["restart", &container]).await?;
+    poll("SSP restart", config.timeout, || async {
+        admin_json(client, config, ssp_url, "/status", None)
+            .await
+            .map(|_| ())
+    })
+    .await
 }
 
 async fn fund_ssp(
@@ -913,11 +928,10 @@ async fn bootstrap_wallet(
     spark_credit_sats: u64,
     timeout: Duration,
 ) -> Result<()> {
-    ensure!(
-        wallet_balance(wallet).await? == 0,
-        "{} bootstrap balance is not zero",
-        wallet.name
-    );
+    let balance_before = wallet_balance(wallet).await?;
+    let balance_after = balance_before
+        .checked_add(spark_credit_sats)
+        .context("expected bootstrap balance overflow")?;
     let invoice = wallet
         .sdk
         .receive_payment(ReceivePaymentRequest {
@@ -942,7 +956,7 @@ async fn bootstrap_wallet(
         "unexpected bootstrap payment: {payment:?}"
     );
     poll("bootstrap wallet balance", timeout, || {
-        exact_balance(wallet, spark_credit_sats)
+        exact_balance(wallet, balance_after)
     })
     .await?;
     poll("bootstrap outbound LDK payment", timeout, || {
@@ -980,9 +994,12 @@ async fn pay_between(
                 payment_hash: None,
             },
         })
-        .await?
+        .await
+        .with_context(|| format!("{label} receiver invoice creation failed"))?
         .payment_request;
-    let payment_hash = decode_payment_hash(&receiver.ldk, &invoice).await?;
+    let payment_hash = decode_payment_hash(&receiver.ldk, &invoice)
+        .await
+        .with_context(|| format!("{label} invoice decoding failed"))?;
     let prepared = sender
         .sdk
         .prepare_send_payment(PrepareSendPaymentRequest {
@@ -994,7 +1011,8 @@ async fn pay_between(
             conversion_options: None,
             fee_policy: None,
         })
-        .await?;
+        .await
+        .with_context(|| format!("{label} send preparation failed"))?;
     ensure!(
         prepared.amount == u128::from(amount_sats),
         "prepared amount is {}; expected {amount_sats}",
@@ -1007,7 +1025,8 @@ async fn pay_between(
             options: None,
             idempotency_key: None,
         })
-        .await?;
+        .await
+        .with_context(|| format!("{label} send execution failed"))?;
     let sender_payment = poll(&format!("{label} Breez send"), timeout, || {
         completed_payment(sender, &sent.payment.id)
     })
@@ -1273,14 +1292,12 @@ async fn run(
     wallet_a: &Wallet,
     wallet_b: &Wallet,
 ) -> Result<()> {
-    println!("fund coarse SSP receive leaves");
+    println!("fund one coarse SSP leaf per receiver");
     for wallet in [wallet_a, wallet_b] {
-        for _ in 0..3 {
-            fund_ssp(client, config, wallet.ssp_url, config.ssp_receive_leaf_sats).await?;
-        }
+        fund_ssp(client, config, wallet.ssp_url, config.ssp_funding_leaf_sats).await?;
     }
-    // Receives are exactly value-conserving: the wallet is credited exactly
-    // the invoice amount in Spark, never a rounded-up whole-leaf sum.
+    // Neither receiver has an exact leaf, so these payments require an
+    // on-demand split rather than consuming pre-sized liquidity.
     bootstrap_wallet(
         wallet_b,
         &wallet_a.ldk,
@@ -1299,18 +1316,56 @@ async fn run(
     )
     .await
     .context("wallet A exact bootstrap receive failed")?;
-    println!("send one full leaf from wallet B to wallet A over Lightning");
+
+    println!("restart SSP A and split its previous change child again");
+    restart_ssp(client, config, wallet_a.ssp_url, "SSP1_CONTAINER").await?;
+    bootstrap_wallet(
+        wallet_a,
+        &wallet_b.ldk,
+        config.repeated_receive_amount_sats,
+        config.repeated_receive_amount_sats,
+        config.timeout,
+    )
+    .await
+    .context("wallet A repeated split receive failed after SSP restart")?;
+
+    println!("seed exact leaves for the Lightning send matrix");
+    for wallet in [wallet_a, wallet_b] {
+        for _ in 0..3 {
+            fund_ssp(client, config, wallet.ssp_url, config.send_amount_sats).await?;
+        }
+    }
+    bootstrap_wallet(
+        wallet_b,
+        &wallet_a.ldk,
+        config.send_amount_sats,
+        config.send_amount_sats,
+        config.timeout,
+    )
+    .await
+    .context("wallet B send-liquidity bootstrap failed")?;
+    bootstrap_wallet(
+        wallet_a,
+        &wallet_b.ldk,
+        config.send_amount_sats,
+        config.send_amount_sats,
+        config.timeout,
+    )
+    .await
+    .context("wallet A send-liquidity bootstrap failed")?;
+
+    println!("send from wallet B to wallet A over Lightning");
     let first_hash = pay_between(
         wallet_b,
         wallet_a,
         config.send_amount_sats,
-        config.ssp_receive_leaf_sats,
+        config.send_amount_sats,
         "ssp-2-send-ssp-1-receive",
         config.timeout,
     )
     .await
     .context("wallet B to wallet A payment failed")?;
-    println!("send one full leaf from wallet A to wallet B over Lightning");
+    println!("send from wallet A to wallet B over Lightning");
     let second_hash = pay_between(
         wallet_a,
         wallet_b,

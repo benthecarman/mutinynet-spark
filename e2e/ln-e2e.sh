@@ -8,8 +8,8 @@ COMPOSE=(docker compose -p "$PROJECT_NAME" -f docker-compose.regtest.yml)
 export COMPOSE_PROGRESS=${COMPOSE_PROGRESS:-plain}
 export COMPOSE_BAKE=${COMPOSE_BAKE:-false}
 export SPARK_ADMIN_TOKEN=${SPARK_ADMIN_TOKEN:-regtest-spark-admin-token}
-SPARK_SOURCE_REF=${SPARK_REF:-/tmp/opencode/spark-ref}
-export LDK_SERVER_REF=${LDK_SERVER_REF:-/tmp/opencode/ldk-server-ref}
+SPARK_SOURCE_REF=${SPARK_REF:-/tmp/open-ssp/spark-ref}
+export LDK_SERVER_REF=${LDK_SERVER_REF:-/tmp/open-ssp/ldk-server-ref}
 export BITCOIN_RPC_USER=${BITCOIN_RPC_USER:-testutil}
 export BITCOIN_RPC_PASSWORD=${BITCOIN_RPC_PASSWORD:-testutilpassword}
 export BITCOIN_RPC_WALLET=${BITCOIN_RPC_WALLET:-default}
@@ -122,12 +122,14 @@ done
 
 LDK1=$("${COMPOSE[@]}" ps -q ldk-server)
 LDK2=$("${COMPOSE[@]}" ps -q ldk-server-2)
-if [ -z "$LDK1" ] || [ -z "$LDK2" ]; then
-  echo "Lightning containers are not running" >&2
+SSP1=$("${COMPOSE[@]}" ps -q ssp)
+if [ -z "$LDK1" ] || [ -z "$LDK2" ] || [ -z "$SSP1" ]; then
+  echo "Lightning or SSP containers are not running" >&2
   exit 1
 fi
 export LDK1_CONTAINER=$LDK1
 export LDK2_CONTAINER=$LDK2
+export SSP1_CONTAINER=$SSP1
 
 echo "=== copy operator trust certificates ==="
 for index in 0 1 2; do
@@ -137,3 +139,20 @@ export BREEZ_OPERATOR_CERT_DIR=$TLS_DIR
 
 echo "=== run Breez SDK send and receive ==="
 cargo run --locked --manifest-path e2e/breez/Cargo.toml
+
+echo "=== verify repeated split trees on every operator ==="
+for index in 0 1 2; do
+  max_depth=$("${COMPOSE[@]}" exec -T postgres psql \
+    -U postgres -d "sparkoperator_${index}" -tAc \
+    "WITH RECURSIVE depths AS (
+       SELECT id, tree_node_parent, 0 AS depth FROM tree_nodes WHERE tree_node_parent IS NULL
+       UNION ALL
+       SELECT child.id, child.tree_node_parent, parent.depth + 1
+       FROM tree_nodes child JOIN depths parent ON child.tree_node_parent = parent.id
+     ) SELECT COALESCE(MAX(depth), 0) FROM depths;")
+  max_depth=$(echo "$max_depth" | tr -d '[:space:]')
+  if [ "$max_depth" -lt 2 ]; then
+    echo "operator ${index} has max split depth=${max_depth}; expected at least 2" >&2
+    exit 1
+  fi
+done

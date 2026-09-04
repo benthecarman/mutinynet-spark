@@ -3,6 +3,8 @@
 // (or ./e2e.sh which sets everything). Regtest-only: mines its own blocks.
 process.env.MINING ??= "1";
 
+import { execFileSync } from "node:child_process";
+
 const SDK_DIST = process.env.SPARK_SDK_DIST;
 if (!SDK_DIST) throw new Error("set SPARK_SDK_DIST to the built spark-sdk node entry");
 
@@ -36,6 +38,22 @@ const opts = () => ({
 });
 
 const step = (n, msg) => console.log(`[e2e ${n}] ${msg}`);
+
+async function restartSsp() {
+  execFileSync(
+    "docker",
+    ["compose", "-f", "docker-compose.regtest.yml", "restart", "ssp"],
+    { stdio: "inherit" },
+  );
+  for (let i = 0; i < 60; i++) {
+    try {
+      const response = await fetch(`${SSP_BASE_URL}/health`);
+      if (response.ok && (await response.json()).status === "ok") return;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  throw new Error("SSP did not become healthy after restart");
+}
 
 const a = await SparkWallet.initialize({ options: opts() });
 step(1, `wallet A ready: ${await a.wallet.getSparkAddress()}`);
@@ -86,6 +104,35 @@ for (let i = 0; i < 30; i++) {
   if (i === 29) {
     throw new Error(
       `SSP did not reclaim swap input: ${available}; expected ${sparkBalanceBefore}`,
+    );
+  }
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+}
+
+// The first swap turns the SSP's 114,000-sat funding leaf into two 50,000-sat
+// counter leaves and a 14,000-sat change child. Restart before asking for
+// 13,000 sats so the second swap proves persisted child-key recovery, repeated
+// splitting of that change child, and splitting the reclaimed user tree leaf.
+step(8.4, "restart SSP after first on-demand split");
+await restartSsp();
+await b.wallet.transfer({
+  amountSats: 13_000,
+  receiverSparkAddress: await a.wallet.getSparkAddress(),
+});
+step(8.5, "transferred 13000 B -> A through a repeated leaf split");
+await b.wallet.experimental_syncWallet();
+await a.wallet.experimental_syncWallet();
+await pollBalance(b.wallet, 37_000n, 8.6);
+await pollBalance(a.wallet, 63_000n, 8.7);
+
+for (let i = 0; i < 30; i++) {
+  const current = await (await fetch(`${SSP_BASE_URL}/status`, statusOptions)).json();
+  const available = BigInt(current.spark.available_sats);
+  step(8.8, `SSP repeated-split balance poll ${i}: ${available} sats`);
+  if (available === sparkBalanceBefore) break;
+  if (i === 29) {
+    throw new Error(
+      `SSP did not reclaim repeated-split input: ${available}; expected ${sparkBalanceBefore}`,
     );
   }
   await new Promise((resolve) => setTimeout(resolve, 2000));
