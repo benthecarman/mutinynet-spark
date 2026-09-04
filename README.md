@@ -100,7 +100,7 @@ operators and SSP:
 
 The Lightning acceptance stack contains bitcoind, a local Electrs Esplora
 service, PostgreSQL, three Spark Operators, two `ldk-server` nodes, two SSP
-instances, and two Breez SDK wallets. It needs Docker Compose, Rust, and
+instances, and three Breez SDK wallets. It needs Docker Compose, Rust, and
 checkouts of the pinned Spark and `ldk-server` revisions. The
 revisions are listed in
 [the fixture README](e2e/upstream/README.md).
@@ -114,12 +114,14 @@ With the two checkouts at their default paths, run:
 The script always creates a separate Compose project with empty volumes. It
 funds each SSP with 1,000-sat receive leaves, creates bidirectional Lightning
 liquidity, and bootstraps both Breez wallets with 1,500-sat standard BOLT11
-receives. It then makes 1,000-sat Breez payments in both directions. Finally,
-one wallet sends to a BOLT12 offer through its SSP, and another Lightning node
-pays an SSP offer that credits the wallet. This proves that a receive can
-combine two leaves for the larger invoice and prefer an exact leaf when one is
-available. The test verifies each Spark balance, each Breez payment record,
-both LDK payment records, the BOLT12 offer IDs, and the received preimages.
+receives. It makes a 1,000-sat payment between two wallets on the same SSP and
+verifies that no LDK payment exists for it. It then makes payments in both
+directions between the SSPs. Finally, one wallet sends to a BOLT12 offer through
+its SSP, and another Lightning node pays an SSP offer that credits the wallet.
+This proves that a receive can combine two leaves for the larger invoice and
+prefer an exact leaf when one is available. The test verifies each Spark
+balance, each Breez payment record, the LDK payment records, the BOLT12 offer
+IDs, and the received preimages.
 
 Run `./e2e/e2e.sh` for the supplemental API, idempotency, failure, reconnect,
 restart, concurrency, and shutdown checks.

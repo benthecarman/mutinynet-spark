@@ -17,6 +17,12 @@ preimage to the Spark transfer.
 Retries with the same wallet, invoice, transfer ID, and idempotency key return
 the stored request and do not start a second Lightning payment.
 
+If the encoded BOLT11 invoice exactly matches an open receive request created
+by the same SSP, the SSP does not call `Bolt11Send`. It completes the receiver's
+Spark transfer, recovers the preimage, and uses it to claim the payer's Spark
+preimage swap. Pending internal settlements are stored and reconciled after a
+retry or process restart.
+
 ### BOLT11 receive
 
 The wallet creates the preimage and stores encrypted threshold shares with the

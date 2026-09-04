@@ -710,6 +710,16 @@ async fn succeeded_ldk_payment(
     Ok(payment.clone())
 }
 
+async fn bolt11_payment_count(ldk: &LdkClient, payment_hash: &str) -> Result<usize> {
+    let payments = ldk.json(&["list-payments"]).await?;
+    Ok(payments["list"]
+        .as_array()
+        .context("LDK list-payments response has no list")?
+        .iter()
+        .filter(|payment| bolt11_hash(payment).as_deref() == Some(payment_hash))
+        .count())
+}
+
 async fn received_payment(wallet: &Wallet, invoice: &str) -> Result<Payment> {
     let payments = wallet
         .sdk
@@ -1098,6 +1108,119 @@ async fn pay_between(
     Ok(payment_hash)
 }
 
+async fn pay_internally(
+    client: &Client,
+    config: &TestConfig,
+    sender: &Wallet,
+    receiver: &Wallet,
+    amount_sats: u64,
+) -> Result<()> {
+    ensure!(
+        sender.ssp_url == receiver.ssp_url,
+        "internal payment wallets do not use the same SSP"
+    );
+    let sender_before = wallet_balance(sender).await?;
+    let receiver_before = wallet_balance(receiver).await?;
+    let ssp_before = ssp_available_balance(client, config, sender.ssp_url).await?;
+    let invoice = receiver
+        .sdk
+        .receive_payment(ReceivePaymentRequest {
+            payment_method: ReceivePaymentMethod::Bolt11Invoice {
+                description: "breez-internal-ssp-payment".to_string(),
+                amount_sats: Some(amount_sats),
+                expiry_secs: Some(300),
+                payment_hash: None,
+            },
+        })
+        .await?
+        .payment_request;
+    let payment_hash = decode_payment_hash(&receiver.ldk, &invoice).await?;
+    ensure!(
+        bolt11_payment_count(&sender.ldk, &payment_hash).await? == 0,
+        "LDK already has a payment for the internal invoice"
+    );
+
+    let prepared = sender
+        .sdk
+        .prepare_send_payment(PrepareSendPaymentRequest {
+            payment_request: PaymentRequest::Input {
+                input: invoice.clone(),
+            },
+            amount: None,
+            token_identifier: None,
+            conversion_options: None,
+            fee_policy: None,
+        })
+        .await?;
+    let sent = sender
+        .sdk
+        .send_payment(SendPaymentRequest {
+            prepare_response: prepared,
+            options: None,
+            idempotency_key: None,
+        })
+        .await?;
+    let sender_payment = poll("internal Breez send", config.timeout, || {
+        completed_payment(sender, &sent.payment.id)
+    })
+    .await?;
+    let receiver_payment = poll("internal Breez receive", config.timeout, || {
+        received_payment(receiver, &invoice)
+    })
+    .await?;
+
+    ensure!(
+        sender_payment.payment_type == PaymentType::Send
+            && sender_payment.amount == u128::from(amount_sats)
+            && sender_payment.fees == 0,
+        "unexpected internal sender payment: {sender_payment:?}"
+    );
+    ensure!(
+        receiver_payment.amount == u128::from(amount_sats) && receiver_payment.fees == 0,
+        "unexpected internal receiver payment: {receiver_payment:?}"
+    );
+    poll("internal sender balance", config.timeout, || {
+        exact_balance(sender, sender_before - amount_sats)
+    })
+    .await?;
+    poll("internal receiver balance", config.timeout, || {
+        exact_balance(receiver, receiver_before + amount_sats)
+    })
+    .await?;
+    poll("internal SSP balance conservation", config.timeout, || async {
+        let balance = ssp_available_balance(client, config, sender.ssp_url).await?;
+        ensure!(
+            balance == ssp_before,
+            "internal payment changed SSP balance from {ssp_before} to {balance}"
+        );
+        Ok(balance)
+    })
+    .await?;
+    ensure!(
+        bolt11_payment_count(&sender.ldk, &payment_hash).await? == 0,
+        "internal payment created an LDK payment"
+    );
+
+    let htlc = match receiver_payment.details {
+        Some(PaymentDetails::Lightning { htlc_details, .. }) => htlc_details,
+        _ => bail!("internal Breez receive has no Lightning details"),
+    };
+    let preimage = htlc
+        .preimage
+        .context("internal Breez receive has no preimage")?;
+    ensure!(
+        htlc.payment_hash == payment_hash
+            && hex::encode(Sha256::digest(hex::decode(preimage)?)) == payment_hash,
+        "internal payment preimage does not match its hash"
+    );
+
+    println!(
+        "PASS internal SSP payment: {} sent {amount_sats} sats to {} without LDK payment {payment_hash}",
+        sender.name, receiver.name
+    );
+    Ok(())
+}
+
 async fn send_bolt12(
     client: &Client,
     config: &TestConfig,
@@ -1291,6 +1414,7 @@ async fn run(
     config: &TestConfig,
     wallet_a: &Wallet,
     wallet_b: &Wallet,
+    wallet_c: &Wallet,
 ) -> Result<()> {
     println!("fund one coarse SSP leaf per receiver");
     for wallet in [wallet_a, wallet_b] {
@@ -1330,10 +1454,11 @@ async fn run(
     .context("wallet A repeated split receive failed after SSP restart")?;
 
     println!("seed exact leaves for the Lightning send matrix");
-    for wallet in [wallet_a, wallet_b] {
-        for _ in 0..3 {
-            fund_ssp(client, config, wallet.ssp_url, config.send_amount_sats).await?;
-        }
+    for _ in 0..4 {
+        fund_ssp(client, config, wallet_a.ssp_url, config.send_amount_sats).await?;
+    }
+    for _ in 0..3 {
+        fund_ssp(client, config, wallet_b.ssp_url, config.send_amount_sats).await?;
     }
     bootstrap_wallet(
         wallet_b,
@@ -1353,6 +1478,26 @@ async fn run(
     )
     .await
     .context("wallet A send-liquidity bootstrap failed")?;
+    bootstrap_wallet(
+        wallet_a,
+        &wallet_b.ldk,
+        config.send_amount_sats,
+        config.send_amount_sats,
+        config.timeout,
+    )
+    .await
+    .context("wallet A internal-send bootstrap failed")?;
+
+    println!("send between two wallets on SSP A without Lightning");
+    pay_internally(
+        client,
+        config,
+        wallet_a,
+        wallet_c,
+        config.send_amount_sats,
+    )
+    .await
+    .context("internal SSP payment failed")?;
 
     println!("send from wallet B to wallet A over Lightning");
     let first_hash = pay_between(
@@ -1432,7 +1577,7 @@ async fn main() -> Result<()> {
         &config,
         "wallet-a",
         "http://127.0.0.1:5000",
-        ldk_a,
+        ldk_a.clone(),
         0x0a,
     )
     .await?;
@@ -1445,11 +1590,22 @@ async fn main() -> Result<()> {
         0x0b,
     )
     .await?;
+    let wallet_c = connect_wallet(
+        &client,
+        &config,
+        "wallet-c",
+        "http://127.0.0.1:5000",
+        ldk_a,
+        0x0c,
+    )
+    .await?;
 
-    let result = run(&client, &config, &wallet_a, &wallet_b).await;
+    let result = run(&client, &config, &wallet_a, &wallet_b, &wallet_c).await;
+    let disconnect_c = wallet_c.sdk.disconnect().await;
     let disconnect_b = wallet_b.sdk.disconnect().await;
     let disconnect_a = wallet_a.sdk.disconnect().await;
     result?;
+    disconnect_c.context("could not disconnect wallet-c")?;
     disconnect_b.context("could not disconnect wallet-b")?;
     disconnect_a.context("could not disconnect wallet-a")?;
     println!("completed in {:.1}s", started.elapsed().as_secs_f64());

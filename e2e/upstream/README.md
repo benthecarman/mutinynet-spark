@@ -11,7 +11,7 @@ The supplemental JavaScript suite uses these revisions:
 The Breez Lightning acceptance test was verified with these clean upstream
 revisions:
 
-- Spark Operators: `0b3a32a05c9ac06cc411683551dd1f1bde9d0caa`
+- Spark Operators fork: `dad8bc6cf109b5946eec6860fb84bf247c8cae98`
 - ldk-server: `6d6d810714706c225ce7effc2163eff6a1b54221`
 
 The supplemental JavaScript suite builds the SDK and runs `e2e/e2e.sh`. Local

@@ -350,18 +350,104 @@ pub async fn dispatch(
                 {
                     return Err("idempotency key was already used for another payment".to_string());
                 }
+                if payload.get("payment_kind").and_then(Value::as_str) == Some("INTERNAL_BOLT11") {
+                    let payment_hash = payload
+                        .get("internal_payment_hash")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "internal payment record has no payment hash".to_string())?;
+                    let payment_id = payload
+                        .get("payment_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "internal payment record has no payment ID".to_string())?;
+                    if let Err(error) = crate::backend(&state)
+                        .await
+                        .settle_internal_bolt11(payment_hash, &inv, &ext_id, payment_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            payment_hash,
+                            payment_id,
+                            "internal Spark payment settlement is pending: {error}"
+                        );
+                    }
+                }
                 return send_response_from_record(&state, &rec, &now).await;
             }
-            crate::backend(&state)
-                .await
-                .verify_lightning_send_funding(&owner, &ext_id, &inv, amt)
-                .await?;
-            let payment_kind = if inv.to_ascii_lowercase().starts_with("lno1") {
+            let local_payment_hash = if inv.to_ascii_lowercase().starts_with("lno1") {
+                None
+            } else {
+                state.db.lightning_receive_hash_for_invoice(&inv).await?
+            };
+            if let Some(payment_hash) = local_payment_hash.as_deref() {
+                let decoded = lightning_invoice::Bolt11Invoice::from_str(&inv)
+                    .map_err(|error| format!("decode internal BOLT11 invoice: {error}"))?;
+                if amt.is_some() {
+                    return Err("amount_sats is only valid for zero-amount invoices".to_string());
+                }
+                if decoded.payment_hash().to_string() != payment_hash {
+                    return Err(
+                        "internal Lightning invoice payment hash does not match its request"
+                            .to_string(),
+                    );
+                }
+                let now_since_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map_err(|_| "system clock is before the Unix epoch".to_string())?;
+                if decoded.would_expire(now_since_epoch) {
+                    return Err("internal Lightning invoice has expired".to_string());
+                }
+                let receive = state
+                    .db
+                    .lightning_receive_for_hash(payment_hash)
+                    .await?
+                    .ok_or_else(|| {
+                        "internal Lightning receive request was not found".to_string()
+                    })?;
+                let expected_msat = receive
+                    .amount_sats
+                    .checked_mul(1000)
+                    .ok_or_else(|| "internal Lightning amount is too large".to_string())?;
+                if decoded.amount_milli_satoshis() != Some(expected_msat) {
+                    return Err(
+                        "internal Lightning invoice amount does not match its request".to_string(),
+                    );
+                }
+                if receive.status != "INVOICE_CREATED" {
+                    return Err(format!(
+                        "internal Lightning invoice is not payable in status {}",
+                        receive.status
+                    ));
+                }
+                if state.db.has_internal_lightning_send(payment_hash).await? {
+                    return Err("internal Lightning invoice already has a payment".to_string());
+                }
+                state
+                    .spark
+                    .verify_lightning_send(&owner, &ext_id, payment_hash, receive.amount_sats)
+                    .await?;
+            } else {
+                crate::backend(&state)
+                    .await
+                    .verify_lightning_send_funding(&owner, &ext_id, &inv, amt)
+                    .await?;
+            }
+            let payment_kind = if local_payment_hash.is_some() {
+                "INTERNAL_BOLT11"
+            } else if inv.to_ascii_lowercase().starts_with("lno1") {
                 "BOLT12"
             } else {
                 "BOLT11"
             };
-            let pay = crate::backend(&state).await.pay_invoice(&inv, amt).await;
+            let pay = if let Some(payment_hash) = local_payment_hash.as_deref() {
+                let payment_id = format!("internal:{payment_hash}");
+                state.db.set_payment(&payment_id, "PENDING").await?;
+                crate::ldk::PayResult {
+                    payment_id,
+                    status: "PENDING".to_string(),
+                }
+            } else {
+                crate::backend(&state).await.pay_invoice(&inv, amt).await
+            };
             let rec = store_request(
                 &state,
                 "LIGHTNING_SEND",
@@ -371,6 +457,7 @@ pub async fn dispatch(
                        "idempotency_key": idem,
                        "payment_id": pay.payment_id, "status": pay.status,
                        "payment_kind": payment_kind,
+                       "internal_payment_hash": local_payment_hash,
                        "network": state.config.network,
                        "user_outbound_transfer_external_id": ext_id}),
                 Some(idem.as_str()),
@@ -390,6 +477,19 @@ pub async fn dispatch(
                     &owner,
                 )
                 .await?;
+            if let Some(payment_hash) = local_payment_hash.as_deref() {
+                if let Err(error) = crate::backend(&state)
+                    .await
+                    .settle_internal_bolt11(payment_hash, &inv, &ext_id, &pay.payment_id)
+                    .await
+                {
+                    tracing::warn!(
+                        payment_hash,
+                        payment_id = pay.payment_id,
+                        "internal Spark payment settlement is pending: {error}"
+                    );
+                }
+            }
             return send_response_from_record(&state, &rec, &now).await;
         }
         // ---- swaps (SDK mutation name is RequestSwap / field request_swap) ----

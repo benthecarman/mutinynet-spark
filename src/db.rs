@@ -33,6 +33,14 @@ pub struct LightningSend {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InternalLightningSend {
+    pub payment_hash: String,
+    pub payment_id: String,
+    pub outbound_transfer_id: String,
+    pub invoice: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SparkSplitOperation {
     pub operation_id: String,
     pub parent_node_id: String,
@@ -541,6 +549,80 @@ impl Db {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 error => Err(error),
             })
+        })
+        .await
+    }
+
+    /// Match the exact invoice issued by this SSP. Matching the encoded
+    /// invoice, rather than only its payment hash, prevents an unrelated
+    /// invoice that reuses a hash from entering the internal payment path.
+    pub async fn lightning_receive_hash_for_invoice(
+        &self,
+        invoice: &str,
+    ) -> Result<Option<String>, String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT json_extract(payload, '$.payment_hash')
+                 FROM requests
+                 WHERE kind='LIGHTNING_RECEIVE'
+                   AND json_extract(payload, '$.invoice')=?1
+                   AND COALESCE(json_extract(payload, '$.payment_kind'), 'BOLT11')='BOLT11'
+                 LIMIT 1",
+                (invoice,),
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                error => Err(error),
+            })
+        })
+        .await
+    }
+
+    /// Internal sends stay pending until both Spark transfers are complete.
+    /// The Lightning reconciler uses these rows to resume work after a crash
+    /// or a transient operator failure.
+    pub async fn pending_internal_lightning_sends(
+        &self,
+    ) -> Result<Vec<InternalLightningSend>, String> {
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT json_extract(r.payload, '$.internal_payment_hash'),
+                        json_extract(r.payload, '$.payment_id'),
+                        json_extract(r.payload, '$.user_outbound_transfer_external_id'),
+                        json_extract(r.payload, '$.encoded_invoice')
+                 FROM requests r
+                 JOIN payments p ON p.id=json_extract(r.payload, '$.payment_id')
+                 WHERE r.kind='LIGHTNING_SEND'
+                   AND json_extract(r.payload, '$.payment_kind')='INTERNAL_BOLT11'
+                   AND p.status='PENDING'",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(InternalLightningSend {
+                    payment_hash: row.get(0)?,
+                    payment_id: row.get(1)?,
+                    outbound_transfer_id: row.get(2)?,
+                    invoice: row.get(3)?,
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    pub async fn has_internal_lightning_send(&self, payment_hash: &str) -> Result<bool, String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM requests
+                    WHERE kind='LIGHTNING_SEND'
+                      AND json_extract(payload, '$.payment_kind')='INTERNAL_BOLT11'
+                      AND json_extract(payload, '$.internal_payment_hash')=?1
+                )",
+                (payment_hash,),
+                |row| row.get(0),
+            )
         })
         .await
     }
@@ -1679,7 +1761,11 @@ mod tests {
             "LIGHTNING_RECEIVE",
             "owner",
             "now",
-            &serde_json::json!({"payment_hash": "hash", "amount_sats": 1234}),
+            &serde_json::json!({
+                "payment_hash": "hash",
+                "amount_sats": 1234,
+                "invoice": "ln-invoice",
+            }),
             None,
         )
         .await
@@ -1692,12 +1778,24 @@ mod tests {
                 owner: "owner".to_string(),
                 receiver: "owner".to_string(),
                 amount_sats: 1234,
-                invoice: String::new(),
+                invoice: "ln-invoice".to_string(),
                 status: "INVOICE_CREATED".to_string(),
                 transfer_id: None,
                 preimage: None,
                 claim_submitted: false,
             })
+        );
+        assert_eq!(
+            db.lightning_receive_hash_for_invoice("ln-invoice")
+                .await
+                .unwrap(),
+            Some("hash".to_string())
+        );
+        assert_eq!(
+            db.lightning_receive_hash_for_invoice("other-invoice")
+                .await
+                .unwrap(),
+            None
         );
         assert_eq!(
             db.transfer_for_request("request", "owner").await.unwrap(),
@@ -1717,6 +1815,47 @@ mod tests {
             db.transfer_for_request("request", "owner").await.unwrap(),
             Some("transfer".to_string())
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_internal_send_is_recoverable() {
+        let (db, dir) = test_db();
+        db.insert_request(
+            "send-request",
+            "LIGHTNING_SEND",
+            "sender",
+            "now",
+            &serde_json::json!({
+                "payment_id": "internal:hash",
+                "payment_kind": "INTERNAL_BOLT11",
+                "internal_payment_hash": "hash",
+                "encoded_invoice": "ln-invoice",
+                "user_outbound_transfer_external_id": "outbound-transfer",
+            }),
+            Some("idempotency-key"),
+        )
+        .await
+        .unwrap();
+        db.set_payment("internal:hash", "PENDING").await.unwrap();
+
+        assert!(db.has_internal_lightning_send("hash").await.unwrap());
+        assert_eq!(
+            db.pending_internal_lightning_sends().await.unwrap(),
+            vec![InternalLightningSend {
+                payment_hash: "hash".to_string(),
+                payment_id: "internal:hash".to_string(),
+                outbound_transfer_id: "outbound-transfer".to_string(),
+                invoice: "ln-invoice".to_string(),
+            }]
+        );
+
+        db.set_payment("internal:hash", "SUCCEEDED").await.unwrap();
+        assert!(db
+            .pending_internal_lightning_sends()
+            .await
+            .unwrap()
+            .is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -132,6 +132,25 @@ impl Backend {
         }
     }
 
+    /// Settle an invoice created by this SSP without sending a Lightning
+    /// payment back to the same LDK node.
+    pub async fn settle_internal_bolt11(
+        &self,
+        payment_hash: &str,
+        invoice: &str,
+        outbound_transfer_id: &str,
+        payment_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Backend::Live(backend) => {
+                backend
+                    .settle_internal_bolt11(payment_hash, invoice, outbound_transfer_id, payment_id)
+                    .await
+            }
+            Backend::Fake(_) => Err("internal BOLT11 settlement requires live Spark".to_string()),
+        }
+    }
+
     /// SubscribeEvents pump for a live backend. The upstream streaming client
     /// does not set a `grpc-timeout` header. Reconnect with capped exponential
     /// backoff when the server, proxy, or HTTP/2 connection ends the stream.
@@ -732,6 +751,92 @@ impl LdkGrpcBackend {
         })
     }
 
+    async fn settle_internal_bolt11(
+        &self,
+        payment_hash: &str,
+        invoice: &str,
+        outbound_transfer_id: &str,
+        payment_id: &str,
+    ) -> Result<(), String> {
+        let _guard = self.receive_lock.lock().await;
+        let receive = self
+            .db
+            .lightning_receive_for_hash(payment_hash)
+            .await?
+            .ok_or_else(|| "internal Lightning receive request was not found".to_string())?;
+        if receive.invoice != invoice {
+            return Err(
+                "internal Lightning invoice does not match the receive request".to_string(),
+            );
+        }
+        if receive.status == "HTLC_FAILED" {
+            return Err("internal Lightning receive has already failed".to_string());
+        }
+
+        let completed = receive.status == "TRANSFER_COMPLETED";
+        let (transfer_id, preimage) = match (receive.transfer_id, receive.preimage) {
+            (Some(transfer_id), Some(preimage)) => (transfer_id, preimage),
+            _ => {
+                if let Some(preimage) = self.db.get_preimage(payment_hash).await? {
+                    let transfer_id = self
+                        .spark
+                        .settle_lightning_receive(
+                            &receive.receiver,
+                            payment_hash,
+                            receive.amount_sats,
+                        )
+                        .await?;
+                    (transfer_id, preimage)
+                } else {
+                    let swap = self
+                        .spark
+                        .swap_for_lightning_receive(
+                            &receive.receiver,
+                            payment_hash,
+                            invoice,
+                            receive.amount_sats,
+                            0,
+                        )
+                        .await?;
+                    (swap.transfer_id, swap.preimage)
+                }
+            }
+        };
+        validate_preimage(payment_hash, &preimage)?;
+
+        if !completed {
+            self.db
+                .commit_lightning_receive_swap(
+                    payment_hash,
+                    &transfer_id,
+                    &preimage,
+                    &receive.request_id,
+                    &receive.owner,
+                )
+                .await?;
+        }
+        self.spark
+            .settle_lightning_send(outbound_transfer_id, payment_hash, &preimage)
+            .await?;
+        if !receive.claim_submitted {
+            self.db.mark_receive_claim_submitted(payment_hash).await?;
+        }
+        self.db
+            .insert_transfer(
+                &transfer_id,
+                &receive.request_id,
+                "LIGHTNING_RECEIVE",
+                "TRANSFER_COMPLETED",
+                &receive.owner,
+            )
+            .await?;
+        self.db
+            .set_receive_status(payment_hash, "TRANSFER_COMPLETED")
+            .await?;
+        self.db.set_payment(payment_id, "SUCCEEDED").await?;
+        Ok(())
+    }
+
     async fn settle_succeeded_payment(&self, payment: &Payment) -> Result<(), String> {
         let payment_id = payment.id.clone();
         let Some(send) = self.db.lightning_send_for_payment(&payment_id).await? else {
@@ -904,6 +1009,23 @@ impl LdkGrpcBackend {
     }
 
     async fn reconcile_payments(&self) -> Result<(), String> {
+        for payment in self.db.pending_internal_lightning_sends().await? {
+            if let Err(error) = self
+                .settle_internal_bolt11(
+                    &payment.payment_hash,
+                    &payment.invoice,
+                    &payment.outbound_transfer_id,
+                    &payment.payment_id,
+                )
+                .await
+            {
+                tracing::warn!(
+                    payment_hash = payment.payment_hash,
+                    payment_id = payment.payment_id,
+                    "internal Spark payment settlement is pending: {error}"
+                );
+            }
+        }
         let mut page_token = None;
         for _ in 0..100 {
             let page = self

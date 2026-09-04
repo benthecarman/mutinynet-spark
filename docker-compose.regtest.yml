@@ -5,7 +5,7 @@
 #   ./e2e/e2e.sh   # runs the SDK end-to-end test, tears nothing down
 #   docker compose -f docker-compose.regtest.yml down
 #
-# SPARK_REF must point at a checkout of https://github.com/buildonspark/spark
+# SPARK_REF must point at a checkout of https://github.com/benthecarman/spark
 # (used to build the SO image and for the SDK test). Defaults below.
 #
 # Host ports: bitcoind RPC uses BITCOIN_RPC_PORT (8332 by default), SOs use
