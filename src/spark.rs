@@ -18,7 +18,10 @@ use ::spark::{
         InvoiceAmount, InvoiceAmountProof, StartTransferRequest,
     },
     operator::{rpc::DefaultConnectionManager, OperatorPool},
-    services::{LeafKeyTweak, Transfer as SparkTransfer, TransferService, TransferType},
+    services::{
+        LeafKeyTweak, LeafSplitDraft, LeafSplitPlan, LeafSplitService, SubmittedLeafSplit,
+        Transfer as SparkTransfer, TransferService, TransferType,
+    },
     session_store::InMemorySessionStore,
     signer::SparkSigner as CoreSparkSigner,
     tree::{select_leaves_by_exact_amounts, LeafLike, TreeNode, TreeNodeStatus, TreeServiceError},
@@ -37,7 +40,10 @@ use spark_wallet::{
     TransferId, TransferStatus, WalletLeaf, WalletTransfer,
 };
 
-use crate::config::Config;
+use crate::{
+    config::Config,
+    db::{Db, SparkSplitOperation},
+};
 
 #[derive(Debug, Serialize)]
 pub struct SparkHealth {
@@ -66,18 +72,22 @@ pub struct SparkService {
     identity: spark_wallet::PublicKey,
     operator_pool: Arc<OperatorPool>,
     transfer_service: Arc<TransferService>,
+    split_service: Option<Arc<LeafSplitService>>,
+    db: Arc<Db>,
+    minimum_split_child_sats: u64,
     liquidity_lock: tokio::sync::Mutex<()>,
     needs_topup: AtomicBool,
 }
 
 impl SparkService {
-    pub async fn connect(config: &Config) -> Result<Arc<Self>, String> {
+    pub async fn connect(config: &Config, db: Arc<Db>) -> Result<Arc<Self>, String> {
         let network = parse_network(&config.network)?;
         let mnemonic =
             load_or_create_mnemonic(&config.spark_mnemonic_file, config.spark_mnemonic_required)?;
         let seed = mnemonic.to_seed("");
         let signer = Arc::new(DefaultSigner::new(&seed, network).map_err(|e| e.to_string())?);
-        let signer: Arc<dyn CoreSparkSigner> = Arc::new(SparkSignerAdapter::new(signer));
+        let signer: Arc<dyn CoreSparkSigner> =
+            Arc::new(SparkSignerAdapter::new(signer).with_leaf_key_override_store(db.clone()));
         let identity = signer
             .get_identity_public_key()
             .await
@@ -144,11 +154,12 @@ impl SparkService {
         // Keep an authenticated operator client beside the embedded wallet.
         // SparkWallet does not expose its pool, but receive settlement needs the
         // existing low-level InitiatePreimageSwapV3 RPC and generated types.
+        let sessions = Arc::new(InMemorySessionStore::default());
         let operator_pool = Arc::new(
             OperatorPool::connect(
                 &wallet_config.operator_pool,
                 Arc::new(DefaultConnectionManager::new()),
-                Arc::new(InMemorySessionStore::default()),
+                sessions.clone(),
                 signer.clone(),
                 None,
             )
@@ -163,20 +174,89 @@ impl SparkService {
             None,
         ));
 
+        let ssp_hosts = csv(&config.ssp_operator_hosts);
+        let ssp_cert_files = csv(&config.ssp_operator_cert_files);
+        let split_service = if ssp_hosts.is_empty() {
+            None
+        } else {
+            if ssp_hosts.len() != pubkeys.len() {
+                return Err(
+                    "SSP_OPERATOR_HOSTS must be empty or have the same length as SO_IDENTITY_PUBKEYS"
+                        .to_string(),
+                );
+            }
+            if !ssp_cert_files.is_empty() && ssp_cert_files.len() != ssp_hosts.len() {
+                return Err(
+                    "SSP_OPERATOR_CERT_FILES must be empty or match SSP_OPERATOR_HOSTS".to_string(),
+                );
+            }
+            let mut private_operators = Vec::with_capacity(ssp_hosts.len());
+            for (index, (host, pubkey)) in ssp_hosts.iter().zip(&pubkeys).enumerate() {
+                let cert = if ssp_cert_files.is_empty() || ssp_cert_files[index].is_empty() {
+                    None
+                } else {
+                    Some(std::fs::read(&ssp_cert_files[index]).map_err(|e| {
+                        format!(
+                            "read SSP operator certificate {}: {e}",
+                            ssp_cert_files[index]
+                        )
+                    })?)
+                };
+                let address = if host.contains("://") {
+                    host.clone()
+                } else {
+                    format!("https://{host}")
+                };
+                private_operators.push(
+                    SparkWalletConfig::create_operator_config(
+                        index,
+                        &format!("{:064x}", index + 1),
+                        &address,
+                        cert.as_deref(),
+                        pubkey,
+                    )
+                    .map_err(|e| format!("SSP operator {index}: {e}"))?,
+                );
+            }
+            let private_config =
+                OperatorPoolConfig::new(0, private_operators).map_err(|e| e.to_string())?;
+            let private_pool = Arc::new(
+                OperatorPool::connect(
+                    &private_config,
+                    Arc::new(DefaultConnectionManager::new()),
+                    sessions,
+                    signer.clone(),
+                    None,
+                )
+                .await
+                .map_err(|e| format!("connect SSP operator clients: {e}"))?,
+            );
+            Some(Arc::new(
+                LeafSplitService::new(network, operator_pool.clone(), private_pool, signer.clone())
+                    .await
+                    .map_err(|e| format!("create leaf split service: {e}"))?,
+            ))
+        };
+
         let wallet = Arc::new(
             SparkWallet::connect(wallet_config, signer)
                 .await
                 .map_err(|e| format!("connect embedded Spark wallet: {e}"))?,
         );
-        Ok(Arc::new(Self {
+        let service = Arc::new(Self {
             wallet,
             network,
             identity,
             operator_pool,
             transfer_service,
+            split_service,
+            db,
+            minimum_split_child_sats: config.ssp_min_split_child_sats,
             liquidity_lock: tokio::sync::Mutex::new(()),
             needs_topup: AtomicBool::new(false),
-        }))
+        });
+        service.recover_incomplete_splits().await?;
+        Ok(service)
     }
 
     pub fn identity(&self) -> String {
@@ -379,11 +459,13 @@ impl SparkService {
         let receiver = SparkAddress::new(owner_key, self.network, None);
         let transfer = match self.find_transfer(&transfer_id).await? {
             Some(transfer) => transfer,
-            None => self
-                .wallet
-                .transfer(amount_sats, &receiver, Some(transfer_id.clone()))
-                .await
-                .map_err(|e| self.liquidity_error(e.to_string()))?,
+            None => {
+                self.ensure_exact_liquidity(amount_sats).await?;
+                self.wallet
+                    .transfer(amount_sats, &receiver, Some(transfer_id.clone()))
+                    .await
+                    .map_err(|e| self.liquidity_error(e.to_string()))?
+            }
         };
         validate_transfer(&transfer, self.identity, owner_key, amount_sats)?;
         self.needs_topup.store(false, Ordering::Relaxed);
@@ -418,6 +500,7 @@ impl SparkService {
         {
             return Ok(recovered);
         }
+        self.ensure_exact_liquidity(amount_sats).await?;
         let leaves = self.wallet.list_leaves().await.map_err(|e| e.to_string())?;
         let mut available = leaves
             .available
@@ -644,10 +727,218 @@ impl SparkService {
         if change > 0 {
             amounts.push(change);
         }
+        self.ensure_denominated_liquidity(&amounts).await?;
         self.wallet
             .transfer_swap_counter(amounts, &receiver, primary_id.clone(), adaptor, counter_id)
             .await
             .map_err(|e| self.liquidity_error(e.to_string()))
+    }
+
+    async fn ensure_exact_liquidity(&self, amount_sats: u64) -> Result<(), String> {
+        for _ in 0..32 {
+            let leaves = self.wallet.list_leaves().await.map_err(|e| e.to_string())?;
+            let mut available = leaves
+                .available
+                .into_iter()
+                .map(wallet_leaf_to_tree_node)
+                .collect::<Result<Vec<_>, _>>()?;
+            available.sort_by(|a, b| a.value.cmp(&b.value).then_with(|| a.id.cmp(&b.id)));
+            if select_receive_leaves(&available, amount_sats).is_ok() {
+                return Ok(());
+            }
+            let plan = plan_just_in_time_split(
+                &available,
+                amount_sats,
+                self.minimum_split_child_sats,
+            )
+            .ok_or_else(|| self.liquidity_error("amount cannot be represented by available leaves without creating a child below the configured split floor".to_string()))?;
+            self.execute_leaf_split(&plan.parent, vec![plan.needed_sats, plan.change_sats])
+                .await?;
+            self.wallet.sync().await.map_err(|e| e.to_string())?;
+        }
+        Err("leaf split reconciliation exceeded its progress limit".to_string())
+    }
+
+    async fn ensure_denominated_liquidity(&self, amounts: &[u64]) -> Result<(), String> {
+        for _ in 0..32 {
+            let leaves = self.wallet.list_leaves().await.map_err(|e| e.to_string())?;
+            let mut available = leaves
+                .available
+                .into_iter()
+                .map(wallet_leaf_to_tree_node)
+                .collect::<Result<Vec<_>, _>>()?;
+            available.sort_by(|a, b| a.value.cmp(&b.value).then_with(|| a.id.cmp(&b.id)));
+            if select_leaves_by_exact_amounts(&available, amounts).is_ok() {
+                return Ok(());
+            }
+            let (parent, needed_sats, change_sats) = plan_denomination_split(
+                &available,
+                amounts,
+                self.minimum_split_child_sats,
+            )
+            .ok_or_else(|| self.liquidity_error("swap denominations cannot be produced without creating a child below the configured split floor".to_string()))?;
+            self.execute_leaf_split(&parent, vec![needed_sats, change_sats])
+                .await?;
+            self.wallet.sync().await.map_err(|e| e.to_string())?;
+        }
+        Err("denomination split reconciliation exceeded its progress limit".to_string())
+    }
+
+    async fn execute_leaf_split(
+        &self,
+        parent: &TreeNode,
+        child_values: Vec<u64>,
+    ) -> Result<(), String> {
+        let service = self.split_service.as_ref().ok_or_else(|| {
+            self.liquidity_error(
+                "just-in-time splitting is disabled; configure SSP_OPERATOR_HOSTS".to_string(),
+            )
+        })?;
+        let operation_id = split_operation_id(&parent.id);
+        let operation = match self
+            .db
+            .spark_split_for_parent(&parent.id.to_string())
+            .await?
+        {
+            Some(operation) => operation,
+            None => {
+                let draft = service
+                    .draft_split(operation_id.clone(), parent, child_values.clone())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.db
+                    .get_or_insert_spark_split(&SparkSplitOperation {
+                        operation_id: operation_id.clone(),
+                        parent_node_id: parent.id.to_string(),
+                        parent_value_sats: parent.value,
+                        child_values_sats: child_values.clone(),
+                        plan: serde_json::to_vec(&draft).map_err(|e| e.to_string())?,
+                        status: "DRAFT".to_string(),
+                        child_node_ids: Vec::new(),
+                        last_error: None,
+                    })
+                    .await?
+            }
+        };
+        if operation.parent_node_id != parent.id.to_string()
+            || operation.parent_value_sats != parent.value
+            || operation.child_values_sats != child_values
+        {
+            return Err(
+                "persisted split does not match the requested parent and values".to_string(),
+            );
+        }
+        self.resume_leaf_split(operation, Some(parent)).await
+    }
+
+    async fn resume_leaf_split(
+        &self,
+        mut operation: SparkSplitOperation,
+        parent: Option<&TreeNode>,
+    ) -> Result<(), String> {
+        let service = self
+            .split_service
+            .as_ref()
+            .ok_or_else(|| "just-in-time splitting is disabled".to_string())?;
+        let operation_id = operation.operation_id.clone();
+        let result = async {
+            loop {
+                match operation.status.as_str() {
+                    "DRAFT" => {
+                        let parent = parent.ok_or_else(|| {
+                            "cannot resume a draft split because its parent is unavailable"
+                                .to_string()
+                        })?;
+                        let draft: LeafSplitDraft =
+                            serde_json::from_slice(&operation.plan).map_err(|e| e.to_string())?;
+                        let plan = service
+                            .prepare_split(&draft, parent)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let encoded = serde_json::to_vec(&plan).map_err(|e| e.to_string())?;
+                        self.db
+                            .save_prepared_spark_split(&operation.operation_id, &encoded)
+                            .await?;
+                    }
+                    "PREPARED" | "SUBMITTING" => {
+                        let plan: LeafSplitPlan =
+                            serde_json::from_slice(&operation.plan).map_err(|e| e.to_string())?;
+                        self.db
+                            .mark_spark_split_submitting(&operation.operation_id)
+                            .await?;
+                        let submitted = service
+                            .submit_split(plan)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let encoded = serde_json::to_vec(&submitted).map_err(|e| e.to_string())?;
+                        self.db
+                            .save_submitted_spark_split(&operation.operation_id, &encoded)
+                            .await?;
+                    }
+                    "SUBMITTED" => {
+                        let submitted: SubmittedLeafSplit =
+                            serde_json::from_slice(&operation.plan).map_err(|e| e.to_string())?;
+                        let split = service
+                            .finalize_split(&submitted)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        if split.children.len() != operation.child_values_sats.len() {
+                            return Err(
+                                "finalized split returned an unexpected child count".to_string()
+                            );
+                        }
+                        self.db
+                            .mark_spark_split_completed(&operation.operation_id)
+                            .await?;
+                    }
+                    "COMPLETED" => return Ok(()),
+                    status => return Err(format!("unknown Spark split status {status}")),
+                }
+                operation = self
+                    .db
+                    .spark_split_for_parent(&operation.parent_node_id)
+                    .await?
+                    .ok_or_else(|| "Spark split checkpoint disappeared".to_string())?;
+            }
+        }
+        .await;
+        if let Err(error) = &result {
+            let _ = self.db.record_spark_split_error(&operation_id, error).await;
+        }
+        result
+    }
+
+    async fn recover_incomplete_splits(&self) -> Result<(), String> {
+        if self.split_service.is_none() {
+            return Ok(());
+        }
+        let operations = self.db.incomplete_spark_splits().await?;
+        if operations.is_empty() {
+            return Ok(());
+        }
+        self.wallet.sync().await.map_err(|e| e.to_string())?;
+        let leaves = self.wallet.list_leaves().await.map_err(|e| e.to_string())?;
+        let available = leaves
+            .available
+            .into_iter()
+            .chain(leaves.available_missing_from_operators)
+            .map(wallet_leaf_to_tree_node)
+            .collect::<Result<Vec<_>, _>>()?;
+        for operation in operations {
+            let parent = available
+                .iter()
+                .find(|leaf| leaf.id.to_string() == operation.parent_node_id);
+            if operation.status == "DRAFT" && parent.is_none() {
+                tracing::warn!(
+                    operation_id = %operation.operation_id,
+                    parent_node_id = %operation.parent_node_id,
+                    "cannot resume draft Spark split until its parent is available"
+                );
+                continue;
+            }
+            self.resume_leaf_split(operation, parent).await?;
+        }
+        self.wallet.sync().await.map_err(|e| e.to_string())
     }
 
     async fn find_htlc(
@@ -826,6 +1117,118 @@ fn select_receive_leaves<L: LeafLike>(
     select_leaves_by_exact_amounts(leaves, &[amount_sats])
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JustInTimeSplit<L> {
+    /// Whole leaves used alongside the newly-created `needed` child.
+    selected: Vec<L>,
+    parent: L,
+    needed_sats: u64,
+    change_sats: u64,
+}
+
+/// Find one leaf to split after exact whole-leaf selection fails. Existing
+/// leaves may cover part of the target; the parent becomes `[needed, change]`.
+/// Both children honor the configured local floor. Operators accept any
+/// positive amount, but deployments that require standalone L1 relayability
+/// should configure their Bitcoin dust floor here.
+fn plan_just_in_time_split<L: LeafLike + Clone>(
+    leaves: &[L],
+    target_sats: u64,
+    minimum_child_sats: u64,
+) -> Option<JustInTimeSplit<L>> {
+    if target_sats == 0 || minimum_child_sats == 0 {
+        return None;
+    }
+
+    let mut best: Option<JustInTimeSplit<L>> = None;
+    for (parent_index, parent) in leaves.iter().enumerate() {
+        let mut candidates = leaves
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != parent_index)
+            .map(|(_, leaf)| leaf.clone())
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|leaf| std::cmp::Reverse(leaf.leaf_value()));
+
+        let maximum_existing = target_sats.saturating_sub(minimum_child_sats);
+        let mut selected = Vec::new();
+        let mut selected_sats = 0u64;
+        for candidate in candidates {
+            let Some(next) = selected_sats.checked_add(candidate.leaf_value()) else {
+                continue;
+            };
+            if next <= maximum_existing {
+                selected.push(candidate);
+                selected_sats = next;
+            }
+        }
+
+        let needed_sats = target_sats - selected_sats;
+        let Some(change_sats) = parent.leaf_value().checked_sub(needed_sats) else {
+            continue;
+        };
+        if needed_sats < minimum_child_sats || change_sats < minimum_child_sats {
+            continue;
+        }
+        let plan = JustInTimeSplit {
+            selected,
+            parent: parent.clone(),
+            needed_sats,
+            change_sats,
+        };
+        let score = (
+            plan.change_sats,
+            plan.selected.len(),
+            plan.parent.leaf_value(),
+        );
+        if best.as_ref().is_none_or(|current| {
+            score
+                < (
+                    current.change_sats,
+                    current.selected.len(),
+                    current.parent.leaf_value(),
+                )
+        }) {
+            best = Some(plan);
+        }
+    }
+    best
+}
+
+fn plan_denomination_split<L: LeafLike + Clone>(
+    leaves: &[L],
+    denominations: &[u64],
+    minimum_child_sats: u64,
+) -> Option<(L, u64, u64)> {
+    if denominations.is_empty() || denominations.contains(&0) || minimum_child_sats == 0 {
+        return None;
+    }
+    let mut remaining = leaves.to_vec();
+    let mut missing = None;
+    for denomination in denominations {
+        if let Some(index) = remaining
+            .iter()
+            .position(|leaf| leaf.leaf_value() == *denomination)
+        {
+            remaining.remove(index);
+        } else {
+            missing = Some(*denomination);
+            break;
+        }
+    }
+    let missing = missing?;
+    if missing < minimum_child_sats {
+        return None;
+    }
+    remaining
+        .into_iter()
+        .filter_map(|parent| {
+            let change = parent.leaf_value().checked_sub(missing)?;
+            (change >= minimum_child_sats).then_some((parent, missing, change))
+        })
+        .min_by_key(|(parent, _, change)| (*change, parent.leaf_value()))
+}
+
 fn wallet_leaf_to_tree_node(leaf: WalletLeaf) -> Result<TreeNode, String> {
     Ok(TreeNode {
         id: leaf.id,
@@ -948,6 +1351,13 @@ fn payment_transfer_id(payment_hash: &str) -> Result<TransferId, String> {
 fn counter_transfer_id(primary_id: &str) -> TransferId {
     let digest = Sha256::digest(format!("swap-counter:{primary_id}").as_bytes());
     deterministic_transfer_id(&digest[..16]).expect("sha256 prefix is 16 bytes")
+}
+
+fn split_operation_id(parent_id: &::spark::tree::TreeNodeId) -> String {
+    let digest = Sha256::digest(format!("leaf-split:{parent_id}").as_bytes());
+    deterministic_transfer_id(&digest[..16])
+        .expect("sha256 prefix is 16 bytes")
+        .to_string()
 }
 
 fn deterministic_transfer_id(source: &[u8]) -> Result<TransferId, String> {
@@ -1101,6 +1511,95 @@ mod tests {
         ];
         let combined = select_receive_leaves(&equal_leaves, 2_000).unwrap();
         assert_eq!(combined, equal_leaves);
+    }
+
+    #[test]
+    fn split_planner_uses_one_larger_leaf_for_needed_and_change() {
+        let leaves = [
+            TestLeaf {
+                id: 1,
+                value: 10_000,
+            },
+            TestLeaf {
+                id: 2,
+                value: 20_000,
+            },
+        ];
+        let plan = plan_just_in_time_split(&leaves, 7_321, 1).unwrap();
+        assert!(plan.selected.is_empty());
+        assert_eq!(plan.parent.id, 1);
+        assert_eq!(plan.needed_sats, 7_321);
+        assert_eq!(plan.change_sats, 2_679);
+    }
+
+    #[test]
+    fn split_planner_combines_existing_leaves_with_one_split() {
+        let leaves = [
+            TestLeaf { id: 1, value: 400 },
+            TestLeaf { id: 2, value: 600 },
+            TestLeaf {
+                id: 3,
+                value: 1_000,
+            },
+        ];
+        let plan = plan_just_in_time_split(&leaves, 1_500, 1).unwrap();
+        assert_eq!(
+            plan.selected.iter().map(|leaf| leaf.value).sum::<u64>(),
+            1_400
+        );
+        assert_eq!(plan.parent.value, 600);
+        assert_eq!(plan.needed_sats, 100);
+        assert_eq!(plan.change_sats, 500);
+    }
+
+    #[test]
+    fn split_planner_enforces_both_child_floors() {
+        let leaves = [TestLeaf {
+            id: 1,
+            value: 1_000,
+        }];
+        assert!(plan_just_in_time_split(&leaves, 900, 101).is_none());
+        assert!(plan_just_in_time_split(&leaves, 100, 101).is_none());
+
+        let plan = plan_just_in_time_split(&leaves, 670, 330).unwrap();
+        assert_eq!((plan.needed_sats, plan.change_sats), (670, 330));
+    }
+
+    #[test]
+    fn split_planner_can_split_a_previous_split_child_again() {
+        // The planner intentionally has no concept of tree depth: once the
+        // signer can resolve a child key, it is an ordinary eligible parent.
+        let change_child = [TestLeaf {
+            id: 9,
+            value: 2_679,
+        }];
+        let plan = plan_just_in_time_split(&change_child, 2_500, 1).unwrap();
+        assert_eq!(plan.parent.id, 9);
+        assert_eq!((plan.needed_sats, plan.change_sats), (2_500, 179));
+    }
+
+    #[test]
+    fn denomination_planner_preserves_existing_matches() {
+        let leaves = [
+            TestLeaf { id: 1, value: 500 },
+            TestLeaf {
+                id: 2,
+                value: 2_000,
+            },
+        ];
+        let (parent, needed, change) = plan_denomination_split(&leaves, &[500, 700], 330).unwrap();
+        assert_eq!(parent.id, 2);
+        assert_eq!((needed, change), (700, 1_300));
+    }
+
+    #[test]
+    fn denomination_planner_rejects_unexitable_child() {
+        let leaves = [TestLeaf {
+            id: 1,
+            value: 1_000,
+        }];
+        assert!(plan_denomination_split(&leaves, &[100], 330).is_none());
+        assert!(plan_denomination_split(&leaves, &[800], 330).is_none());
     }
 
     #[test]

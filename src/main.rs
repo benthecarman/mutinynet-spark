@@ -309,11 +309,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         return Err("SPARK_ADMIN_TOKEN is required unless SPARK_ADMIN_ALLOW_NO_AUTH=1".into());
     }
-    let spark = SparkService::connect(&config)
+    let db = Arc::new(Db::open(&config.data_dir).map_err(|e| format!("db: {e}"))?);
+    let spark = SparkService::connect(&config, db.clone())
         .await
         .map_err(|e| format!("spark: {e}"))?;
     info!(identity = %spark.identity(), "embedded Spark wallet connected");
-    let db = Arc::new(Db::open(&config.data_dir).map_err(|e| format!("db: {e}"))?);
     // Fake Lightning is never silent: refuse unless explicitly allowed.
     let allow_fake = std::env::var("SSP_ALLOW_FAKE_LN").unwrap_or_default() == "1";
     let backend = Arc::new(tokio::sync::RwLock::new(

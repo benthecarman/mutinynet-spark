@@ -32,6 +32,15 @@ pub struct Config {
     pub so_identity_pubkeys: String,
     /// Optional comma-separated CA certificate files for custom operators.
     pub so_cert_files: String,
+    /// Private SSP-facing operator endpoints, in the same order as SO_HOSTS.
+    /// Empty disables just-in-time leaf splitting.
+    pub ssp_operator_hosts: String,
+    /// Optional comma-separated CA certificate files for SSP operator endpoints.
+    pub ssp_operator_cert_files: String,
+    /// Smallest child the local liquidity policy will create. Spark accepts
+    /// positive sub-dust leaves off chain; set this to the deployment's relay
+    /// dust floor when every child must be independently exit-relayable.
+    pub ssp_min_split_child_sats: u64,
     /// Token for the integrated funding endpoints. A missing token fails
     /// closed unless SPARK_ADMIN_ALLOW_NO_AUTH=1 is explicit.
     pub spark_admin_token: String,
@@ -75,6 +84,11 @@ impl Config {
             so_hosts: get("SO_HOSTS", ""),
             so_identity_pubkeys: get("SO_IDENTITY_PUBKEYS", ""),
             so_cert_files: get("SO_CERT_FILES", ""),
+            ssp_operator_hosts: get("SSP_OPERATOR_HOSTS", ""),
+            ssp_operator_cert_files: get("SSP_OPERATOR_CERT_FILES", ""),
+            ssp_min_split_child_sats: get("SSP_MIN_SPLIT_CHILD_SATS", "330")
+                .parse()
+                .unwrap_or(330),
             spark_admin_token: std::env::var("SPARK_ADMIN_TOKEN")
                 .or_else(|_| std::env::var("SIDECAR_TOKEN"))
                 .unwrap_or_default(),

@@ -32,6 +32,26 @@ pub struct LightningSend {
     pub amount_sats: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SparkSplitOperation {
+    pub operation_id: String,
+    pub parent_node_id: String,
+    pub parent_value_sats: u64,
+    pub child_values_sats: Vec<u64>,
+    /// Opaque, retryable split stage produced by spark-sdk. Child secrets are
+    /// persisted separately before the first operator call.
+    pub plan: Vec<u8>,
+    pub status: String,
+    pub child_node_ids: Vec<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SparkLeafKeyOverride {
+    pub node_id: String,
+    pub key_material: Vec<u8>,
+}
+
 fn ensure_column(
     conn: &rusqlite::Connection,
     table: &str,
@@ -75,7 +95,31 @@ impl Db {
              CREATE TABLE IF NOT EXISTS preimages(hash TEXT PRIMARY KEY, preimage TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00');
              CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, status TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS receive_payments(hash TEXT PRIMARY KEY, status TEXT NOT NULL, transfer_id TEXT, preimage TEXT, claimable_amount_msat INTEGER, claim_submitted INTEGER NOT NULL DEFAULT 0);
-             CREATE TABLE IF NOT EXISTS static_quotes(txid TEXT NOT NULL, vout INTEGER NOT NULL, credit INTEGER NOT NULL, signature TEXT NOT NULL, created_at TEXT NOT NULL, claimed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(txid, vout));",
+             CREATE TABLE IF NOT EXISTS static_quotes(txid TEXT NOT NULL, vout INTEGER NOT NULL, credit INTEGER NOT NULL, signature TEXT NOT NULL, created_at TEXT NOT NULL, claimed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(txid, vout));
+             CREATE TABLE IF NOT EXISTS spark_split_operations(
+               operation_id TEXT PRIMARY KEY,
+               parent_node_id TEXT NOT NULL UNIQUE,
+               parent_value_sats INTEGER NOT NULL,
+               child_values_sats TEXT NOT NULL,
+               plan BLOB NOT NULL,
+               status TEXT NOT NULL CHECK(status IN ('DRAFT','PREPARED','SUBMITTING','SUBMITTED','COMPLETED')),
+               child_node_ids TEXT NOT NULL DEFAULT '[]',
+               last_error TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS spark_leaf_key_overrides(
+               node_id TEXT PRIMARY KEY,
+               operation_id TEXT NOT NULL REFERENCES spark_split_operations(operation_id),
+               key_material BLOB NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS spark_pending_split_keys(
+               operation_id TEXT PRIMARY KEY,
+               parent_node_id TEXT NOT NULL,
+               encrypted_keys BLOB NOT NULL,
+               created_at TEXT NOT NULL
+             );",
         )
         .map_err(|e| e.to_string())?;
         // Keep old databases compatible without a migration framework. Each
@@ -984,6 +1028,536 @@ impl Db {
             .await?;
         Ok(found.unwrap_or_else(|| "UNKNOWN".to_string()))
     }
+
+    // ---- Spark leaf splitting ----
+
+    /// Save a split plan before any operator call. A parent may only have one
+    /// plan: retries get the original opaque plan and therefore reuse its
+    /// child secrets instead of silently creating incompatible keys.
+    pub async fn get_or_insert_spark_split(
+        &self,
+        candidate: &SparkSplitOperation,
+    ) -> Result<SparkSplitOperation, String> {
+        let candidate = candidate.clone();
+        self.with(move |c| {
+            let child_values = serde_json::to_string(&candidate.child_values_sats)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let child_node_ids = serde_json::to_string(&candidate.child_node_ids)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let now = chrono::Utc::now().to_rfc3339();
+            c.execute(
+                "INSERT OR IGNORE INTO spark_split_operations(
+                   operation_id,parent_node_id,parent_value_sats,child_values_sats,plan,status,
+                   child_node_ids,last_error,created_at,updated_at
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
+                rusqlite::params![
+                    candidate.operation_id,
+                    candidate.parent_node_id,
+                    candidate.parent_value_sats,
+                    child_values,
+                    candidate.plan,
+                    candidate.status,
+                    child_node_ids,
+                    candidate.last_error,
+                    now,
+                ],
+            )?;
+            read_spark_split(c, &candidate.parent_node_id)
+        })
+        .await
+    }
+
+    pub async fn spark_split_for_parent(
+        &self,
+        parent_node_id: &str,
+    ) -> Result<Option<SparkSplitOperation>, String> {
+        let parent_node_id = parent_node_id.to_string();
+        self.with(move |c| optional_spark_split(c, &parent_node_id))
+            .await
+    }
+
+    pub async fn incomplete_spark_splits(&self) -> Result<Vec<SparkSplitOperation>, String> {
+        self.with(|c| {
+            let mut statement = c.prepare(
+                "SELECT operation_id,parent_node_id,parent_value_sats,child_values_sats,plan,
+                        status,child_node_ids,last_error
+                 FROM spark_split_operations WHERE status!='COMPLETED' ORDER BY created_at",
+            )?;
+            let rows = statement
+                .query_map([], spark_split_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub async fn mark_spark_split_submitting(&self, operation_id: &str) -> Result<(), String> {
+        let operation_id = operation_id.to_string();
+        self.with(move |c| {
+            let changed = c.execute(
+                "UPDATE spark_split_operations
+                 SET status='SUBMITTING',last_error=NULL,updated_at=?2
+                 WHERE operation_id=?1 AND status='PREPARED'",
+                (&operation_id, chrono::Utc::now().to_rfc3339()),
+            )?;
+            if changed == 0 {
+                let status: String = c.query_row(
+                    "SELECT status FROM spark_split_operations WHERE operation_id=?1",
+                    (&operation_id,),
+                    |row| row.get(0),
+                )?;
+                if status != "SUBMITTING" && status != "SUBMITTED" && status != "COMPLETED" {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn save_prepared_spark_split(
+        &self,
+        operation_id: &str,
+        plan: &[u8],
+    ) -> Result<(), String> {
+        let operation_id = operation_id.to_string();
+        let plan = plan.to_vec();
+        self.with(move |c| {
+            let changed = c.execute(
+                "UPDATE spark_split_operations
+                 SET plan=?2,status='PREPARED',last_error=NULL,updated_at=?3
+                 WHERE operation_id=?1 AND status IN ('DRAFT','PREPARED')",
+                (&operation_id, &plan, chrono::Utc::now().to_rfc3339()),
+            )?;
+            if changed == 1 {
+                Ok(())
+            } else {
+                Err(rusqlite::Error::InvalidQuery)
+            }
+        })
+        .await
+    }
+
+    /// Replace the prepared plan with the serialized operator response before
+    /// finalizing signatures. Retries can then resume without submitting a
+    /// different tree request.
+    pub async fn save_submitted_spark_split(
+        &self,
+        operation_id: &str,
+        submitted: &[u8],
+    ) -> Result<(), String> {
+        let operation_id = operation_id.to_string();
+        let submitted = submitted.to_vec();
+        self.with(move |c| {
+            let changed = c.execute(
+                "UPDATE spark_split_operations
+                 SET plan=?2,status='SUBMITTED',last_error=NULL,updated_at=?3
+                 WHERE operation_id=?1 AND status IN ('SUBMITTING','SUBMITTED')",
+                (&operation_id, &submitted, chrono::Utc::now().to_rfc3339()),
+            )?;
+            if changed == 1 {
+                Ok(())
+            } else {
+                Err(rusqlite::Error::InvalidQuery)
+            }
+        })
+        .await
+    }
+
+    /// Persist progress made inside the opaque SDK plan (for example prepared
+    /// addresses) without changing its identity or child keys.
+    pub async fn update_spark_split_plan(
+        &self,
+        operation_id: &str,
+        plan: &[u8],
+    ) -> Result<(), String> {
+        let operation_id = operation_id.to_string();
+        let plan = plan.to_vec();
+        self.with(move |c| {
+            let changed = c.execute(
+                "UPDATE spark_split_operations SET plan=?2,updated_at=?3
+                 WHERE operation_id=?1 AND status!='COMPLETED'",
+                (&operation_id, &plan, chrono::Utc::now().to_rfc3339()),
+            )?;
+            if changed == 1 {
+                Ok(())
+            } else {
+                Err(rusqlite::Error::InvalidQuery)
+            }
+        })
+        .await
+    }
+
+    pub async fn record_spark_split_error(
+        &self,
+        operation_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        let operation_id = operation_id.to_string();
+        let error = error.to_string();
+        self.with(move |c| {
+            c.execute(
+                "UPDATE spark_split_operations SET last_error=?2,updated_at=?3
+                 WHERE operation_id=?1 AND status!='COMPLETED'",
+                (&operation_id, &error, chrono::Utc::now().to_rfc3339()),
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Commit the operator-assigned child IDs and their private key material
+    /// together. Once this returns, a restarted signer can resolve every new
+    /// child before the completed operation is used for liquidity.
+    pub async fn complete_spark_split(
+        &self,
+        operation_id: &str,
+        overrides: &[SparkLeafKeyOverride],
+    ) -> Result<(), String> {
+        let operation_id = operation_id.to_string();
+        let overrides = overrides.to_vec();
+        self.with(move |c| {
+            let tx = c.unchecked_transaction()?;
+            let expected_children: String = tx.query_row(
+                "SELECT child_values_sats FROM spark_split_operations WHERE operation_id=?1",
+                (&operation_id,),
+                |row| row.get(0),
+            )?;
+            let expected_children: Vec<u64> = serde_json::from_str(&expected_children)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            if overrides.len() != expected_children.len()
+                || overrides.iter().any(|item| item.node_id.is_empty() || item.key_material.is_empty())
+            {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let child_node_ids = overrides
+                .iter()
+                .map(|item| item.node_id.clone())
+                .collect::<Vec<_>>();
+            let now = chrono::Utc::now().to_rfc3339();
+            for item in &overrides {
+                tx.execute(
+                    "INSERT INTO spark_leaf_key_overrides(node_id,operation_id,key_material,created_at)
+                     VALUES(?1,?2,?3,?4)
+                     ON CONFLICT(node_id) DO UPDATE SET
+                       operation_id=excluded.operation_id,key_material=excluded.key_material",
+                    rusqlite::params![item.node_id, operation_id, item.key_material, now],
+                )?;
+            }
+            tx.execute(
+                "UPDATE spark_split_operations
+                 SET status='COMPLETED',child_node_ids=?2,last_error=NULL,updated_at=?3
+                 WHERE operation_id=?1",
+                (
+                    &operation_id,
+                    serde_json::to_string(&child_node_ids)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    &now,
+                ),
+            )?;
+            tx.execute(
+                "DELETE FROM spark_pending_split_keys WHERE operation_id=?1",
+                (&operation_id,),
+            )?;
+            tx.commit()
+        })
+        .await
+    }
+
+    pub async fn mark_spark_split_completed(&self, operation_id: &str) -> Result<(), String> {
+        let operation_id = operation_id.to_string();
+        self.with(move |c| {
+            let changed = c.execute(
+                "UPDATE spark_split_operations
+                 SET status='COMPLETED',last_error=NULL,updated_at=?2
+                 WHERE operation_id=?1 AND status IN ('SUBMITTED','COMPLETED')
+                   AND child_node_ids!='[]'",
+                (&operation_id, chrono::Utc::now().to_rfc3339()),
+            )?;
+            if changed == 1 {
+                Ok(())
+            } else {
+                Err(rusqlite::Error::InvalidQuery)
+            }
+        })
+        .await
+    }
+
+    pub async fn spark_leaf_key_overrides(&self) -> Result<Vec<SparkLeafKeyOverride>, String> {
+        self.with(|c| {
+            let mut statement = c.prepare(
+                "SELECT node_id,key_material FROM spark_leaf_key_overrides ORDER BY node_id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(SparkLeafKeyOverride {
+                        node_id: row.get(0)?,
+                        key_material: row.get(1)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub async fn spark_leaf_key_override(&self, node_id: &str) -> Result<Option<Vec<u8>>, String> {
+        let node_id = node_id.to_string();
+        self.with(move |c| {
+            c.query_row(
+                "SELECT key_material FROM spark_leaf_key_overrides WHERE node_id=?1",
+                (&node_id,),
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                error => Err(error),
+            })
+        })
+        .await
+    }
+
+    pub async fn pending_spark_split_keys(
+        &self,
+        operation_id: &str,
+        parent_node_id: &str,
+    ) -> Result<Option<Vec<Vec<u8>>>, String> {
+        let operation_id = operation_id.to_string();
+        let parent_node_id = parent_node_id.to_string();
+        self.with(move |c| {
+            let encoded: Option<Vec<u8>> = c
+                .query_row(
+                    "SELECT encrypted_keys FROM spark_pending_split_keys
+                     WHERE operation_id=?1 AND parent_node_id=?2",
+                    (&operation_id, &parent_node_id),
+                    |row| row.get(0),
+                )
+                .map(Some)
+                .or_else(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    error => Err(error),
+                })?;
+            encoded
+                .map(|encoded| {
+                    serde_json::from_slice(&encoded).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()
+        })
+        .await
+    }
+
+    /// Persist once. A retry with different key material is rejected so an
+    /// ambiguous split can never be retried using newly generated children.
+    pub async fn put_pending_spark_split_keys(
+        &self,
+        operation_id: &str,
+        parent_node_id: &str,
+        encrypted_keys: &[Vec<u8>],
+    ) -> Result<(), String> {
+        if encrypted_keys.is_empty() || encrypted_keys.iter().any(Vec::is_empty) {
+            return Err("pending Spark split keys must be non-empty".to_string());
+        }
+        let operation_id = operation_id.to_string();
+        let parent_node_id = parent_node_id.to_string();
+        let encoded = serde_json::to_vec(encrypted_keys).map_err(|e| e.to_string())?;
+        self.with(move |c| {
+            c.execute(
+                "INSERT OR IGNORE INTO spark_pending_split_keys(operation_id,parent_node_id,encrypted_keys,created_at)
+                 VALUES(?1,?2,?3,?4)",
+                (
+                    &operation_id,
+                    &parent_node_id,
+                    &encoded,
+                    chrono::Utc::now().to_rfc3339(),
+                ),
+            )?;
+            let stored: (String, Vec<u8>) = c.query_row(
+                "SELECT parent_node_id,encrypted_keys FROM spark_pending_split_keys WHERE operation_id=?1",
+                (&operation_id,),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if stored == (parent_node_id, encoded) {
+                Ok(())
+            } else {
+                Err(rusqlite::Error::InvalidQuery)
+            }
+        })
+        .await
+    }
+
+    pub async fn bind_pending_spark_split_keys(
+        &self,
+        operation_id: &str,
+        node_ids: &[String],
+    ) -> Result<(), String> {
+        if node_ids.is_empty() || node_ids.iter().any(String::is_empty) {
+            return Err("split child node IDs must be non-empty".to_string());
+        }
+        let operation_id = operation_id.to_string();
+        let node_ids = node_ids.to_vec();
+        self.with(move |c| {
+            let tx = c.unchecked_transaction()?;
+            let operation: (String, String) = tx.query_row(
+                "SELECT child_values_sats,child_node_ids FROM spark_split_operations
+                 WHERE operation_id=?1",
+                (&operation_id,),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let expected_values: Vec<u64> = serde_json::from_str(&operation.0)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            if expected_values.len() != node_ids.len() {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let pending: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT encrypted_keys FROM spark_pending_split_keys WHERE operation_id=?1",
+                    (&operation_id,),
+                    |row| row.get(0),
+                )
+                .map(Some)
+                .or_else(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    error => Err(error),
+                })?;
+            let Some(pending) = pending else {
+                let bound: Vec<String> = serde_json::from_str(&operation.1)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                return if bound == node_ids {
+                    tx.commit()
+                } else {
+                    Err(rusqlite::Error::InvalidQuery)
+                };
+            };
+            let encrypted_keys: Vec<Vec<u8>> = serde_json::from_slice(&pending)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            if encrypted_keys.len() != node_ids.len() {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let now = chrono::Utc::now().to_rfc3339();
+            for (node_id, key_material) in node_ids.iter().zip(encrypted_keys) {
+                tx.execute(
+                    "INSERT INTO spark_leaf_key_overrides(node_id,operation_id,key_material,created_at)
+                     VALUES(?1,?2,?3,?4)
+                     ON CONFLICT(node_id) DO UPDATE SET
+                       operation_id=excluded.operation_id,key_material=excluded.key_material",
+                    rusqlite::params![node_id, operation_id, key_material, now],
+                )?;
+            }
+            tx.execute(
+                "UPDATE spark_split_operations
+                 SET child_node_ids=?2,last_error=NULL,updated_at=?3
+                 WHERE operation_id=?1",
+                (
+                    &operation_id,
+                    serde_json::to_string(&node_ids)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    &now,
+                ),
+            )?;
+            tx.execute(
+                "DELETE FROM spark_pending_split_keys WHERE operation_id=?1",
+                (&operation_id,),
+            )?;
+            tx.commit()
+        })
+        .await
+    }
+}
+
+fn spark_split_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SparkSplitOperation> {
+    let parent_value_sats: u64 = row.get(2)?;
+    let child_values: String = row.get(3)?;
+    let child_node_ids: String = row.get(6)?;
+    Ok(SparkSplitOperation {
+        operation_id: row.get(0)?,
+        parent_node_id: row.get(1)?,
+        parent_value_sats,
+        child_values_sats: serde_json::from_str(&child_values).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        plan: row.get(4)?,
+        status: row.get(5)?,
+        child_node_ids: serde_json::from_str(&child_node_ids).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        last_error: row.get(7)?,
+    })
+}
+
+fn optional_spark_split(
+    conn: &rusqlite::Connection,
+    parent_node_id: &str,
+) -> rusqlite::Result<Option<SparkSplitOperation>> {
+    conn.query_row(
+        "SELECT operation_id,parent_node_id,parent_value_sats,child_values_sats,plan,
+                status,child_node_ids,last_error
+         FROM spark_split_operations WHERE parent_node_id=?1",
+        (parent_node_id,),
+        spark_split_from_row,
+    )
+    .map(Some)
+    .or_else(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        error => Err(error),
+    })
+}
+
+fn read_spark_split(
+    conn: &rusqlite::Connection,
+    parent_node_id: &str,
+) -> rusqlite::Result<SparkSplitOperation> {
+    optional_spark_split(conn, parent_node_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+#[async_trait::async_trait]
+impl ::spark::signer::LeafKeyOverrideStore for Db {
+    async fn get_leaf_key(
+        &self,
+        node_id: &::spark::tree::TreeNodeId,
+    ) -> Result<Option<Vec<u8>>, ::spark::signer::LeafKeyOverrideStoreError> {
+        self.spark_leaf_key_override(&node_id.to_string())
+            .await
+            .map_err(::spark::signer::LeafKeyOverrideStoreError::Generic)
+    }
+
+    async fn get_pending_split_keys(
+        &self,
+        operation_id: &str,
+        parent_node_id: &::spark::tree::TreeNodeId,
+    ) -> Result<Option<Vec<Vec<u8>>>, ::spark::signer::LeafKeyOverrideStoreError> {
+        self.pending_spark_split_keys(operation_id, &parent_node_id.to_string())
+            .await
+            .map_err(::spark::signer::LeafKeyOverrideStoreError::Generic)
+    }
+
+    async fn put_pending_split_keys(
+        &self,
+        operation_id: &str,
+        parent_node_id: &::spark::tree::TreeNodeId,
+        encrypted_keys: &[Vec<u8>],
+    ) -> Result<(), ::spark::signer::LeafKeyOverrideStoreError> {
+        self.put_pending_spark_split_keys(operation_id, &parent_node_id.to_string(), encrypted_keys)
+            .await
+            .map_err(::spark::signer::LeafKeyOverrideStoreError::Generic)
+    }
+
+    async fn bind_pending_split_keys(
+        &self,
+        operation_id: &str,
+        node_ids: &[::spark::tree::TreeNodeId],
+    ) -> Result<(), ::spark::signer::LeafKeyOverrideStoreError> {
+        let node_ids = node_ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+        self.bind_pending_spark_split_keys(operation_id, &node_ids)
+            .await
+            .map_err(::spark::signer::LeafKeyOverrideStoreError::Generic)
+    }
 }
 
 #[cfg(test)]
@@ -1285,6 +1859,168 @@ mod tests {
                 .await
                 .unwrap(),
             Some(spark_id.to_string())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spark_split_plan_and_keys_survive_restart() {
+        let (db, dir) = test_db();
+        db.put_pending_spark_split_keys(
+            "split-1",
+            "parent",
+            &[b"encrypted-a".to_vec(), b"encrypted-b".to_vec()],
+        )
+        .await
+        .unwrap();
+        let candidate = SparkSplitOperation {
+            operation_id: "split-1".to_string(),
+            parent_node_id: "parent".to_string(),
+            parent_value_sats: 10_000,
+            child_values_sats: vec![7_000, 3_000],
+            plan: b"opaque-encrypted-plan".to_vec(),
+            status: "PREPARED".to_string(),
+            child_node_ids: Vec::new(),
+            last_error: None,
+        };
+        assert_eq!(
+            db.get_or_insert_spark_split(&candidate).await.unwrap(),
+            candidate
+        );
+
+        // Retrying preparation for the same parent must recover the first
+        // plan, not replace its already-persisted child secrets.
+        let mut conflicting = candidate.clone();
+        conflicting.operation_id = "split-2".to_string();
+        conflicting.plan = b"fresh-and-unsafe".to_vec();
+        assert_eq!(
+            db.get_or_insert_spark_split(&conflicting).await.unwrap(),
+            candidate
+        );
+        db.mark_spark_split_submitting("split-1").await.unwrap();
+        drop(db);
+
+        let db = Db::open(dir.to_str().unwrap()).unwrap();
+        assert_eq!(
+            db.pending_spark_split_keys("split-1", "parent")
+                .await
+                .unwrap(),
+            Some(vec![b"encrypted-a".to_vec(), b"encrypted-b".to_vec()])
+        );
+        let pending = db.incomplete_spark_splits().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].plan, b"opaque-encrypted-plan");
+        assert_eq!(pending[0].status, "SUBMITTING");
+        db.save_submitted_spark_split("split-1", b"submitted-response")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.spark_split_for_parent("parent")
+                .await
+                .unwrap()
+                .unwrap()
+                .plan,
+            b"submitted-response"
+        );
+
+        let overrides = vec![
+            SparkLeafKeyOverride {
+                node_id: "child-a".to_string(),
+                key_material: b"encrypted-a".to_vec(),
+            },
+            SparkLeafKeyOverride {
+                node_id: "child-b".to_string(),
+                key_material: b"encrypted-b".to_vec(),
+            },
+        ];
+        db.bind_pending_spark_split_keys(
+            "split-1",
+            &["child-a".to_string(), "child-b".to_string()],
+        )
+        .await
+        .unwrap();
+        // A retry after an ambiguous response is an idempotent no-op.
+        db.bind_pending_spark_split_keys(
+            "split-1",
+            &["child-a".to_string(), "child-b".to_string()],
+        )
+        .await
+        .unwrap();
+        db.mark_spark_split_completed("split-1").await.unwrap();
+        drop(db);
+
+        let db = Db::open(dir.to_str().unwrap()).unwrap();
+        assert!(db.incomplete_spark_splits().await.unwrap().is_empty());
+        assert_eq!(
+            db.pending_spark_split_keys("split-1", "parent")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(db.spark_leaf_key_overrides().await.unwrap(), overrides);
+        let completed = db.spark_split_for_parent("parent").await.unwrap().unwrap();
+        assert_eq!(completed.status, "COMPLETED");
+        assert_eq!(completed.child_node_ids, ["child-a", "child-b"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spark_split_completion_is_atomic() {
+        let (db, dir) = test_db();
+        db.get_or_insert_spark_split(&SparkSplitOperation {
+            operation_id: "split".to_string(),
+            parent_node_id: "parent".to_string(),
+            parent_value_sats: 2_000,
+            child_values_sats: vec![1_000, 1_000],
+            plan: vec![1],
+            status: "PREPARED".to_string(),
+            child_node_ids: Vec::new(),
+            last_error: None,
+        })
+        .await
+        .unwrap();
+
+        let error = db
+            .complete_spark_split(
+                "split",
+                &[SparkLeafKeyOverride {
+                    node_id: "only-one".to_string(),
+                    key_material: vec![2],
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.is_empty());
+        assert!(db.spark_leaf_key_overrides().await.unwrap().is_empty());
+        assert_eq!(
+            db.spark_split_for_parent("parent")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "PREPARED"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_split_keys_cannot_be_replaced() {
+        let (db, dir) = test_db();
+        db.put_pending_spark_split_keys("split", "parent", &[vec![1], vec![2]])
+            .await
+            .unwrap();
+        db.put_pending_spark_split_keys("split", "parent", &[vec![1], vec![2]])
+            .await
+            .unwrap();
+        assert!(db
+            .put_pending_spark_split_keys("split", "parent", &[vec![3], vec![4]])
+            .await
+            .is_err());
+        assert_eq!(
+            db.pending_spark_split_keys("split", "parent")
+                .await
+                .unwrap(),
+            Some(vec![vec![1], vec![2]])
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

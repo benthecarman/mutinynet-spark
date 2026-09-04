@@ -29,6 +29,9 @@ The SSP calls existing operator consensus code through this RPC.
 | `SO_HOSTS` | Ordered, comma-separated operator gRPC addresses |
 | `SO_IDENTITY_PUBKEYS` | Ordered operator identity keys; must match `SO_HOSTS` |
 | `SO_CERT_FILES` | Empty for public trust, or one ordered certificate file per operator |
+| `SSP_OPERATOR_HOSTS` | Optional ordered, comma-separated SSP-private operator gRPC addresses; enables just-in-time leaf splitting |
+| `SSP_OPERATOR_CERT_FILES` | Empty for public trust, or one ordered certificate file per SSP-private operator endpoint |
+| `SSP_MIN_SPLIT_CHILD_SATS` | Local minimum split-child value (default `330`, the standard P2TR relay dust floor) |
 | `SSP_FROST_OPERATORS` | JSON operator IDs, identifiers, and identity keys for receive shares |
 | `SSP_FROST_THRESHOLD` | Operator signing threshold |
 | `SPARK_ADMIN_TOKEN` | Bearer token for the liquidity endpoints |
