@@ -70,7 +70,7 @@ jobs:
       SPARK_OPERATOR_COMMIT: 0b3a32a05c9ac06cc411683551dd1f1bde9d0caa
       LDK_SERVER_REF: /tmp/opencode/ldk-server-ref
       SPARK_ADMIN_TOKEN: regtest-spark-admin-token
-      BREEZ_E2E_PROJECT_NAME: mutinynet-ssp-breez-e2e-ci
+      BREEZ_E2E_PROJECT_NAME: open-ssp-breez-e2e-ci
     steps:
       - uses: actions/checkout@v5
       - name: Install build dependencies
@@ -106,7 +106,7 @@ jobs:
       - uses: docker/metadata-action@v6
         id: meta
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/mutinynet-ssp
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/open-ssp
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=master,enable={{is_default_branch}}

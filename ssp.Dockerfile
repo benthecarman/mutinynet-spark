@@ -17,10 +17,10 @@ RUN apt-get update && apt-get install -y ca-certificates \
  && groupadd --system --gid 10001 ssp \
  && useradd --system --uid 10001 --gid ssp --home-dir /data ssp \
  && install -d -o ssp -g ssp /data
-COPY --from=builder /app/target/release/mutinynet-ssp /usr/local/bin/mutinynet-ssp
+COPY --from=builder /app/target/release/open-ssp /usr/local/bin/open-ssp
 ENV SSP_DATA_DIR=/data
 USER ssp
 EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD ["mutinynet-ssp", "healthcheck"]
-ENTRYPOINT ["mutinynet-ssp"]
+  CMD ["open-ssp", "healthcheck"]
+ENTRYPOINT ["open-ssp"]

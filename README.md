@@ -1,6 +1,6 @@
-# mutinynet-ssp
+# open-ssp
 
-`mutinynet-ssp` is a self-hosted Spark Service Provider written in Rust. One
+`open-ssp` is a self-hosted Spark Service Provider written in Rust. One
 process provides the SSP GraphQL API, owns the Spark liquidity wallet, fills
 Swap V3 requests, and settles Lightning payments through `ldk-server`.
 

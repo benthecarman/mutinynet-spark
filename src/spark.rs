@@ -1020,10 +1020,8 @@ mod tests {
 
     #[test]
     fn required_mnemonic_does_not_create_a_new_identity() {
-        let path = std::env::temp_dir().join(format!(
-            "mutinynet-ssp-required-mnemonic-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("open-ssp-required-mnemonic-{}", std::process::id()));
         let error = load_or_create_mnemonic(path.to_str().unwrap(), true).unwrap_err();
         assert!(error.contains("is required"));
         assert!(!path.exists());

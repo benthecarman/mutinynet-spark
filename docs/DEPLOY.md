@@ -10,7 +10,7 @@ repository.
 - At least two Spark Operators and their signers.
 - PostgreSQL databases used by the Spark Operators.
 - `ldk-server` with usable inbound and outbound channel capacity.
-- `mutinynet-ssp` with persistent storage mounted at `/data`.
+- `open-ssp` with persistent storage mounted at `/data`.
 
 The Spark Operator build must include the authenticated Swap V3 counter RPC.
 The SSP calls existing operator consensus code through this RPC.

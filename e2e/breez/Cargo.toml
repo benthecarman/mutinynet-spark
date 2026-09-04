@@ -1,5 +1,5 @@
 [package]
-name = "mutinynet-ssp-breez-e2e"
+name = "open-ssp-breez-e2e"
 version = "0.1.0"
 edition = "2024"
 publish = false

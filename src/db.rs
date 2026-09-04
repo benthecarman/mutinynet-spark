@@ -843,7 +843,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> (Db, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("mutinynet-ssp-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("open-ssp-{}", uuid::Uuid::new_v4()));
         (Db::open(dir.to_str().unwrap()).unwrap(), dir)
     }
 

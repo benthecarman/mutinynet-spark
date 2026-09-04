@@ -276,7 +276,7 @@ services:
 
   ssp:
     # Prebuilt: docker compose pull (needs GHCR access); or --build locally.
-    image: ${SSP_IMAGE:-ghcr.io/benthecarman/mutinynet-ssp:latest}
+    image: ${SSP_IMAGE:-ghcr.io/benthecarman/open-ssp:latest}
     build:
       context: .
       dockerfile: ssp.Dockerfile
@@ -288,7 +288,7 @@ services:
     ports:
       - "127.0.0.1:5000:5000"
     healthcheck:
-      test: ["CMD", "mutinynet-ssp", "healthcheck"]
+      test: ["CMD", "open-ssp", "healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -320,7 +320,7 @@ services:
   # The second SSP gives each Breez wallet a distinct Lightning node. This
   # prevents the test from paying an invoice back to the same node.
   ssp-2:
-    image: ${SSP_IMAGE:-ghcr.io/benthecarman/mutinynet-ssp:latest}
+    image: ${SSP_IMAGE:-ghcr.io/benthecarman/open-ssp:latest}
     build:
       context: .
       dockerfile: ssp.Dockerfile
@@ -332,7 +332,7 @@ services:
     ports:
       - "127.0.0.1:5001:5000"
     healthcheck:
-      test: ["CMD", "mutinynet-ssp", "healthcheck"]
+      test: ["CMD", "open-ssp", "healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 12

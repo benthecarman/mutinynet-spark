@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PROJECT_NAME=${BREEZ_E2E_PROJECT_NAME:-mutinynet-ssp-breez-e2e}
+PROJECT_NAME=${BREEZ_E2E_PROJECT_NAME:-open-ssp-breez-e2e}
 COMPOSE=(docker compose -p "$PROJECT_NAME" -f docker-compose.regtest.yml)
 export COMPOSE_PROGRESS=${COMPOSE_PROGRESS:-plain}
 export COMPOSE_BAKE=${COMPOSE_BAKE:-false}

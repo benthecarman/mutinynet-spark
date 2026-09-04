@@ -1382,8 +1382,7 @@ mod tests {
     }
 
     async fn receive_fixture() -> (Db, std::path::PathBuf, String, String) {
-        let dir =
-            std::env::temp_dir().join(format!("mutinynet-ssp-receive-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("open-ssp-receive-{}", uuid::Uuid::new_v4()));
         let db = Db::open(dir.to_str().unwrap()).unwrap();
         let preimage = "01".repeat(32);
         let payment_hash = hex::encode(Sha256::digest(hex::decode(&preimage).unwrap()));
