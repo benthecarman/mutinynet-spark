@@ -128,4 +128,8 @@ for index in 0 1 2; do
 done
 
 echo "=== run Lightning e2e ==="
+# The Breez suite uses a separate Compose project but binds the same host
+# ports. Release the completed SDK stack before the isolated Lightning stack
+# starts.
+"${COMPOSE[@]}" down -v --remove-orphans
 SPARK_SDK_DIST="$SDK_DIST" ./e2e/ln-e2e.sh
