@@ -617,10 +617,14 @@ where
 /// SSP-owned HODL receive: the SSP minted the preimage, so it pays Spark
 /// from its own wallet and claims Lightning with the held preimage. The
 /// claimable Lightning amount is validated before any Spark value moves —
-/// the payout is irreversible, so a mismatched amount fails the hold (the
-/// payer is refunded) instead of funding first and erroring later.
+/// the payout is irreversible, so a mismatched or missing amount fails the
+/// hold (the payer is refunded) instead of funding first and erroring later.
+/// The shared receive lock serializes the event pump against the reconciler,
+/// like the standard receive path.
+#[allow(clippy::too_many_arguments)]
 async fn process_ssp_owned_receive<S, L>(
     db: &Db,
+    receive_lock: &tokio::sync::Mutex<()>,
     spark: &S,
     ldk: &L,
     payment_hash: &str,
@@ -632,6 +636,7 @@ where
     S: SettleSpark + ?Sized,
     L: ReceiveLdk + ?Sized,
 {
+    let _guard = receive_lock.lock().await;
     let Some(receive) = db.lightning_receive_for_hash(payment_hash).await? else {
         return Ok(false);
     };
@@ -642,8 +647,10 @@ where
         .amount_sats
         .checked_mul(1000)
         .ok_or_else(|| "Lightning receive amount is too large".to_string())?;
-    let actual_msat =
-        amount_msat.ok_or_else(|| "claimable Lightning payment has no amount".to_string())?;
+    let Some(actual_msat) = amount_msat else {
+        fail_unfunded_receive(db, ldk, payment_hash, delays).await;
+        return Err("claimable Lightning payment has no amount".to_string());
+    };
     if actual_msat != expected_msat {
         fail_unfunded_receive(db, ldk, payment_hash, delays).await;
         return Err(format!(
@@ -832,6 +839,7 @@ impl LdkGrpcBackend {
         let preimage = self.preimage_for(payment_hash).await;
         process_ssp_owned_receive(
             self.db.as_ref(),
+            self.receive_lock.as_ref(),
             self.spark.as_ref(),
             &self.client,
             payment_hash,
@@ -1931,6 +1939,7 @@ mod tests {
 
         let error = process_ssp_owned_receive(
             &db,
+            &tokio::sync::Mutex::new(()),
             &spark,
             &ldk,
             &hash,
@@ -1962,6 +1971,7 @@ mod tests {
 
         assert!(process_ssp_owned_receive(
             &db,
+            &tokio::sync::Mutex::new(()),
             &spark,
             &ldk,
             &hash,
@@ -1988,14 +1998,49 @@ mod tests {
         let spark = MockSettle::default();
         let ldk = MockLdk::default();
 
-        assert!(
-            process_ssp_owned_receive(&db, &spark, &ldk, &hash, Some(5_000_000), &[], None,)
-                .await
-                .is_err()
-        );
+        assert!(process_ssp_owned_receive(
+            &db,
+            &tokio::sync::Mutex::new(()),
+            &spark,
+            &ldk,
+            &hash,
+            Some(5_000_000),
+            &[],
+            None,
+        )
+        .await
+        .is_err());
         assert_eq!(spark.calls.load(Ordering::SeqCst), 0);
         assert_eq!(ldk.claims.load(Ordering::SeqCst), 0);
         assert_eq!(ldk.failed_holds.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ssp_owned_receive_without_amount_fails_the_hold() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        let spark = MockSettle::default();
+        let ldk = MockLdk::default();
+
+        let error = process_ssp_owned_receive(
+            &db,
+            &tokio::sync::Mutex::new(()),
+            &spark,
+            &ldk,
+            &hash,
+            None,
+            &[],
+            Some(&preimage),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("no amount"));
+        // No Spark value moved; the hold is failed so the payer refunds
+        // immediately instead of waiting for expiry cleanup.
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.claims.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.failed_holds.load(Ordering::SeqCst), 1);
+        assert_eq!(db.receive_status(&hash).await.unwrap(), "HTLC_FAILED");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
