@@ -100,9 +100,11 @@ prevents the wallet from keeping connections to replaced certificates.
 
 ## Liquidity
 
-Swap fills need exact SSP-owned Spark leaves. Lightning receives can use one or
-more whole leaves whose total is at least the invoice amount. Monitor these
-authenticated `/status` fields:
+Swap fills need exact SSP-owned Spark leaves. Lightning receives are exactly
+value-conserving: the SSP only settles a receive when whole leaves totalling
+exactly the invoice amount can be selected. Amounts the leaf ladder cannot
+represent are rejected, the hold invoice is failed, and the payer is refunded.
+Monitor these authenticated `/status` fields:
 
 - `spark.available_sats`: spendable leaves visible on the operators.
 - `spark.owned_sats`: all wallet-owned leaves, including temporarily missing
@@ -124,12 +126,12 @@ Use `SSP_BASE_URL`, `BITCOIN_RPC_URL`, `BITCOIN_RPC_USER`, and
 `BITCOIN_RPC_PASSWORD` when the services are not at the local defaults. Do not
 put quotes inside values passed through Docker's `--env-file` option.
 
-The SSP first selects an exact combination when one exists. Otherwise, it
-selects a deterministic set of whole leaves whose total covers the invoice.
-The receiving wallet gets the full value of those leaves. Keep the smallest
-leaf reasonably close to the smallest supported invoice to limit SSP
-overpayment. A ladder that starts at 1,000 sats can settle a 68-sat receive, but
-the wallet receives the full 1,000-sat leaf.
+The SSP selects an exact combination of whole leaves when one exists and
+rejects the receive otherwise, so the wallet is never paid more Spark value
+than the Lightning invoice collected. Fund the ladder with denominations that
+match the invoices the service is expected to settle (for example, add a
+68-sat-compatible ladder or 1-sat leaves for small regtest invoices). A
+ladder that starts at 1,000 sats cannot settle a 68-sat receive.
 
 Keep `MAX_SWAP_TOTAL_SATS` below the amount of liquidity that the operator can
 safely expose. Add small denominations before `needs_topup` becomes true.

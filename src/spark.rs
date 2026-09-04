@@ -21,10 +21,7 @@ use ::spark::{
     services::{LeafKeyTweak, Transfer as SparkTransfer, TransferService, TransferType},
     session_store::InMemorySessionStore,
     signer::SparkSigner as CoreSparkSigner,
-    tree::{
-        select_leaves_by_exact_amounts, select_leaves_by_minimum_amount, LeafLike, TreeNode,
-        TreeNodeStatus, TreeServiceError,
-    },
+    tree::{select_leaves_by_exact_amounts, LeafLike, TreeNode, TreeNodeStatus, TreeServiceError},
 };
 use bip39::{Language, Mnemonic};
 use bitcoin::{
@@ -764,9 +761,11 @@ fn validate_lightning_receive_swap(
     {
         return Err("operator receive swap returned a mismatched transfer".to_string());
     }
-    if transfer.total_value < invoice_amount_sats {
+    // Value conservation must be exact: a transfer above the invoice amount
+    // pays the wallet SSP-owned sats that Lightning never collected.
+    if transfer.total_value != invoice_amount_sats {
         return Err(format!(
-            "operator receive swap transferred {} sats; invoice requires at least {invoice_amount_sats}",
+            "operator receive swap transferred {} sats; invoice requires exactly {invoice_amount_sats}",
             transfer.total_value
         ));
     }
@@ -776,18 +775,15 @@ fn validate_lightning_receive_swap(
     })
 }
 
+/// Select exactly the invoice amount. A covering whole-leaf set would
+/// overpay the wallet with SSP-owned sats, so amounts the ladder cannot
+/// represent are rejected (the receive then fails its hold invoice and the
+/// payer is refunded).
 fn select_receive_leaves<L: LeafLike>(
     leaves: &[L],
     amount_sats: u64,
 ) -> Result<Vec<L>, TreeServiceError> {
-    match select_leaves_by_exact_amounts(leaves, &[amount_sats]) {
-        Ok(selected) => Ok(selected),
-        Err(TreeServiceError::UnselectableAmount) => {
-            select_leaves_by_minimum_amount(leaves, amount_sats)?
-                .ok_or(TreeServiceError::UnselectableAmount)
-        }
-        Err(error) => Err(error),
-    }
+    select_leaves_by_exact_amounts(leaves, &[amount_sats])
 }
 
 fn wallet_leaf_to_tree_node(leaf: WalletLeaf) -> Result<TreeNode, String> {
@@ -979,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn receive_leaf_selection_accepts_more_than_invoice() {
+    fn receive_leaf_selection_rejects_unrepresentable_amounts() {
         let leaves = [
             TestLeaf {
                 id: 1,
@@ -995,8 +991,10 @@ mod tests {
             },
         ];
 
-        let selected = select_receive_leaves(&leaves, 68).unwrap();
-        assert_eq!(selected, vec![leaves[0].clone()]);
+        // A 68-sat invoice must never claim a whole 1,000-sat leaf.
+        assert!(select_receive_leaves(&leaves, 68).is_err());
+        // 1,500 sats cannot be composed from whole 1,000-sat leaves either.
+        assert!(select_receive_leaves(&leaves, 1_500).is_err());
     }
 
     #[test]
@@ -1032,12 +1030,12 @@ mod tests {
                 value: 1_000,
             },
         ];
-        let combined = select_receive_leaves(&equal_leaves, 1_500).unwrap();
+        let combined = select_receive_leaves(&equal_leaves, 2_000).unwrap();
         assert_eq!(combined, equal_leaves);
     }
 
     #[test]
-    fn receive_swap_validation_accepts_operator_overfunding() {
+    fn receive_swap_validation_requires_exact_value() {
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let sender_secret = bitcoin::secp256k1::SecretKey::from_slice(&[2; 32]).unwrap();
         let receiver_secret = bitcoin::secp256k1::SecretKey::from_slice(&[3; 32]).unwrap();
@@ -1060,6 +1058,7 @@ mod tests {
             spark_invoice: None,
         };
 
+        // Exactly the invoice amount is accepted...
         assert!(validate_lightning_receive_swap(
             transfer.clone(),
             preimage.clone(),
@@ -1067,22 +1066,24 @@ mod tests {
             &transfer_id,
             sender,
             receiver,
-            100,
+            12_345,
         )
         .is_ok());
-        assert!(validate_lightning_receive_swap(
-            transfer,
-            preimage,
-            &payment_hash,
-            &transfer_id,
-            sender,
-            receiver,
-            12_346,
-        )
-        .unwrap_err()
-        .contains("invoice requires at least"));
+        // ...but over- and under-valued operator transfers are both rejected.
+        for invoice_amount_sats in [100u64, 12_346] {
+            assert!(validate_lightning_receive_swap(
+                transfer.clone(),
+                preimage.clone(),
+                &payment_hash,
+                &transfer_id,
+                sender,
+                receiver,
+                invoice_amount_sats,
+            )
+            .unwrap_err()
+            .contains("requires exactly"));
+        }
     }
-
     #[test]
     fn required_mnemonic_does_not_create_a_new_identity() {
         let path =
